@@ -36,7 +36,15 @@ SHA=(   # the Hub's LFS sha256 of each shard at $REV
   04eaa6d2cb5a548854c719994816a791a4e3d7783f38979e95b389f8f840badf
   6227252600ff83f185b6ad149266fbd0cb1c1f57ae0bfb71c247ee49faa3c31b )
 A5_SHA=(   # the a5 shards this script produced on the reference machine (the requant is deterministic)
-  __A5_SHA__ )
+  0bec738e5b71267d7c68eb22440f957424daa56f8d35a3eedd59c370199d2bf4
+  3804657b129d1e28f9c9ed952d03b294fa9d2633f22ad82407f1b5c43b745938
+  78e1b33b309ee7d04ebb3a235b4f47ce6a984446bbc5f764fb7799bd54c98836
+  6544fd57ec3e4f6957c1ec2905badcebc91a4309c63bfd7196c2fc956ac5fd65
+  133092e64a5a043aab15e0221d1b9899ecf605b0f9d73d09ceee1d2f6f683dd3
+  299021df69cda056d9dfbf9481b03df3694bccb82b3e04bf066d36aafe69fb19
+  33bbea7d38949b27922e4c36249d7f56569f83cbb11b768ffa508b298cae69a6
+  0dcc83781482a608f493e287e2b9288eb0c00ffb6ac896bc4f7d4d5745907d46
+  d90504f4d42340214b98ace8b9cdc570d3ef4607cf0b3c66de5c95356c97fa69 )
 
 say(){ echo "[get-model] $*"; }
 avail_gb(){ df -BG --output=avail "$DIR" | tail -1 | tr -dc 0-9; }
