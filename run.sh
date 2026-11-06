@@ -26,7 +26,8 @@ command -v docker >/dev/null || { echo "run.sh: docker is not installed"; exit 2
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run.sh: no image $IMAGE (docker build -t glm53-offload -f docker/Dockerfile .)"; exit 2; }
 DIR=$(cd "$(dirname "$MODEL")" && pwd); BASE=$(basename "$MODEL")
 MODE=(--rm); if [ $DETACH = 1 ]; then MODE=(-d); elif [ -t 0 ]; then MODE=(--rm -it); fi
-docker run "${MODE[@]}" --name "$NAME" --gpus "\"device=$GPUS\"" --ulimit memlock=-1:-1 --shm-size 2g --stop-timeout 120 \
+# --init: tini as PID 1; without it a killed llama-server was left a zombie and `docker rm -f` failed (2026-11-06)
+docker run "${MODE[@]}" --init --name "$NAME" --gpus "\"device=$GPUS\"" --ulimit memlock=-1:-1 --shm-size 2g --stop-timeout 120 \
   -p "$BIND:$PORT:8080" -v "$DIR":/models:ro "$IMAGE" --model "/models/$BASE" "${REST[@]}"
 rc=$?
 [ $DETACH = 1 ] && [ $rc = 0 ] && echo "run.sh: started container $NAME (docker logs -f $NAME; docker rm -f $NAME to stop); API at http://$BIND:$PORT/v1 once loaded"
