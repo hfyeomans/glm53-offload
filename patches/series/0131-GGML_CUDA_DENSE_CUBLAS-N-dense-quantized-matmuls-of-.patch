@@ -1,0 +1,71 @@
+From 0f4e34655d3fc9cbb6a702c976f728ba2597a5a5 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:13:08 -0600
+Subject: [PATCH 131/141] GGML_CUDA_DENSE_CUBLAS=N: dense quantized matmuls of
+ N or more columns to cuBLAS in bf16 (f32 compute) instead of MMQ
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  5 +++++
+ ggml/src/ggml-cuda/mmq.cu       | 10 ++++++++++
+ ggml/src/ggml-cuda/mmq.cuh      |  3 +++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d1cd30b82..32a5e2409 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1850,6 +1850,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     ggml_type compute_type = src0->type;
+     if (ggml_is_quantized(compute_type)) {
+         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
++        // 0126 GGML_CUDA_DENSE_CUBLAS: the dense matmuls it sends here run in bf16 with f32 compute (GGML_CUDA_DENSE_CUBLAS_TYPE=f32: f32)
++        if (ggml_cuda_dense_cublas_min() > 0 && src1->ne[1] >= ggml_cuda_dense_cublas_min()) {
++            static const bool dense_f32 = getenv("GGML_CUDA_DENSE_CUBLAS_TYPE") != nullptr && strcmp(getenv("GGML_CUDA_DENSE_CUBLAS_TYPE"), "f32") == 0;
++            compute_type = dense_f32 || !fast_bf16_hardware_available(cc) ? GGML_TYPE_F32 : GGML_TYPE_BF16;
++        }
+     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
+         compute_type = GGML_TYPE_F32;
+     } else if (compute_type == GGML_TYPE_BF16 && !fast_bf16_hardware_available(cc)) {
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 55640a98d..a0e43b691 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -437,6 +437,11 @@ void ggml_cuda_mul_mat_q(
+     ggml_cuda_mul_mat_q_switch_type(ctx, args_c, stream, prec_src1);
+ }
+ 
++int64_t ggml_cuda_dense_cublas_min(void) {
++    static const int64_t v = getenv("GGML_CUDA_DENSE_CUBLAS") != nullptr ? std::max(0LL, atoll(getenv("GGML_CUDA_DENSE_CUBLAS"))) : 0;
++    return v;
++}
++
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+ #ifdef GGML_CUDA_FORCE_CUBLAS
+     return false;
+@@ -490,6 +495,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+         }
+     }
+ 
++    // 0126: a dense matmul of GGML_CUDA_DENSE_CUBLAS or more columns goes to cuBLAS (ggml_cuda_mul_mat_cublas converts it to bf16)
++    if (n_experts == 0 && ggml_cuda_dense_cublas_min() > 0 && ne11 >= ggml_cuda_dense_cublas_min()) {
++        return false;
++    }
++
+     if (turing_mma_available(cc)) {
+         return true;
+     }
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 0766ca6f1..fb3fa2731 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1702,4 +1702,7 @@ void ggml_cuda_mul_mat_q(
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+ 
++// 0126 GGML_CUDA_DENSE_CUBLAS=N: the column count from which a dense quantized matmul goes to cuBLAS (0 = never)
++int64_t ggml_cuda_dense_cublas_min(void);
++
+ bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+-- 
+2.43.0
+

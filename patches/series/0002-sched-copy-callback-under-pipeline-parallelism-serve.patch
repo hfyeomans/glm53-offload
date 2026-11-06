@@ -1,0 +1,49 @@
+From 1d58552e6406754cf5661e6eb6af36582b03475a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:53:43 -0600
+Subject: [PATCH 002/141] sched copy callback: under pipeline parallelism,
+ serve the cached experts from the device banks
+
+With #29963 the large-batch path never reads the ids, so the whole expert tensor went back to a host upload and the MoE
+cache was unused at prefill (28K prefill 684 -> 568 tok/s on the merged branch). The slot map is host memory: copy the
+cached experts device-to-device and upload only the rest, with no wait for the ids.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 977defa02..9601684e0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2901,6 +2901,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 }
+                 st.ids_noted = ids;
+             }
++            // upload all the experts, the cached ones from the device banks: the slot map is host memory, so no wait for the ids
++            if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
++                int64_t next = 0;
++                for (int64_t e = 0; e < n_expert; ) {
++                    const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, n_expert - 1);
++                    if (n == 0) {
++                        e++;
++                        continue;
++                    }
++                    if (next < e) {
++                        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
++                    }
++                    e   += n;
++                    next = e;
++                }
++                if (next < n_expert) {
++                    ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
++                }
++                return true;
++            }
+             return false;
+         }
+     }
+-- 
+2.43.0
+

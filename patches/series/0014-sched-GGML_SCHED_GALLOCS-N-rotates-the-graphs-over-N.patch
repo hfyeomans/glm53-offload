@@ -1,0 +1,140 @@
+From a04675c04ba109c87ef1df1aafce4e7b522bbc1a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:21:22 -0600
+Subject: [PATCH 014/141] sched: GGML_SCHED_GALLOCS=N rotates the graphs over N
+ allocators, so a re-reservation waits only for the graph N steps back (the
+ prefill drain)
+
+---
+ ggml/src/ggml-backend.cpp | 66 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 15a164b19..62f7be40b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1191,7 +1191,12 @@ struct ggml_backend_sched {
+ 
+     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
+     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+-    ggml_gallocr_t galloc;
++    ggml_gallocr_t galloc; // the allocator of the current graph: gallocs[cur_copy % n_gallocs]
++
++    // graph allocators: with pipeline parallelism, GGML_SCHED_GALLOCS=N rotates the graphs over N allocators with their own
++    // buffers, so a re-reservation waits only for the graph that used the same allocator N graphs ago
++    ggml_gallocr_t gallocs[GGML_SCHED_MAX_COPIES];
++    int n_gallocs;
+ 
+     // hash map of the nodes in the graph
+     struct ggml_hash_set  hash_set;
+@@ -2039,6 +2044,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     }
+ }
+ 
++static bool ggml_backend_sched_timing_enabled(void);
++
+ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     bool backend_ids_changed = false;
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+@@ -2084,8 +2091,27 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+ 
+         // the re-allocation may cause the split inputs to be moved to a different address
+         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+-        for (int i = 0; i < sched->n_backends; i++) {
+-            ggml_backend_synchronize(sched->backends[i]);
++        const int64_t t_wait0 = ggml_time_us();
++        if (sched->n_gallocs > 1) {
++            // only the graph that last used this allocator (n_gallocs graphs ago) can still be reading its buffers: wait for the
++            // events recorded after its last split on every backend
++            const int prev_copy = (sched->cur_copy + sched->n_copies - sched->n_gallocs) % sched->n_copies;
++            for (int i = 0; i < sched->n_backends; i++) {
++                if (sched->events[i][prev_copy] != NULL) {
++                    ggml_backend_event_synchronize(sched->events[i][prev_copy]);
++                } else {
++                    ggml_backend_synchronize(sched->backends[i]);
++                }
++            }
++        } else {
++            for (int i = 0; i < sched->n_backends; i++) {
++                ggml_backend_synchronize(sched->backends[i]);
++            }
++        }
++        if (ggml_backend_sched_timing_enabled()) {
++            GGML_LOG_INFO("sched realloc: allocator %d of %d, %d nodes, %d leafs, backend ids changed %d, graph size changed %d: waited %.1f ms\n",
++                sched->cur_copy % sched->n_gallocs, sched->n_gallocs, sched->graph.n_nodes, sched->graph.n_leafs,
++                (int) backend_ids_changed, (int) graph_size_changed, (ggml_time_us() - t_wait0)/1000.0);
+         }
+ 
+         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+@@ -2363,6 +2389,23 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     }
+ 
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
++    sched->gallocs[0] = sched->galloc;
++    sched->n_gallocs = 1;
++    if (sched->n_copies > 1) {
++        const char * GGML_SCHED_GALLOCS = getenv("GGML_SCHED_GALLOCS");
++        int n_gallocs = GGML_SCHED_GALLOCS ? atoi(GGML_SCHED_GALLOCS) : 1;
++        if (n_gallocs < 1 || n_gallocs > sched->n_copies || sched->n_copies % n_gallocs != 0) {
++            GGML_LOG_WARN("%s: GGML_SCHED_GALLOCS=%d must divide the number of copies (%d), using 1\n", __func__, n_gallocs, sched->n_copies);
++            n_gallocs = 1;
++        }
++        for (int g = 1; g < n_gallocs; g++) {
++            sched->gallocs[g] = ggml_gallocr_new_n(sched->bufts, n_backends);
++        }
++        sched->n_gallocs = n_gallocs;
++        if (n_gallocs > 1) {
++            GGML_LOG_INFO("%s: %d graph allocators (GGML_SCHED_GALLOCS)\n", __func__, n_gallocs);
++        }
++    }
+     sched->op_offload = op_offload;
+ 
+     ggml_backend_sched_reset(sched);
+@@ -2380,7 +2423,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+             ggml_backend_event_free(sched->input_events[b][c]);
+         }
+     }
+-    ggml_gallocr_free(sched->galloc);
++    for (int g = 0; g < sched->n_gallocs; g++) {
++        ggml_gallocr_free(sched->gallocs[g]);
++    }
+     ggml_free(sched->ctx);
+     ggml_hash_set_free(&sched->hash_set);
+     for (int i = 0; i < sched->splits_capacity; i++) {
+@@ -2441,8 +2486,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+ 
+     ggml_backend_sched_split_graph(sched, measure_graph);
+ 
+-    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+-        return false;
++    for (int g = 0; g < sched->n_gallocs; g++) {
++        if (!ggml_gallocr_reserve_n(sched->gallocs[g], &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
++            return false;
++        }
+     }
+ 
+     ggml_backend_sched_reset(sched);
+@@ -2457,6 +2504,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+     sched->cur_copy = sched->next_copy;
+     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
++    sched->galloc = sched->gallocs[sched->cur_copy % sched->n_gallocs];
+ 
+     ggml_backend_sched_split_graph(sched, graph);
+ 
+@@ -2555,7 +2603,11 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
+     int backend_index = ggml_backend_sched_backend_id(sched, backend);
+     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+ 
+-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
++    size_t size = 0;
++    for (int g = 0; g < sched->n_gallocs; g++) {
++        size += ggml_gallocr_get_buffer_size(sched->gallocs[g], backend_index);
++    }
++    return size;
+ }
+ 
+ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
+-- 
+2.43.0
+

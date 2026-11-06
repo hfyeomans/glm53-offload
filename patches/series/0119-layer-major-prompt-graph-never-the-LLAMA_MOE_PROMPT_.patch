@@ -1,0 +1,29 @@
+From 2ab09ed19d7f83240acd590713bd63fe33d33ab9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:44:39 -0600
+Subject: [PATCH 119/141] layer-major prompt graph: never the
+ LLAMA_MOE_PROMPT_CPU expert split (its FFN blocks shared one layer plan made
+ for another block tokens: wrong outputs on one card); it uploads the whole
+ layer anyway
+
+---
+ src/llama-graph.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5dbb63524..d75a53c2d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2491,7 +2491,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (moe_cache != nullptr && il >= 0 && !moe_probe) {
+         moe_cache->set_prompt_out(il, nullptr); // 0091: set again below when this graph has the layer's CPU part
+     }
+-    if (slots == nullptr && moe_cache != nullptr && il >= 0 && twins == nullptr && !weight_before_ffn && loras->empty() &&
++    // 0120: not in a layer-major graph (its FFN blocks would share one layer's plan; it uploads the whole layer anyway)
++    if (slots == nullptr && moe_cache != nullptr && il >= 0 && twins == nullptr && !weight_before_ffn && loras->empty() && cparams.lm_rows == 0 &&
+         up_exps && gate_exps && down_exps && !gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+         !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm && type_op == LLM_FFN_SILU &&
+         std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; })) {
+-- 
+2.43.0
+

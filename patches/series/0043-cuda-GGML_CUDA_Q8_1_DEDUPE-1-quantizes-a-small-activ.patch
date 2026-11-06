@@ -1,0 +1,202 @@
+From 5ae0c680094031ed85fe401ce80cfdabe0049612 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 17:17:34 -0600
+Subject: [PATCH 043/141] cuda: GGML_CUDA_Q8_1_DEDUPE=1 quantizes a small
+ activation to q8_1 once per graph evaluation and serves it to every matvec
+ that reads the same rows
+
+---
+ ggml/src/ggml-cuda/common.cuh   | 20 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 80 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 16 +++++--
+ 3 files changed, 113 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 7d49f02f5..b1fe5f68f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1452,6 +1452,13 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++struct ggml_backend_cuda_context;
++// GGML_CUDA_Q8_1_DEDUPE (0042), defined in ggml-cuda.cu
++bool   ggml_cuda_q8_1_dedupe_enabled();
++void * ggml_cuda_q8_1_dedupe_lookup(ggml_backend_cuda_context & ctx, const float * src, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
++        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, size_t q_size, cudaStream_t stream, bool * need_quantize);
++void   ggml_cuda_q8_1_dedupe_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1465,6 +1472,19 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // GGML_CUDA_Q8_1_DEDUPE (0042): activations already quantized to q8_1 in this graph evaluation
++    struct q8_1_entry {
++        const char * lo;   // source range (f32)
++        const char * hi;
++        int64_t ne00, ne0, nrows, row_stride;
++        cudaStream_t stream;
++        void * q;
++    };
++    std::vector<q8_1_entry> q8_1_cache;
++    char * q8_1_arena      = nullptr;
++    size_t q8_1_arena_size = 0;
++    size_t q8_1_arena_used = 0;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b820f9065..58a8c4dd4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5143,6 +5143,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    for (int k = i; k <= i + nodes_to_skip; ++k) {
++                        ggml_cuda_q8_1_dedupe_invalidate(*cuda_ctx, cgraph->nodes[k]);
++                    }
+                     ggml_cuda_op_timing_end(cuda_ctx, op_slot, node, cgraph->nodes[i + nodes_to_skip]);
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+@@ -5175,6 +5178,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                ggml_cuda_q8_1_dedupe_invalidate(*cuda_ctx, node);
+                 ggml_cuda_op_timing_end(cuda_ctx, op_slot, node, node);
+ 
+                 if (!is_concurrent_event_active) {
+@@ -5302,11 +5306,87 @@ static void ggml_cuda_split_timing_end(ggml_backend_cuda_context * cuda_ctx, int
+     CUDA_CHECK(cudaEventRecord(g_cuda_split_timing[cuda_ctx->device].end[slot], cuda_ctx->stream()));
+ }
+ 
++bool ggml_cuda_q8_1_dedupe_enabled() {
++    static const bool v = [] {
++        const char * s = getenv("GGML_CUDA_Q8_1_DEDUPE");
++        const bool on = s != nullptr && atoi(s) != 0;
++        if (on) {
++            GGML_LOG_INFO("%s: q8_1 activations are quantized once per graph evaluation and reused\n", __func__);
++        }
++        return on;
++    }();
++    return v;
++}
++
++void * ggml_cuda_q8_1_dedupe_lookup(ggml_backend_cuda_context & ctx, const float * src, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
++        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, size_t q_size, cudaStream_t stream, bool * need_quantize) {
++    *need_quantize = true;
++    if (!ggml_cuda_q8_1_dedupe_enabled() || ctx.q8_1_arena == nullptr) {
++        return nullptr;
++    }
++    const int64_t nrows = ne1*ne2*ne3;
++    if (nrows > 8) {
++        return nullptr;
++    }
++    int64_t row_stride;
++    if (nrows == 1) {
++        row_stride = 0;
++    } else if (ne2 == 1 && ne3 == 1) {
++        row_stride = s01;
++    } else if (ne1 == 1 && ne3 == 1) {
++        row_stride = s02;
++    } else if (ne1 == 1 && ne2 == 1) {
++        row_stride = s03;
++    } else {
++        return nullptr;
++    }
++    const char * lo = (const char *) src;
++    const char * hi = lo + ((nrows - 1)*row_stride + ne00)*(int64_t) sizeof(float);
++    for (const auto & e : ctx.q8_1_cache) {
++        if (e.lo == lo && e.ne00 == ne00 && e.ne0 == ne0 && e.nrows == nrows && e.row_stride == row_stride && e.stream == stream) {
++            *need_quantize = false;
++            return e.q;
++        }
++    }
++    const size_t sz = GGML_PAD(q_size, 256);
++    if (ctx.q8_1_arena_used + sz > ctx.q8_1_arena_size) {
++        return nullptr;
++    }
++    void * q = ctx.q8_1_arena + ctx.q8_1_arena_used;
++    ctx.q8_1_arena_used += sz;
++    ctx.q8_1_cache.push_back({ lo, hi, ne00, ne0, nrows, row_stride, stream, q });
++    return q;
++}
++
++void ggml_cuda_q8_1_dedupe_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
++    if (ctx.q8_1_cache.empty() || t == nullptr || t->data == nullptr) {
++        return;
++    }
++    const char * lo = (const char *) t->data;
++    const char * hi = lo + ggml_nbytes(t);
++    auto & c = ctx.q8_1_cache;
++    c.erase(std::remove_if(c.begin(), c.end(), [&](const ggml_backend_cuda_context::q8_1_entry & e) { return e.lo < hi && lo < e.hi; }), c.end());
++}
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    // GGML_CUDA_Q8_1_DEDUPE (0042): the arena is allocated before any capture, the cache starts empty for every graph
++    if (ggml_cuda_q8_1_dedupe_enabled()) {
++        if (cuda_ctx->q8_1_arena == nullptr) {
++            cuda_ctx->q8_1_arena_size = 4u << 20;
++            if (cudaMalloc((void **) &cuda_ctx->q8_1_arena, cuda_ctx->q8_1_arena_size) != cudaSuccess) {
++                (void) cudaGetLastError();
++                cuda_ctx->q8_1_arena      = nullptr;
++                cuda_ctx->q8_1_arena_size = 0;
++            }
++        }
++        cuda_ctx->q8_1_cache.clear();
++        cuda_ctx->q8_1_arena_used = 0;
++    }
++
+     const int split_timing_slot = ggml_cuda_split_timing_begin(cuda_ctx);
+ 
+     bool use_cuda_graph             = false;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c8f46a636..5e5f73100 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1577,12 +1577,22 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    const size_t  src1_q_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++    char * src1_q = nullptr;
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        // GGML_CUDA_Q8_1_DEDUPE (0042): the rows may already be quantized in this graph evaluation
++        bool need_quantize = true;
++        src1_q = (char *) ggml_cuda_q8_1_dedupe_lookup(ctx, src1_d, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, src1_q_size, stream, &need_quantize);
++        if (src1_q == nullptr) {
++            src1_q = src1_q8_1.alloc(src1_q_size);
++        }
++        if (need_quantize) {
++            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1608,7 +1618,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+-- 
+2.43.0
+

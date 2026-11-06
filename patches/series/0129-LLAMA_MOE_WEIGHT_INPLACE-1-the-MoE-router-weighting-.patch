@@ -1,0 +1,105 @@
+From 0e6f91e44497e1adda6c518cc4cf245ecbd78052 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:38:17 -0600
+Subject: [PATCH 129/141] LLAMA_MOE_WEIGHT_INPLACE=1: the MoE router weighting
+ in place over the down projection output (never written once fused), and the
+ CUDA weighted-reduction fusion accepts it
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 52 +++++++++++++++++++++++++++++++--
+ src/llama-graph.cpp             |  9 +++++-
+ 2 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ba7c7700c..d1cd30b82 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3701,7 +3701,9 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+ 
+         if (candidate->op == GGML_OP_VIEW) {
+             const int expert = (int) views.size();
+-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
++            // 0124: the views of a MUL in place over the experts have the experts as their view source
++            const ggml_tensor * view_base = weighted->view_src != nullptr && weighted->view_offs == 0 ? weighted->view_src : weighted;
++            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != view_base ||
+                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
+                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
+                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
+@@ -3733,8 +3735,52 @@ static bool ggml_cuda_match_moe_weighted_reduction(
+     }
+ 
+     const int output_idx = node_idx + node_count - 1;
+-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+-        return false;
++    if (weighted->view_src == nullptr) {
++        if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
++            return false;
++        }
++    } else {
++        // 0124: the MUL is in place over the experts (LLAMA_MOE_WEIGHT_INPLACE).  ggml_can_fuse_subgraph's checks, except that the MUL
++        // and the expert views may have the experts -- outside the subgraph -- as their view source; and the experts may have no reader
++        // but the MUL (fused, its in-place write is skipped)
++        if (mul_count != 1 || weighted->view_src != experts || weighted->src[0] != experts) {
++            return false;
++        }
++        int experts_idx = -1;
++        for (int j = node_idx - 1; j >= 0 && j >= node_idx - 256; --j) {
++            if (cgraph->nodes[j] == experts) {
++                experts_idx = j;
++                break;
++            }
++        }
++        if (experts_idx < 0 || ggml_node_get_use_count(cgraph, experts_idx) != 1) {
++            return false;
++        }
++        for (int k = 0; k < node_count; ++k) {
++            const ggml_tensor * node = cgraph->nodes[node_idx + k];
++            if (node->op != ops[k] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++                return false;
++            }
++            if (node_idx + k == output_idx) {
++                continue;
++            }
++            if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
++                return false;
++            }
++            int subgraph_uses = 0;
++            for (int j = k + 1; j < node_count; ++j) {
++                const ggml_tensor * other = cgraph->nodes[node_idx + j];
++                for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                    subgraph_uses += other->src[s] == node ? 1 : 0;
++                }
++            }
++            if (subgraph_uses != ggml_node_get_use_count(cgraph, node_idx + k)) {
++                return false;
++            }
++            if (node->view_src != nullptr && node->view_src != experts) {
++                return false;
++            }
++        }
+     }
+ 
+     match.experts      = experts;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d75a53c2d..f5f0f0871 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2772,7 +2772,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     if (!weight_before_ffn) {
+-        experts = ggml_mul(ctx0, experts, weights);
++        // 0124 LLAMA_MOE_WEIGHT_INPLACE=1: in place over the down projection's output on the plain device path (the CUDA weighted
++        // reduction fuses this MUL away; out of place it held a second [n_embd, n_expert_used, n_tokens] f32 that was never written)
++        static const bool w_inplace = getenv("LLAMA_MOE_WEIGHT_INPLACE") != nullptr && atoi(getenv("LLAMA_MOE_WEIGHT_INPLACE")) != 0;
++        if (w_inplace && p_gids == nullptr && cpu_ids == nullptr && experts->view_src == nullptr) {
++            experts = ggml_mul_inplace(ctx0, experts, weights);
++        } else {
++            experts = ggml_mul(ctx0, experts, weights);
++        }
+         cb(experts, "ffn_moe_weighted", il);
+     }
+ 
+-- 
+2.43.0
+

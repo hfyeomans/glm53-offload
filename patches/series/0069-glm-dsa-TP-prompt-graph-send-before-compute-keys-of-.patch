@@ -1,0 +1,128 @@
+From 3d79cd8cc17804fa09c757389ccd4afa12b5510a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:01:26 -0600
+Subject: [PATCH 069/141] glm-dsa TP prompt graph: send before compute (keys of
+ both cards before attention, the non-home expert half first, both cards
+ gather/reduce receives before their norms and shared experts)
+
+---
+ src/llama-graph.cpp    |  3 ++-
+ src/llama-graph.h      |  1 +
+ src/models/glm-dsa.cpp | 42 ++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4b72330fa..edf63c9a9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2397,7 +2397,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         GGML_ASSERT(gate_exps && up_exps && down_exps && !gate_up_exps && !weight_before_ffn && n_expert % 2 == 0);
+         GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm);
+         const int64_t n_half = n_expert/2;
+-        for (int c = 0; c < 2; ++c) {
++        for (int k = 0; k < 2; ++k) {
++            const int c = k == 0 ? moe_ep_first : 1 - moe_ep_first; // 0068: the card without the router first
+             const int n_nodes0 = ggml_graph_n_nodes(gf);
+             auto half = [&](ggml_tensor * w) {
+                 return ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], n_half, w->nb[1], w->nb[2], c*n_half*w->nb[2]);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3d9af5a3e..dcdaafc7b 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1063,6 +1063,7 @@ struct llm_graph_context {
+     mutable ggml_backend_t moe_ep_backend[2]   = { nullptr, nullptr };
+     mutable ggml_tensor *  moe_ep_out[2]       = { nullptr, nullptr };
+     mutable int            moe_ep_route_end    = 0;
++    mutable int            moe_ep_first        = 0; // 0068: the card whose half is built first (the one without the router)
+ 
+     // LLAMA_MOE_SHEXP_OVERLAP=1: called by build_moe_ffn after the device experts and before the CPU part (the shared expert goes here)
+     mutable std::function<void()> moe_overlap_hook;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 1dc6a4e55..cc6b1a412 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -358,8 +358,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 pin_from(n0, c);
+             }
+ 
+-            // the keys of the whole batch on both cards, the cache write on the home card, each card's attention over its own queries
+-            ggml_tensor * xa[2];
++            // the keys of the whole batch on both cards, the cache write on the home card (0068: for both cards before either card's
++            // attention, so a card's keys leave it ahead of its own attention)
++            ggml_tensor * Kk[2]  = { nullptr, nullptr };
++            ggml_tensor * IKk[2] = { nullptr, nullptr };
+             for (int c = 0; c < 2; ++c) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+                 ggml_tensor * k_all  = ggml_concat(ctx0, Kc[0], Kc[1], 2);
+@@ -380,8 +382,22 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                     if (ik_all != nullptr) {
+                         IK = kv_temp(mctx_lid->get_k(ctx0, il), ik_all, inp->get_k_idxs_lid());
+                     }
++                    ggml_build_forward_expand(gf, K);
++                    if (IK != nullptr) {
++                        ggml_build_forward_expand(gf, IK);
++                    }
+                 }
++                Kk[c]  = K;
++                IKk[c] = IK;
++                pin_from(n0, c);
++            }
+ 
++            // each card's attention over its own queries
++            ggml_tensor * xa[2];
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                ggml_tensor * K  = Kk[c];
++                ggml_tensor * IK = IKk[c];
+                 ggml_tensor * top_k = nullptr;
+                 if (IQc[c] != nullptr) {
+                     ggml_tensor * sc = ggml_lightning_indexer(ctx0, IQc[c], IK, IWc[c], rows4(lid_mask, c));
+@@ -421,16 +437,23 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+ 
+             // MoE: every token on both cards (all-gather), the router once on the home card, half of the experts on each card
+             ggml_tensor * hf[2];
++            ggml_tensor * xf[2];
+             for (int c = 0; c < 2; ++c) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+-                ggml_tensor * xf = ggml_concat(ctx0, xa[0], xa[1], 1);
+-                hf[c] = build_norm(xf, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
++                xf[c] = ggml_concat(ctx0, xa[0], xa[1], 1); // 0068: both cards' concats before their norms
++                ggml_build_forward_expand(gf, xf[c]);
++                pin_from(n0, c);
++            }
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                hf[c] = build_norm(xf[c], W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
+                 ggml_build_forward_expand(gf, hf[c]);
+                 pin_from(n0, c);
+             }
+             {
+                 const int n0 = ggml_graph_n_nodes(gf);
+                 moe_ep = true;
++                moe_ep_first = 1 - H; // 0068
+                 for (int c = 0; c < 2; ++c) {
+                     moe_ep_in[c]      = hf[c];
+                     moe_ep_backend[c] = be[c];
+@@ -461,10 +484,17 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 }
+                 GGML_ASSERT(moe_ep_out[0] != nullptr && moe_ep_out[1] != nullptr);
+             }
++            // reduce-scatter: this card's tokens of both partial sums (0068: both cards' adds before the shared experts)
++            ggml_tensor * mr[2];
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                mr[c] = ggml_add(ctx0, rows2(moe_ep_out[c], c), rows2(moe_ep_out[1 - c], c));
++                ggml_build_forward_expand(gf, mr[c]);
++                pin_from(n0, c);
++            }
+             for (int c = 0; c < 2; ++c) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+-                // reduce-scatter: this card's tokens of both partial sums
+-                ggml_tensor * m  = ggml_add(ctx0, rows2(moe_ep_out[c], c), rows2(moe_ep_out[1 - c], c));
++                ggml_tensor * m  = mr[c];
+                 ggml_tensor * sh = build_ffn(rows2(hf[c], c),
+                     W(L.ffn_up_shexp, c), NULL, W(L.ffn_up_shexp_s, c),
+                     W(L.ffn_gate_shexp, c), NULL, W(L.ffn_gate_shexp_s, c),
+-- 
+2.43.0
+

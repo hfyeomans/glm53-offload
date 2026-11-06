@@ -1,0 +1,32 @@
+From 7cbe52691a6a0fa0f9d174792ddd2bc717a443cd Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:25:42 -0600
+Subject: [PATCH 116/141] layer-major prompt graph: the staircase bound check
+ prints its values (ubatch positions, block, batch extent, staircase shape)
+
+---
+ src/models/glm-dsa.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index b50c2a2d7..48081c18a 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -624,7 +624,13 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                                                : std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
+                 b.c    = GGML_PAD(base, 8);
+                 b.d    = b.c - base;
+-                GGML_ASSERT(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1]);
++                if (!(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1])) { // 0117: the values
++                    GGML_ABORT("LLAMA_LAYER_MAJOR: block outside the staircase: ubatch %lld tokens pos %d..%d, block %lld r0 %lld nr %lld p0 %lld, "
++                        "keys %lld (n_kv %lld, lm_kv_end %u, n_ctx %u), c %lld d %lld, S %lld, staircase %lld x %lld",
++                        (long long) n_tokens, (int) ubatch.pos[0], (int) ubatch.pos[n_tokens - 1], (long long) ib, (long long) b.r0,
++                        (long long) b.nr, (long long) p0, (long long) b.n_kv, (long long) n_kv, cparams.lm_kv_end, cparams.n_ctx,
++                        (long long) b.c, (long long) b.d, (long long) S, (long long) Z0->ne[0], (long long) Z0->ne[1]);
++                }
+             }
+             blocks.push_back(b);
+         }
+-- 
+2.43.0
+

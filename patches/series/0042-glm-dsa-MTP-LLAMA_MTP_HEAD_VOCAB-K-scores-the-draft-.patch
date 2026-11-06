@@ -1,0 +1,39 @@
+From 34e5943da40fa798f11c6fc24ac88c3da2aa32d3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 17:01:45 -0600
+Subject: [PATCH 042/141] glm-dsa MTP: LLAMA_MTP_HEAD_VOCAB=K scores the draft
+ head over the first K token ids only (the rest -inf)
+
+---
+ src/models/glm-dsa.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index bec469b87..12012badd 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -850,7 +850,20 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "GLM_DSA MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    // LLAMA_MTP_HEAD_VOCAB=K (0041): score the first K token ids only, -inf for the rest (the draft just cannot propose them)
++    static const int64_t head_k = [] {
++        const char * s = getenv("LLAMA_MTP_HEAD_VOCAB");
++        return s != nullptr ? (int64_t) atoll(s) : (int64_t) 0;
++    }();
++    if (head_k > 0 && head_k < head_w->ne[1] && head_s == nullptr && loras->empty()) {
++        ggml_tensor * head_k_w = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_k, head_w->nb[1], 0);
++        ggml_tensor * logits_k = ggml_mul_mat(ctx0, head_k_w, cur);                     // [K, n_outputs]
++        ggml_tensor * rest     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, head_w->ne[1] - head_k, logits_k->ne[1]);
++        rest = ggml_fill(ctx0, rest, -INFINITY);
++        cur  = ggml_concat(ctx0, logits_k, rest, 0);                                    // [n_vocab, n_outputs]
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+-- 
+2.43.0
+

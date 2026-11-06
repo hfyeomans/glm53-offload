@@ -1,0 +1,30 @@
+From 144e12276f9f87e0b4a844ce0055cbe3a388e0b1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 12:32:20 -0600
+Subject: [PATCH 115/141] layer-major prompt graph: every block views exactly
+ the batch key extent, past the ubatch n_kv if need be (a view is checked
+ against the whole cache tensor), so the batch has one size and the allocator
+ plans once
+
+---
+ src/models/glm-dsa.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 2348a5369..b50c2a2d7 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -619,7 +619,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 const int64_t base = S - p0;
+                 // 0114: the batch's key extent for every block (the usual graph's n_kv is one value for a batch): keys that grew with p0
+                 // outgrew the allocator's plan each ubatch, and re-planning synchronizes every backend
+-                b.n_kv = std::min<int64_t>(n_kv, cparams.lm_kv_end > 0 ? (int64_t) cparams.lm_kv_end : GGML_PAD(p0 + b.nr, 256));
++                // 0116: the extent itself, past the ubatch's n_kv if need be (a view is checked against the whole cache tensor)
++                b.n_kv = cparams.lm_kv_end > 0 ? std::min<int64_t>((int64_t) cparams.lm_kv_end, (int64_t) cparams.n_ctx)
++                                               : std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
+                 b.c    = GGML_PAD(base, 8);
+                 b.d    = b.c - base;
+                 GGML_ASSERT(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1]);
+-- 
+2.43.0
+

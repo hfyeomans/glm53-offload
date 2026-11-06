@@ -1,0 +1,349 @@
+From 4dc4876db394c40cfdb34796202b7a5194a910e7 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 15:17:13 -0600
+Subject: [PATCH 089/141] moe prompt prefetch (LLAMA_MOE_PROMPT_PREFETCH=N):
+ the next layer s guessed experts go up into a staging area behind this layer
+ s uploads; its plan counts them as on the card
+
+---
+ ggml/include/ggml-cuda.h        |   3 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  23 +++++
+ src/llama-context.cpp           |   6 ++
+ src/llama-moe-cache.cpp         | 163 +++++++++++++++++++++++++++++++-
+ src/llama-moe-cache.h           |   4 +
+ 5 files changed, 198 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 4c162b23d..e8d7cd78c 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -38,6 +38,9 @@ GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void *
+ // `host_all`, when given, is the contiguous host copy of all n experts: the slot is then filled with one cudaMemcpyAsync (the copy
+ // engine) instead of the gather kernel, and `srcs` is ignored
+ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all);
++// 0090: host-to-device copies into the caller's memory on the device's upload ring stream, after the gathers issued so far (the main stream
++// does not wait for them; a later gather on the same stream reads them in order); false when the device has no ring yet
++GGML_BACKEND_API bool ggml_backend_cuda_upload_ring_prefetch(ggml_backend_t backend, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t n);
+ // 0078: the same two-slot ring, a second instance per device for weights in host memory: `bytes` from `host` into the current slot (a
+ // new slot when first_of_layer), slots of slot_bytes
+ GGML_BACKEND_API void * ggml_backend_cuda_weight_ring_upload(ggml_backend_t backend, bool first_of_layer, size_t bytes, size_t slot_bytes, const void * host);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8cbbb5a13..f108ceb15 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7330,6 +7330,29 @@ void ggml_backend_cuda_upload_ring_copy_commit(ggml_backend_t backend, void * ds
+     CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), r.ev_upload, 0));
+ }
+ 
++bool ggml_backend_cuda_upload_ring_prefetch(ggml_backend_t backend, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t n) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    if (r.stream == nullptr || r.k < 0) {
++        return false;
++    }
++    if (n == 0) {
++        return true;
++    }
++#if CUDART_VERSION >= 12080
++    cudaMemcpyAttributes attr = {};
++    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
++    size_t attr_idx = 0;
++    CUDA_CHECK(cudaMemcpyBatchAsync((void **) dsts, (const void **) srcs, (size_t *) sizes, n, &attr, &attr_idx, 1, r.stream));
++#else
++    for (size_t i = 0; i < n; ++i) {
++        CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, r.stream));
++    }
++#endif
++    return true;
++}
++
+ bool ggml_backend_cuda_host_ptr_device_accessible(const void * ptr) {
+     cudaPointerAttributes attr;
+     const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7f2d738aa..f7961d45b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3230,6 +3230,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 table[e] = nullptr;
+                 continue;
+             }
++            // 0090: prefetched into the card's staging area
++            if (const void * ps = lctx->moe_cache ? lctx->moe_cache->prompt_staged(src, e) : nullptr) {
++                table[e] = ps;
++                continue;
++            }
+             const void * p = lctx->moe_cache ? lctx->moe_cache->cached_expert(backend, src, e) : nullptr;
+             table[e] = p != nullptr ? p : (const void *) ((const uint8_t *) src->data + e*expert_size);
+         }
+@@ -3319,6 +3324,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             }
+             // upload all the experts, the cached ones from the device banks: the slot map is host memory, so no wait for the ids
+             if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++                lctx->moe_cache->prompt_after_gather(backend, src); // 0090: the next layer's prefetch, behind this layer's uploads
+                 st.cur_path = 1;
+                 return true;
+             }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 70807c1df..c9bc36ac5 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -404,6 +404,11 @@ struct llama_moe_cache::impl {
+         std::vector<int32_t> p_pred_cnt;    // 0089: this layer's selections per expert as the previous layer's plan read the guess
+         uint64_t p_pred_epoch = 0;          // 0089: the graph compute of that read
+         int64_t  p_pred_ntok  = 0;
++        std::vector<int32_t> p_pf;          // 0090: the experts prefetched for this layer, by expert id (their staging positions in order)
++        std::vector<int32_t> p_stage_pos;   // 0090: expert -> staging position, -1 if not prefetched
++        uint64_t p_stage_epoch = 0;         // 0090: the graph compute that decided p_pf
++        bool     p_pf_issued   = false;     // 0090: its copies went up
++        int32_t  p_gathers     = 0;         // 0090: this layer's expert tensors gathered since its plan
+         llama_moe_prompt_csr p_csr;         // 0085: the pairs of each token
+     };
+ 
+@@ -1468,11 +1473,24 @@ struct llama_moe_cache::impl {
+     std::vector<int32_t> p_order;
+     std::vector<int32_t> p_pred_ids;
+     std::vector<int32_t> p_rank;
++    // 0090: the staging areas of each device (two, by layer parity), one tensor per expert tensor of a layer
++    struct prompt_stage {
++        ggml_context_ptr        ctx;
++        ggml_backend_buffer_ptr buf;
++        ggml_tensor *           t[2][4] = { { nullptr } };
++    };
++    std::vector<prompt_stage> p_stage;
++    int32_t p_pf_n   = 0;
++    int32_t p_pf_min = 4;
++    std::vector<void *>       pf_dst;
++    std::vector<const void *> pf_src;
++    std::vector<size_t>       pf_len;
+     static constexpr int P_NB = 4;
+     static constexpr int P_B[P_NB] = { 25, 50, 75, 100 };
+     struct prompt_stats {
+         int64_t n_layers = 0, n_tok = 0, n_cpu = 0, n_zero = 0, n_up = 0, n_cached = 0, n_pairs = 0, n_sel = 0;
+         int64_t n_pred = 0, pred_up[P_NB] = {}, pred_cpu[P_NB] = {}, pred_zero[P_NB] = {}, pred_den[P_NB] = {}, pred_upall = 0;
++        int64_t pf_used = 0, pf_unused = 0;
+         double  link_ms = 0, cpu_ms = 0;
+         int64_t t_us = 0, t_wait_us = 0;
+     } p_st;
+@@ -1532,6 +1550,44 @@ struct llama_moe_cache::impl {
+         }
+         LLAMA_LOG_INFO("%s: LLAMA_MOE_PROMPT_CPU: batches over %lld tokens plan their experts per layer, up to %lld CPU pairs a layer (cap %.2f)\n",
+             __func__, (long long) max_batch, (long long) p_alloc, p_cap);
++
++        // 0090: the staging areas
++        p_pf_n   = (int32_t) prompt_env("LLAMA_MOE_PROMPT_PREFETCH", 0);
++        p_pf_min = (int32_t) prompt_env("LLAMA_MOE_PROMPT_PREFETCH_MIN", 4);
++        if (p_pf_n > 0) {
++            p_stage.resize(devices.size());
++            for (size_t id = 0; id < devices.size(); ++id) {
++                size_t es[4] = { 0, 0, 0, 0 };
++                size_t n_ip  = 0;
++                for (const layer & l : layers) {
++                    if (l.p_map == nullptr || groups[l.ig].id != (int32_t) id) {
++                        continue;
++                    }
++                    n_ip = std::max(n_ip, l.experts.size());
++                    for (size_t ip = 0; ip < l.experts.size() && ip < 4; ++ip) {
++                        es[ip] = std::max(es[ip], (size_t) l.experts[ip]->nb[2]);
++                    }
++                }
++                if (n_ip == 0) {
++                    continue;
++                }
++                prompt_stage & ps = p_stage[id];
++                ggml_init_params sp = { 8*ggml_tensor_overhead(), nullptr, true };
++                ps.ctx.reset(ggml_init(sp));
++                size_t total = 0;
++                for (int a = 0; a < 2; ++a) {
++                    for (size_t ip = 0; ip < n_ip && ip < 4; ++ip) {
++                        ps.t[a][ip] = ggml_new_tensor_1d(ps.ctx.get(), GGML_TYPE_I8, (int64_t) (es[ip]*p_pf_n));
++                        ggml_format_name(ps.t[a][ip], "moe_cache.prompt_stage-%d-%zu", a, ip);
++                        total += es[ip]*p_pf_n;
++                    }
++                }
++                ps.buf = llama_memory_bufs::alloc_buf(ps.ctx.get(), devices[id].buft, false, "MoE prompt prefetch");
++                GGML_ASSERT(ps.buf);
++                LLAMA_LOG_INFO("%s: LLAMA_MOE_PROMPT_PREFETCH: device %zu: %d experts a layer, two staging areas, %.1f MiB\n", __func__, id, p_pf_n,
++                    total/1024.0/1024.0);
++            }
++        }
+     }
+ 
+     ggml_tensor * get_prompt_map(int32_t il, int64_t n_tokens) const {
+@@ -1544,6 +1600,64 @@ struct llama_moe_cache::impl {
+         return layers[il].p_map;
+     }
+ 
++    const void * prompt_staged(const ggml_tensor * w, int64_t e) const {
++        const auto it = bindings.find(w);
++        if (it == bindings.end()) {
++            return nullptr;
++        }
++        const layer & l = layers[it->second.il];
++        if (l.p_stage_epoch != p_cur || !l.p_pf_issued || e < 0 || e >= (int64_t) l.p_stage_pos.size() || l.p_stage_pos[e] < 0) {
++            return nullptr;
++        }
++        const int32_t ip = it->second.ip;
++        const ggml_tensor * st = p_stage[groups[l.ig].id].t[it->second.il % 2][ip];
++        return (const char *) st->data + (size_t) l.p_stage_pos[e]*w->nb[2];
++    }
++
++    void prompt_after_gather(ggml_backend_t backend, const ggml_tensor * w) {
++        if (p_pf_n <= 0) {
++            return;
++        }
++        const auto it = bindings.find(w);
++        if (it == bindings.end()) {
++            return;
++        }
++        const int32_t il = it->second.il;
++        layer & l = layers[il];
++        if (l.p_epoch != p_cur || ++l.p_gathers < (int32_t) l.experts.size() || il + 1 >= (int32_t) layers.size()) {
++            return;
++        }
++        layer & ln = layers[il + 1];
++        if (ln.p_stage_epoch != p_cur || ln.p_pf_issued || ln.p_map == nullptr) {
++            return;
++        }
++        const prompt_stage & ps = p_stage[groups[ln.ig].id];
++        pf_dst.clear();
++        pf_src.clear();
++        pf_len.clear();
++        for (size_t ip = 0; ip < ln.experts.size() && ip < 4; ++ip) {
++            const ggml_tensor * t = ln.experts[ip];
++            char * base = (char *) ps.t[(il + 1) % 2][ip]->data;
++            const size_t es = t->nb[2];
++            for (size_t j = 0; j < ln.p_pf.size(); ) {
++                size_t j1 = j + 1;
++                while (j1 < ln.p_pf.size() && ln.p_pf[j1] == ln.p_pf[j1 - 1] + 1) {
++                    j1++;
++                }
++                pf_dst.push_back(base + j*es);
++                pf_src.push_back((const char *) t->data + (size_t) ln.p_pf[j]*es);
++                pf_len.push_back((j1 - j)*es);
++                j = j1;
++            }
++        }
++#ifdef GGML_USE_CUDA
++        ln.p_pf_issued = ggml_backend_is_cuda(backend) &&
++            ggml_backend_cuda_upload_ring_prefetch(backend, pf_dst.data(), pf_src.data(), pf_len.data(), pf_dst.size());
++#else
++        GGML_UNUSED(backend);
++#endif
++    }
++
+     void set_prompt_pred(int32_t il, ggml_tensor * sel) {
+         if (il >= 0 && il < (int32_t) layers.size()) {
+             layers[il].p_pred_t = sel;
+@@ -1565,6 +1679,7 @@ struct llama_moe_cache::impl {
+         layer & l = layers[il];
+         group & g = groups[l.ig];
+         GGML_ASSERT(backend == devices[g.id].backend);
++        l.p_gathers = 0; // 0090
+ 
+         const int n_nodes = ggml_graph_n_nodes(graph);
+         const ggml_tensor * lookup = nullptr;
+@@ -1663,16 +1778,23 @@ struct llama_moe_cache::impl {
+         p_order.clear();
+         double link = 0.0;
+         int64_t n_zero = 0, n_cached = 0;
++        const bool staged_ok = l.p_stage_epoch == p_cur && l.p_pf_issued && (int64_t) l.p_stage_pos.size() == n_expert; // 0090
+         for (int64_t e = 0; e < n_expert; ++e) {
+             const bool cached = slots != nullptr && slots[e] < g.n_slots;
++            const bool staged = staged_ok && l.p_stage_pos[e] >= 0;
+             if (p_cnt[e] == 0) {
+-                n_zero += cached ? 0 : 1;
++                n_zero += cached || staged ? 0 : 1;
++                p_st.pf_unused += staged ? 1 : 0;
+                 continue;
+             }
+             if (cached) {
+                 n_cached++;
+                 continue;
+             }
++            if (staged) {
++                p_st.pf_used++; // 0090: on the card already, as a cached expert
++                continue;
++            }
+             p_order.push_back((int32_t) e);
+             link += u_ms;
+         }
+@@ -1751,6 +1873,33 @@ struct llama_moe_cache::impl {
+         l.p_valid = true;
+         l.p_epoch = p_cur;
+ 
++        // 0090: the next layer's prefetch, from its guess: the uncached experts it ranks first
++        if (p_pf_n > 0 && has_pred && il + 1 < (int32_t) layers.size() && layers[il + 1].p_map != nullptr) {
++            layer & ln = layers[il + 1];
++            group & gn = groups[ln.ig];
++            const int32_t * slots_n = gn.slru.slot_map[il + 1];
++            const int64_t n_exp_n = (int64_t) ln.p_pred_cnt.size();
++            std::vector<int32_t> & cand = ln.p_pf;
++            cand.clear();
++            for (int64_t e = 0; e < n_exp_n; ++e) {
++                const bool cached_n = slots_n != nullptr && slots_n[e] < gn.n_slots;
++                if (!cached_n && ln.p_pred_cnt[e] >= p_pf_min) {
++                    cand.push_back((int32_t) e);
++                }
++            }
++            std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return ln.p_pred_cnt[a] != ln.p_pred_cnt[b] ? ln.p_pred_cnt[a] > ln.p_pred_cnt[b] : a < b; });
++            if ((int64_t) cand.size() > p_pf_n) {
++                cand.resize(p_pf_n);
++            }
++            std::sort(cand.begin(), cand.end()); // by expert: consecutive experts are one copy
++            ln.p_stage_pos.assign(n_exp_n, -1);
++            for (size_t j = 0; j < cand.size(); ++j) {
++                ln.p_stage_pos[cand[j]] = (int32_t) j;
++            }
++            ln.p_stage_epoch = p_cur;
++            ln.p_pf_issued   = false;
++        }
++
+         // 0089: score the guess of this layer's experts read at the previous layer's plan
+         if (l.p_pred_epoch == p_cur && l.p_pred_ntok == n_tok && (int64_t) l.p_pred_cnt.size() == n_expert) {
+             p_rank.clear();
+@@ -1818,6 +1967,10 @@ struct llama_moe_cache::impl {
+                 LLAMA_LOG_INFO("moe prompt pred: %lld layers scored, %.1f uploads a layer%s\n", (long long) p_st.n_pred,
+                     (double) p_st.pred_upall/p_st.n_pred, buf);
+             }
++            if (do_log && p_pf_n > 0 && p_st.n_layers > 0) {
++                LLAMA_LOG_INFO("moe prompt prefetch: a layer %.1f prefetched experts used, %.1f unused\n",
++                    (double) p_st.pf_used/p_st.n_layers, (double) p_st.pf_unused/p_st.n_layers);
++            }
+             p_st = {};
+         }
+         return true;
+@@ -2478,6 +2631,14 @@ void llama_moe_cache::set_prompt_pred(int32_t il, ggml_tensor * sel) {
+     pimpl->set_prompt_pred(il, sel);
+ }
+ 
++const void * llama_moe_cache::prompt_staged(const ggml_tensor * w, int64_t e) const {
++    return pimpl->prompt_staged(w, e);
++}
++
++void llama_moe_cache::prompt_after_gather(ggml_backend_t backend, const ggml_tensor * w) {
++    pimpl->prompt_after_gather(backend, w);
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index acf04e148..10c947675 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -94,6 +94,10 @@ public:
+     // 0089 LLAMA_MOE_PROMPT_PRED=1: sel [n_expert_used, n_tokens] on the device, layer il+1's experts guessed in layer il's graph; layer
+     // il's plan reads it with the layer's routing
+     void set_prompt_pred(int32_t il, ggml_tensor * sel);
++    // 0090 LLAMA_MOE_PROMPT_PREFETCH=N: expert e of w as prefetched into the card's staging area for this graph compute, nullptr if not
++    const void * prompt_staged(const ggml_tensor * w, int64_t e) const;
++    // after the gather of w's experts: once a planned layer's expert tensors are all up, the next layer's prefetch goes up behind them
++    void prompt_after_gather(ggml_backend_t backend, const ggml_tensor * w);
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+-- 
+2.43.0
+

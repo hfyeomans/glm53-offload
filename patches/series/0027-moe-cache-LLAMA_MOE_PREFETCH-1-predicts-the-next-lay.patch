@@ -1,0 +1,345 @@
+From f3fe3dfa9a937200692d7b94e856a6dec69505f0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:05:06 -0600
+Subject: [PATCH 027/141] moe cache: LLAMA_MOE_PREFETCH=1 predicts the next
+ layer's experts at the top of each layer (decode), plans them into the cache
+ at the lookup callback and uploads the uncached ones on the side stream
+ before that layer's hits
+
+---
+ ggml/include/ggml-cuda.h        |  5 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 32 ++++++++++++
+ src/llama-graph.cpp             |  5 ++
+ src/llama-graph.h               |  1 +
+ src/llama-moe-cache.cpp         | 92 ++++++++++++++++++++++++++++++++-
+ src/llama-moe-cache.h           |  4 ++
+ src/models/glm-dsa.cpp          | 42 +++++++++++++++
+ 7 files changed, 179 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 757f38ce1..c6b3826f2 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -38,6 +38,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void *
+ // `host_all`, when given, is the contiguous host copy of all n experts: the slot is then filled with one cudaMemcpyAsync (the copy
+ // engine) instead of the gather kernel, and `srcs` is ignored
+ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all);
++
++// side uploads: a host -> device copy on the device's upload stream, beside the main stream's work; `wait` makes the main stream wait
++// for every side upload issued since the last wait
++GGML_BACKEND_API void ggml_backend_cuda_side_upload_async(ggml_backend_t backend, void * dst, const void * src, size_t bytes);
++GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend);
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f2c267b2b..ad3a359dc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6793,6 +6793,7 @@ struct ggml_cuda_upload_ring {
+     size_t       slot_bytes = 0;
+     size_t       used       = 0;  // bump pointer in the current slot
+     int64_t      k          = -1; // split counter
++    bool         side_pending = false; // side uploads issued since the last wait
+ };
+ 
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
+@@ -6871,6 +6872,37 @@ void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_o
+     return dst;
+ }
+ 
++static void ggml_cuda_upload_ring_init(ggml_cuda_upload_ring & r) {
++    if (r.stream == nullptr) {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
++        for (int i = 0; i < 2; ++i) {
++            CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_main[i], cudaEventDisableTiming));
++        }
++        CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_upload, cudaEventDisableTiming));
++    }
++}
++
++void ggml_backend_cuda_side_upload_async(ggml_backend_t backend, void * dst, const void * src, size_t bytes) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    ggml_cuda_upload_ring_init(r);
++    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, r.stream));
++    r.side_pending = true;
++}
++
++void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    if (!r.side_pending) {
++        return;
++    }
++    ggml_cuda_set_device(cuda_ctx->device);
++    CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), r.ev_upload, 0));
++    r.side_pending = false;
++}
++
+ bool ggml_backend_cuda_host_ptr_device_accessible(const void * ptr) {
+     cudaPointerAttributes attr;
+     const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c28c69977..79724accb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2671,6 +2671,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     return moe_out;
+ }
+ 
++bool llm_graph_context::moe_prefetch_enabled() {
++    static const bool v = getenv("LLAMA_MOE_PREFETCH") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH")) != 0;
++    return v;
++}
++
+ bool llm_graph_context::moe_probe_enabled() {
+     static const bool v = getenv("LLAMA_MOE_PROBE") != nullptr && atoi(getenv("LLAMA_MOE_PROBE")) != 0;
+     return v;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 11e263f93..c27316674 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1057,6 +1057,7 @@ struct llm_graph_context {
+     mutable bool          moe_probe     = false;
+     mutable ggml_tensor * moe_probe_sel = nullptr;
+     static bool moe_probe_enabled();
++    static bool moe_prefetch_enabled(); // LLAMA_MOE_PREFETCH=1: predict the next layer's experts at the top of each layer (decode)
+ 
+     const llama_prec_policy * prec_policy;
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 95d502cdf..be647c748 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-moe-cache.h"
+ 
++#ifdef GGML_USE_CUDA
++#include "ggml-cuda.h"
++#endif
++
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+ #include "llama-model.h"
+@@ -290,6 +294,7 @@ struct llama_moe_cache::impl {
+         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
+         ggml_tensor * cpu_ids = nullptr;    // I32 [n_expert_used, max_batch] in host memory: the token's CPU experts, -1 elsewhere (deferred plan)
+         std::vector<int32_t> last_ids;      // the experts selected at the last small-batch lookup (LLAMA_MOE_PROBE)
++        ggml_tensor * pred = nullptr;       // LLAMA_MOE_PREFETCH: the graph's prediction of this layer's experts, per graph build
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+         std::vector<uint32_t> hist;         // prompt-informed admission: selections per expert in large batches
+     };
+@@ -363,6 +368,57 @@ struct llama_moe_cache::impl {
+         ggml_backend_event_t ev      = nullptr; // recorded behind the reads of the ids and of the stash
+     };
+     pending_plan defer_st;
++
++    // LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, read with the ids; the uncached ones are uploaded on the side stream
++    static bool prefetch_enabled() {
++        static const bool v = getenv("LLAMA_MOE_PREFETCH") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH")) != 0;
++        return v;
++    }
++    std::vector<int32_t> pred_ids;
++    bool   pred_pending  = false;
++    size_t win_pf_n      = 0;
++    size_t win_pf_bytes  = 0;
++
++    void prefetch(int32_t jl, ggml_backend_t backend) {
++        pred_pending = false;
++#ifdef GGML_USE_CUDA
++        if (jl < 0 || jl >= (int32_t) layers.size() || layers[jl].ig < 0 || !ggml_backend_is_cuda(backend)) {
++            return;
++        }
++        layer & lj = layers[jl];
++        group & gj = groups[lj.ig];
++        if (devices[gj.id].backend != backend) {
++            return;
++        }
++        // the predicted experts become hits of the next lookup: the cached ones are promoted, the rest get slots and are uploaded
++        auto n_cpu0 = [](size_t) { return (size_t) 0; };
++        size_t n_hit = 0;
++        if (!gj.slru.plan(jl, pred_ids.data(), pred_ids.size(), n_expert_used, n_zero, n_cpu0, rng, fills, cpu, n_hit)) {
++            return;
++        }
++        size_t bytes = 0;
++        for (size_t ip = 0; ip < lj.experts.size(); ++ip) {
++            const ggml_tensor * w    = lj.experts[ip];
++            ggml_tensor       * bank = gj.banks[ip];
++            const size_t expert_size = w->nb[2];
++            for (size_t i = 0; i < fills.size();) {
++                size_t n = 1;
++                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                    n++;
++                }
++                ggml_backend_cuda_side_upload_async(backend, (uint8_t *) bank->data + fills[i].slot*expert_size,
++                    (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size);
++                bytes += n*expert_size;
++                i += n;
++            }
++        }
++        win_pf_n     += fills.size();
++        win_pf_bytes += bytes;
++#else
++        GGML_UNUSED(jl);
++        GGML_UNUSED(backend);
++#endif
++    }
+     std::unordered_map<ggml_backend_t, ggml_backend_event_t> ev_ids; // one per backend: an event belongs to its device
+     std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
+ 
+@@ -956,6 +1012,14 @@ struct llama_moe_cache::impl {
+ 
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        pred_pending = false;
++        if (prefetch_enabled() && il + 1 < (int32_t) layers.size() && layers[il + 1].pred != nullptr && layers[il + 1].pred->data != nullptr &&
++            ids.size() == (size_t) n_expert_used) {
++            const ggml_tensor * pred = layers[il + 1].pred;
++            pred_ids.resize(ggml_nelements(pred));
++            ggml_backend_tensor_get_async(backend, pred, pred_ids.data(), 0, ggml_nbytes(pred));
++            pred_pending = true;
++        }
+         if (deferred_plan() && has_cpu && l.cpu_ids != nullptr && ids.size() <= (size_t) 8*n_expert_used) {
+             // the lookup runs on the map as it is: record the reads, upload the map, plan when the CPU part asks for its inputs
+             if (defer_st.il >= 0) {
+@@ -1018,6 +1082,9 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        if (pred_pending) {
++            prefetch(il + 1, backend);
++        }
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+         st.misses += fills.size() + cpu.size();
+@@ -1035,13 +1102,22 @@ struct llama_moe_cache::impl {
+             if (il == il_first && ++win_tokens >= (size_t) log_every) {
+                 win_total += win_tokens;
+                 const size_t n = win.hits + win.misses;
+-                LLAMA_LOG_INFO("llama_moe_cache: window: tokens %zu-%zu: hit rate = %.2f%% (%zu hits, %zu misses, %zu on the CPU), uploaded = %.1f MiB\n",
+-                    win_total - win_tokens, win_total, n > 0 ? 100.0*win.hits/n : 0.0, win.hits, win.misses, win.cpu, win.bytes/1024.0/1024.0);
++                LLAMA_LOG_INFO("llama_moe_cache: window: tokens %zu-%zu: hit rate = %.2f%% (%zu hits, %zu misses, %zu on the CPU), uploaded = %.1f MiB, prefetched = %zu (%.1f MiB)\n",
++                    win_total - win_tokens, win_total, n > 0 ? 100.0*win.hits/n : 0.0, win.hits, win.misses, win.cpu, win.bytes/1024.0/1024.0,
++                    win_pf_n, win_pf_bytes/1024.0/1024.0);
+                 win_tokens = 0;
+                 win = stats();
++                win_pf_n = 0;
++                win_pf_bytes = 0;
+             }
+         }
+ 
++#ifdef GGML_USE_CUDA
++        // the hits of this layer wait for the side uploads issued for it by the previous layer's callback
++        if (prefetch_enabled() && ggml_backend_is_cuda(backend)) {
++            ggml_backend_cuda_side_upload_wait(backend);
++        }
++#endif
+         // the next copy synchronizes the backend before it changes the slot map again
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+ 
+@@ -1237,6 +1313,18 @@ ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il) const {
+     return impl::deferred_plan() && il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_ids : nullptr;
+ }
+ 
++void llama_moe_cache::set_pred(int32_t il, ggml_tensor * sel) {
++    if (il >= 0 && il < (int32_t) pimpl->layers.size()) {
++        pimpl->layers[il].pred = sel;
++    }
++}
++
++void llama_moe_cache::clear_preds() {
++    for (auto & l : pimpl->layers) {
++        l.pred = nullptr;
++    }
++}
++
+ const std::vector<int32_t> * llama_moe_cache::last_ids(int32_t il) const {
+     return il >= 0 && il < (int32_t) pimpl->layers.size() && !pimpl->layers[il].last_ids.empty() ? &pimpl->layers[il].last_ids : nullptr;
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 40a9a3fe5..2ec56c200 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -39,6 +39,10 @@ public:
+     // the experts selected at the last small-batch lookup of layer il (LLAMA_MOE_PROBE), nullptr if none
+     const std::vector<int32_t> * last_ids(int32_t il) const;
+ 
++    // LLAMA_MOE_PREFETCH: the graph's prediction of the experts of layer il (I32 [n_expert_used, 1]), set per graph build
++    void set_pred(int32_t il, ggml_tensor * sel);
++    void clear_preds();
++
+     // the CPU part of the layer of the slot lookup, with n_used experts per token, no inputs if the graph has no CPU part
+     // its inputs on the device are read together with the selected experts, so the CPU part does not wait for the device
+     void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index ff05a73d2..5c78c021d 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1,6 +1,7 @@
+ #include "models.h"
+ 
+ #include "llama-kv-cache-dsa.h"
++#include "llama-moe-cache.h"
+ 
+ // https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L26
+ const std::array<uint32_t, LLAMA_MAX_LAYERS> GLM_5_2_DEFAULT_INDEXER_TYPES = {
+@@ -234,12 +235,53 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     // See https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L30
+     ggml_tensor * prev_top_k = nullptr;
+     std::vector<ggml_tensor *> moe_probe_inputs; // LLAMA_MOE_PROBE: the pre-attention residual of every layer
++    if (moe_cache != nullptr) {
++        moe_cache->clear_preds();
++    }
+     for (int il = 0; il < n_layer; ++il) {
+         ggml_tensor * inpSA = inpL;
+         if (moe_probe_enabled() && n_tokens == 1) {
+             moe_probe_inputs.push_back(inpSA);
+         }
+ 
++        // LLAMA_MOE_PREFETCH=1 (decode): the next layer's experts as its own router reads this layer's pre-attention residual; the
++        // slot lookup's copy callback of this layer reads them and uploads the uncached ones before the next layer's hits.  Kept on
++        // this layer's device (no pinned norm, no device boundary) so the layer's splits keep their shape
++        if (moe_prefetch_enabled() && n_tokens == 1 && moe_cache != nullptr && il + 1 < n_layer && (uint32_t) (il + 1) >= hparams.n_layer_dense_lead &&
++            model.dev_layer(il + 1) == model.dev_layer(il)) {
++            const int jl = il + 1;
++            ggml_tensor * h = ggml_rms_norm(ctx0, inpL, hparams.f_norm_rms_eps);
++            cb(h, "moe_pred_rms", il);
++            h = ggml_mul(ctx0, h, model.layers[jl].ffn_norm);
++            cb(h, "moe_pred_norm", il);
++            moe_probe = true;
++            build_moe_ffn(h,
++                model.layers[jl].ffn_gate_inp,
++                model.layers[jl].ffn_up_exps,
++                model.layers[jl].ffn_gate_exps,
++                model.layers[jl].ffn_down_exps,
++                model.layers[jl].ffn_exp_probs_b,
++                n_expert, n_expert_used,
++                LLM_FFN_SILU, hparams.expert_weights_norm,
++                hparams.expert_weights_scale,
++                (llama_expert_gating_func_type) hparams.expert_gating_func,
++                jl,
++                nullptr,
++                model.layers[jl].ffn_gate_up_exps,
++                model.layers[jl].ffn_up_exps_s,
++                model.layers[jl].ffn_gate_exps_s,
++                model.layers[jl].ffn_down_exps_s);
++            moe_probe = false;
++            ggml_tensor * sel = moe_probe_sel;
++            moe_probe_sel = nullptr;
++            if (sel != nullptr) {
++                ggml_format_name(sel, "moe_pred-%d", jl);
++                ggml_set_output(sel);
++                ggml_build_forward_expand(gf, sel);
++                moe_cache->set_pred(jl, sel);
++            }
++        }
++
+         // norm
+         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+-- 
+2.43.0
+

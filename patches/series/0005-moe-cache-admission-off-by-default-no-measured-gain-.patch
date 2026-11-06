@@ -1,0 +1,27 @@
+From 964c455c9885fc028deb5f64149589672e855127 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:26:44 -0600
+Subject: [PATCH 005/141] moe cache: admission off by default (no measured gain
+ on GLM-5.3)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/llama-moe-cache.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 67e58f1f4..366ee43af 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -341,7 +341,7 @@ struct llama_moe_cache::impl {
+         int64_t ne0, ne1;
+         size_t  nb0, nb1; // strides in bytes, as read
+     };
+-    int32_t admit_k        = 32;
++    int32_t admit_k        = 0; // off unless LLAMA_MOE_CACHE_ADMIT is set: measured no gain on GLM-5.3 (the reply opens with generic reasoning tokens)
+     bool    prompt_pending = false;
+     std::vector<pending_ids> pending;
+     ggml_backend_buffer_ptr  pending_buf; // pinned host ring for the asynchronous reads
+-- 
+2.43.0
+

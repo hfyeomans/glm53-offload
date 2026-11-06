@@ -1,0 +1,42 @@
+From 62c05385cb21883b68d774771dc455bcfff94efd Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:54:12 -0600
+Subject: [PATCH 019/141] ggml-alloc: GGML_GALLOCR_HEADROOM_PCT=N allocates
+ compute chunks N % over the reservation, so graphs that outgrow it slightly
+ do not reallocate (synchronize) under the pipeline
+
+---
+ ggml/src/ggml-alloc.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b0c067b49..3ad0c2e79 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -427,8 +427,23 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
+         return NULL;
+     }
+ 
++    // GGML_GALLOCR_HEADROOM_PCT=N: compute chunks are allocated N % larger than reserved, so a graph that outgrows the reservation by
++    // less than that does not reallocate the buffer (a reallocation synchronizes the device under the graphs in flight)
++    static int headroom_pct = -1;
++    if (headroom_pct < 0) {
++        const char * env = getenv("GGML_GALLOCR_HEADROOM_PCT");
++        headroom_pct = env ? atoi(env) : 0;
++        if (headroom_pct < 0) {
++            headroom_pct = 0;
++        }
++    }
++
+     for (int n = 0; n < talloc->n_chunks; n++) {
+         size_t chunk_size = talloc->chunks[n]->max_size;
++        if (headroom_pct > 0 && usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++            const size_t padded = chunk_size + chunk_size/100*(size_t) headroom_pct;
++            chunk_size = padded < talloc->max_chunk_size ? padded : talloc->max_chunk_size;
++        }
+         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+         if (buf->chunks[n] == NULL) {
+             ggml_vbuffer_free(buf);
+-- 
+2.43.0
+

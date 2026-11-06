@@ -1,0 +1,29 @@
+From 9e893a6a8f1e2fdc4891f4a56bddc7b130f6c4b6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:41:00 -0600
+Subject: [PATCH 130/141] GGML_SCHED_COPIES=N: the scheduler pipeline copies of
+ the split inputs (default 4)
+
+---
+ ggml/src/ggml-backend.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 821e716e9..0f293d0e5 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2542,6 +2542,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->n_backends = n_backends;
+     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
++    // 0125 GGML_SCHED_COPIES=N: fewer pipeline copies of the split inputs (each a [n_embd, n_ubatch] f32 for the layer-split prompt graph)
++    if (parallel && getenv("GGML_SCHED_COPIES") != nullptr) {
++        sched->n_copies = std::max(1, std::min((int) GGML_SCHED_MAX_COPIES, atoi(getenv("GGML_SCHED_COPIES"))));
++        GGML_LOG_INFO("%s: GGML_SCHED_COPIES: %d pipeline copies of the split inputs\n", __func__, sched->n_copies);
++    }
+ 
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+-- 
+2.43.0
+

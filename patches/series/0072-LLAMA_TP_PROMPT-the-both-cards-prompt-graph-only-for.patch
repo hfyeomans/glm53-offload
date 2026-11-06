@@ -1,0 +1,74 @@
+From 51d2a2e01762b0312ef11088eed0e9ad677bcf0e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:31:12 -0600
+Subject: [PATCH 072/141] LLAMA_TP_PROMPT: the both-cards prompt graph only for
+ a batch that is one ubatch (LLAMA_TP_PROMPT_ANY=1 for every batch)
+
+---
+ src/llama-context.cpp  | 3 +++
+ src/llama-cparams.h    | 2 ++
+ src/llama-graph.h      | 5 +++++
+ src/models/glm-dsa.cpp | 4 +++-
+ 4 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c475820fd..1d66dc110 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2163,6 +2163,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // 0071 LLAMA_TP_PROMPT: the both-cards prompt graph only for a batch that is one ubatch
++    cparams.tp_batch_single = balloc->get_n_tokens() <= cparams.n_ubatch;
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index c515c379e..71e233675 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -49,6 +49,8 @@ struct llama_cparams {
+     bool fused_dsv4_hc_post;
+     bool auto_fhc;
+     bool fused_top_k_mask;   // use fused top-k sparse attention mask
++
++    bool tp_batch_single = true; // 0071 LLAMA_TP_PROMPT: the batch being decoded is one ubatch (set by decode())
+     bool auto_ftkm;
+     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+     bool auto_fkvr;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index dcdaafc7b..37e36239a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -883,6 +883,11 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // 0071: the both-cards prompt graph is built for single-ubatch batches only
++        if (cparams.tp_batch_single != other.cparams.tp_batch_single) {
++            return false;
++        }
++
+         return
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 6fe4fc209..ac9e6293b 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -222,7 +222,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     // inputs of that graph are transient (0060), the other graphs keep the scheduler's usual copies
+     static const int tp_min = getenv("LLAMA_TP_PROMPT") != nullptr && atoi(getenv("LLAMA_TP_PROMPT")) != 0 ?
+         (getenv("LLAMA_TP_PROMPT_MIN") != nullptr ? std::max(2, atoi(getenv("LLAMA_TP_PROMPT_MIN"))) : 1024) : 0;
+-    const bool tp = tp_min > 0 && model.tp_devs.size() == 2 && n_tokens >= tp_min;
++    // 0071: only a batch that is one ubatch, unless LLAMA_TP_PROMPT_ANY=1
++    static const bool tp_any = getenv("LLAMA_TP_PROMPT_ANY") != nullptr && atoi(getenv("LLAMA_TP_PROMPT_ANY")) != 0;
++    const bool tp = tp_min > 0 && model.tp_devs.size() == 2 && n_tokens >= tp_min && (tp_any || cparams.tp_batch_single);
+     ggml_backend_sched_set_transient_inputs(sched, tp);
+     if (tp) {
+         GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
+-- 
+2.43.0
+

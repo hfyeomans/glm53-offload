@@ -1,0 +1,114 @@
+From c1442c1c9b48262ee4078363081cfb761cc2b566 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:35:12 -0600
+Subject: [PATCH 035/141] cache-aware routing folded into exp_probs_b, so the
+ fused topk-moe router kernel still matches
+
+---
+ src/llama-graph.cpp     |  9 +++++++--
+ src/llama-moe-cache.cpp | 23 +++++++++++++++++++++--
+ src/llama-moe-cache.h   |  3 +++
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 214c690cc..724051edb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2260,8 +2260,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // add experts selection bias - introduced in DeepSeek V3
+     // leave probs unbiased as it's later used to get expert weights
+     ggml_tensor * selection_probs = probs;
++    // LLAMA_MOE_ROUTE_BIAS folded (0034): the cache's route bias holds exp_probs_b + d for the cached experts and replaces exp_probs_b
++    ggml_tensor * route_bias_folded = nullptr;
++    if (moe_cache != nullptr && exp_probs_b != nullptr && moe_cache->route_bias_folded(il)) {
++        route_bias_folded = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
++    }
+     if (exp_probs_b != nullptr) {
+-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
++        selection_probs = ggml_add(ctx0, probs, route_bias_folded != nullptr ? route_bias_folded : exp_probs_b);
+         cb(selection_probs, "ffn_moe_probs_biased", il);
+     }
+ 
+@@ -2277,7 +2282,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     // LLAMA_MOE_ROUTE_BIAS: favour the cached experts in the selection of the batches the MoE cache serves; the weights stay unbiased
+-    if (moe_cache != nullptr) {
++    if (moe_cache != nullptr && route_bias_folded == nullptr) {
+         ggml_tensor * route_bias = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
+         if (route_bias != nullptr) {
+             // LLAMA_MOE_ROUTE_PROTECT=R: the R best experts by the unbiased score stay selected, the bias only steers the rest
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index b6f6a8ff0..3b4001a12 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -299,6 +299,7 @@ struct llama_moe_cache::impl {
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
++        std::vector<float> route_epb;       // the layer's exp_probs_b, folded into the route bias (empty: not folded)
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+         std::vector<uint32_t> hist;         // prompt-informed admission: selections per expert in large batches
+     };
+@@ -734,6 +735,20 @@ struct llama_moe_cache::impl {
+                 GGML_ASSERT(rb_buf[id]);
+                 ggml_backend_buffer_clear(rb_buf[id].get(), 0);
+                 ggml_backend_buffer_set_usage(rb_buf[id].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                // fold the layer's exp_probs_b into its route bias (the graph then has the single add the fused router expects)
++                static const bool protect = getenv("LLAMA_MOE_ROUTE_PROTECT") != nullptr && atoi(getenv("LLAMA_MOE_ROUTE_PROTECT")) > 0;
++                for (size_t il = 0; il < layers.size() && !protect; ++il) {
++                    layer & l = layers[il];
++                    const ggml_tensor * epb = model.layers[il].ffn_exp_probs_b;
++                    if (l.route_bias == nullptr || epb == nullptr || epb->type != GGML_TYPE_F32 || ggml_nelements(epb) != n_exp) {
++                        continue;
++                    }
++                    l.route_epb.resize(n_exp);
++                    ggml_backend_tensor_get(epb, l.route_epb.data(), 0, ggml_nbytes(epb));
++                    l.route_bias_host = l.route_epb;
++                    l.route_bias_last = l.route_epb;
++                    ggml_backend_tensor_set(l.route_bias, l.route_epb.data(), 0, ggml_nbytes(l.route_bias));
++                }
+             }
+             LLAMA_LOG_INFO("llama_moe_cache: cache-aware routing, selection bias %.4f for the cached experts\n", (double) route_bias_value());
+         }
+@@ -1184,10 +1199,10 @@ struct llama_moe_cache::impl {
+             const float d = route_bias_value();
+             const int32_t * slots_rb = g.slru.slot_map[il];
+             for (int32_t e = 0; e < g.slru.n_expert; ++e) {
+-                l.route_bias_host[e] = slots_rb[e] < g.slru.n_slots ? d : 0.0f;
++                l.route_bias_host[e] = (l.route_epb.empty() ? 0.0f : l.route_epb[e]) + (slots_rb[e] < g.slru.n_slots ? d : 0.0f);
+             }
+             for (const auto & pf : l.pending_fills) {
+-                l.route_bias_host[pf.first] = d;
++                l.route_bias_host[pf.first] = (l.route_epb.empty() ? 0.0f : l.route_epb[pf.first]) + d;
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+                 ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
+@@ -1430,6 +1445,10 @@ ggml_tensor * llama_moe_cache::get_route_bias(int32_t il, int64_t n_tokens, int6
+     return pimpl->get_slot_map(il, n_tokens, n_expert_used) != nullptr ? pimpl->layers[il].route_bias : nullptr;
+ }
+ 
++bool llama_moe_cache::route_bias_folded(int32_t il) const {
++    return il >= 0 && il < (int32_t) pimpl->layers.size() && !pimpl->layers[il].route_epb.empty();
++}
++
+ ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il) const {
+     return impl::deferred_plan() && il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_ids : nullptr;
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index de33de848..bfd90b530 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -41,6 +41,9 @@ public:
+     // selection scores; nullptr when off or when the cache does not serve batches of n_tokens
+     ggml_tensor * get_route_bias(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+ 
++    // true when the route bias of layer il already holds the layer's exp_probs_b (it replaces exp_probs_b in the graph, see 0034)
++    bool route_bias_folded(int32_t il) const;
++
+     // the experts selected at the last small-batch lookup of layer il (LLAMA_MOE_PROBE), nullptr if none
+     const std::vector<int32_t> * last_ids(int32_t il) const;
+ 
+-- 
+2.43.0
+

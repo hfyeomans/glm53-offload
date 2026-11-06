@@ -1,0 +1,87 @@
+From ae8250da686f78f0a0923fe9dab8862e5d7320ab Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:28:58 -0600
+Subject: [PATCH 034/141] MTP draft context: an expert cache over the NextN
+ layers only, sized by LLAMA_MTP_MOE_CACHE_MIB (default none), instead of a
+ second full-size cache
+
+---
+ src/llama-context.cpp   | 13 +++++++++++--
+ src/llama-moe-cache.cpp |  8 ++++----
+ src/llama-moe-cache.h   |  3 ++-
+ 3 files changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f806283b7..07e388991 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -631,8 +631,17 @@ llama_context::llama_context(
+             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+         }
+ 
+-        if (cparams.moe_cache_size > 0) {
+-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
++        // the MTP draft context runs the NextN layers only: a cache of its own size for them (LLAMA_MTP_MOE_CACHE_MIB, default 0 = none)
++        size_t  moe_cache_size   = cparams.moe_cache_size;
++        int32_t moe_cache_il_min = 0;
++        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++            const char * mib = getenv("LLAMA_MTP_MOE_CACHE_MIB");
++            moe_cache_size   = mib != nullptr ? (size_t) atoll(mib)*1024*1024 : 0;
++            moe_cache_il_min = (int32_t) model.hparams.n_layer();
++            LLAMA_LOG_INFO("%s: MTP draft context: expert cache %zu MiB for the layers from %d\n", __func__, moe_cache_size/1024/1024, moe_cache_il_min);
++        }
++        if (moe_cache_size > 0) {
++            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, moe_cache_size, cparams.moe_cache_cpu_share, moe_cache_il_min);
+         }
+ 
+         sched_reserve();
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 291f869a3..b6f6a8ff0 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -472,7 +472,7 @@ struct llama_moe_cache::impl {
+     // views used by copy_experts
+     ggml_context_ptr ctx_views;
+ 
+-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
++    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t il_min) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+@@ -497,7 +497,7 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
+-        for (size_t il = 0; il < model.layers.size(); ++il) {
++        for (size_t il = (size_t) std::max<int32_t>(il_min, 0); il < model.layers.size(); ++il) {
+             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_tensor_is_host_weight)) {
+                 continue;
+@@ -1397,8 +1397,8 @@ struct llama_moe_cache::impl {
+     }
+ };
+ 
+-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
+-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
++llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t il_min) :
++    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, il_min)) {
+ }
+ 
+ llama_moe_cache::~llama_moe_cache() = default;
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 91d261bb1..de33de848 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -14,7 +14,8 @@ class llama_moe_cache {
+ public:
+     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+     // cpu_share is the share of the misses computed on the CPU instead of uploaded
+-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
++    // il_min: the first layer the cache may hold (the MTP draft context caches its NextN layers only)
++    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t il_min = 0);
+     ~llama_moe_cache();
+ 
+     // the device that caches layer il
+-- 
+2.43.0
+

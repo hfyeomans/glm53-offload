@@ -1,0 +1,149 @@
+From ada66776c0ded0f989de95b38eea31ac0c0ed58c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:07:58 -0600
+Subject: [PATCH 118/141] LLAMA_MTP_DSA=1: the GLM-DSA MTP draft head attends
+ sparsely with its own lightning indexer (a DSA cache of the nextn layer, the
+ trunk top-k attention) instead of dense MLA over the whole cache
+
+---
+ src/llama-model.cpp    | 25 ++++++++++++++-
+ src/models/glm-dsa.cpp | 73 ++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 716c139f7..c0d61ac01 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2981,7 +2981,30 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         case LLM_ARCH_GLM_DSA:
+         case LLM_ARCH_DEEPSEEK32:
+             {
+-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
++                // 0119 LLAMA_MTP_DSA=1: the MTP block attends sparsely with its own indexer -- a DSA cache of the nextn layer
++                static const bool mtp_dsa = getenv("LLAMA_MTP_DSA") != nullptr && atoi(getenv("LLAMA_MTP_DSA")) != 0;
++                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0 && mtp_dsa && arch == LLM_ARCH_GLM_DSA &&
++                        layers[hparams.n_layer()].indexer_attn_k != nullptr) {
++                    llama_kv_cache::layer_filter_cb filter_mla = [&](uint32_t il) { return il >= hparams.n_layer(); };
++                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il >= hparams.n_layer() && layers[il].indexer_attn_k != nullptr; };
++                    LLAMA_LOG_INFO("%s: LLAMA_MTP_DSA: the MTP draft context gets a DSA cache (MLA + indexer keys) of the nextn layer\n", __func__);
++
++                    res = new llama_kv_cache_dsa(
++                            *this,
++                            params.no_alloc,
++                            params.type_k,
++                            params.type_v,
++                            !cparams.flash_attn,
++                            cparams.offload_kqv,
++                            cparams.kv_unified,
++                            cparams.n_ctx_seq,
++                            cparams.n_seq_max,
++                            hparams.n_swa,
++                            hparams.swa_type,
++                            filter_mla,
++                            filter_lid,
++                            nullptr);
++                } else if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
+                     // MTP context uses a plain attention KV cache holding only the
+                     // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 5071c57a4..7a0a304fa 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1336,7 +1336,10 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     // MLA with the absorption optimization uses a K-only cache (V is a view of K)
+-    auto * inp_attn = build_attn_inp_k();
++    // 0119 LLAMA_MTP_DSA=1: the DSA input (MLA + indexer caches, llama_model::create_memory) when the block has an indexer
++    static const bool mtp_dsa = getenv("LLAMA_MTP_DSA") != nullptr && atoi(getenv("LLAMA_MTP_DSA")) != 0;
++    llm_graph_input_attn_k_dsa * inp_dsa = mtp_dsa && layer.indexer_attn_k != nullptr ? build_attn_inp_k_dsa() : nullptr;
++    auto * inp_attn = inp_dsa == nullptr ? build_attn_inp_k() : nullptr;
+ 
+     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+     cb(h_norm, "mtp_hnorm", il);
+@@ -1363,6 +1366,68 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+         q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+         cb(q, "mtp_q", il);
+ 
++        // 0119: the block's lightning indexer picks its keys, as a trunk "full" layer does (queries from the normed q_a, keys and
++        // weights from the normed input)
++        ggml_tensor * top_k = nullptr;
++        if (inp_dsa != nullptr) {
++            const int64_t  n_indexer_head      = hparams.indexer_n_head;
++            const int64_t  n_embd_indexer_head = hparams.indexer_head_size;
++            const uint32_t n_indexer_top_k     = hparams.indexer_top_k;
++            GGML_ASSERT(hparams.n_rot() <= n_embd_indexer_head);
++
++            ggml_tensor * indexer_q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q);
++            indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, n_tokens);
++            indexer_q = ggml_rope_ext(ctx0, indexer_q, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                      ext_factor, attn_factor, beta_fast, beta_slow);
++            cb(indexer_q, "mtp_indexer_q", il);
++
++            ggml_tensor * indexer_k = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
++            indexer_k = build_norm(indexer_k, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
++            indexer_k = ggml_reshape_3d(ctx0, indexer_k, n_embd_indexer_head, 1, n_tokens);
++            indexer_k = ggml_rope_ext(ctx0, indexer_k, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                      ext_factor, attn_factor, beta_fast, beta_slow);
++            cb(indexer_k, "mtp_indexer_k", il);
++
++            // the Hadamard transform of the indexer's queries and keys
++            indexer_q = ggml_mul_mat(ctx0, inp_dsa->self_k_rot_lid[il], indexer_q);
++            indexer_k = ggml_mul_mat(ctx0, inp_dsa->self_k_rot_lid[il], indexer_k);
++
++            const auto * mctx_lid = inp_dsa->mctx->get_lid();
++            ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, inp_dsa->get_k_idxs_lid(), il));
++
++            ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
++            indexer_k = mctx_lid->get_k(ctx0, il);
++
++            const auto n_stream = indexer_k->ne[3];
++            indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,
++                                     indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
++            indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2],
++                                           n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
++            indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
++            cb(indexer_weights, "mtp_indexer_weights", il);
++
++            ggml_tensor * indexer_score = nullptr;
++            if (cparams.fused_lid) {
++                indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_dsa->self_attn_mask_lid.cnv);
++                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
++            } else {
++                indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
++                indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
++                ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
++                indexer_kq    = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
++                indexer_score = ggml_relu(ctx0, indexer_kq);
++                indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
++                indexer_score = ggml_sum_rows(ctx0, indexer_score);
++                indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
++                indexer_score = ggml_add(ctx0, indexer_score, inp_dsa->self_attn_mask_lid.cnv);
++            }
++            cb(indexer_score, "mtp_indexer_score", il);
++
++            const uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
++            top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
++            cb(top_k, "mtp_top_k", il);
++        }
++
+         q = ggml_mul_mat(ctx0, layer.wq_b, q);
+         cb(q, "mtp_q", il);
+ 
+@@ -1434,7 +1499,11 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+         cb(Vcur, "mtp_Vcur", il);
+ 
+         // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
+-        cur = build_attn(inp_attn,
++        cur = inp_dsa != nullptr
++            ? build_attn(inp_dsa, // 0119: the top-k attention of the trunk
++                layer.wo, NULL, layer.wo_s,
++                Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, top_k, kq_scale, il)
++            : build_attn(inp_attn,
+                 layer.wo, NULL, layer.wo_s,
+                 Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale, il);
+         cb(cur, "mtp_attn_out", il);
+-- 
+2.43.0
+

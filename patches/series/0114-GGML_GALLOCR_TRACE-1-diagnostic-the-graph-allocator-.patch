@@ -1,0 +1,88 @@
+From f40d0357697b5609536a3c2fc487da6b13d05368 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 12:15:47 -0600
+Subject: [PATCH 114/141] GGML_GALLOCR_TRACE=1 (diagnostic): the graph
+ allocator logs why it re-plans in a release build (counts, or the first node
+ / source that outgrew its slot, with sizes); the layer-major graph logs its
+ key extents
+
+---
+ ggml/src/ggml-alloc.c  | 45 ++++++++++++++++++++++++++++++++++++++++++
+ src/models/glm-dsa.cpp |  4 ++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 3ad0c2e79..6d641dc14 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -1021,7 +1021,52 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
+     return talloc->size_max >= node_size;
+ }
+ 
++static bool ggml_gallocr_trace(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_GALLOCR_TRACE");
++        v = e != NULL && atoi(e) != 0;
++    }
++    return v != 0;
++}
++
++static size_t ggml_gallocr_trace_size(ggml_gallocr_t galloc, struct ggml_tensor * t, struct tensor_alloc * ta) {
++    if (t->data || t->view_src || ta->buffer_id < 0) {
++        return 0;
++    }
++    return ggml_backend_buft_get_alloc_size(galloc->bufts[ta->buffer_id], t);
++}
++
+ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
++    // 0115 GGML_GALLOCR_TRACE=1: the reason, in a release build
++    if (ggml_gallocr_trace() && (galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs)) {
++        GGML_LOG_INFO("gallocr trace: nodes %d -> %d, leafs %d -> %d\n", galloc->n_nodes, graph->n_nodes, galloc->n_leafs, graph->n_leafs);
++    }
++    if (ggml_gallocr_trace() && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs) {
++        for (int i = 0; i < graph->n_nodes; i++) {
++            struct ggml_tensor * node = graph->nodes[i];
++            struct node_alloc * na = &galloc->node_allocs[i];
++            if (!ggml_gallocr_node_needs_realloc(galloc, node, &na->dst)) {
++                GGML_LOG_INFO("gallocr trace: node %d %s (%s) needs %zu, slot %zu\n", i, node->name, ggml_op_desc(node),
++                    ggml_gallocr_trace_size(galloc, node, &na->dst), na->dst.size_max);
++                break;
++            }
++            bool bad = false;
++            for (int j = 0; j < GGML_MAX_SRC; j++) {
++                struct ggml_tensor * src = node->src[j];
++                if (src != NULL && !ggml_gallocr_node_needs_realloc(galloc, src, &na->src[j])) {
++                    GGML_LOG_INFO("gallocr trace: node %d %s (%s) src %d %s needs %zu, slot %zu\n", i, node->name, ggml_op_desc(node), j,
++                        src->name, ggml_gallocr_trace_size(galloc, src, &na->src[j]), na->src[j].size_max);
++                    bad = true;
++                    break;
++                }
++            }
++            if (bad) {
++                break;
++            }
++        }
++    }
++
+     if (galloc->n_nodes != graph->n_nodes) {
+ #ifndef NDEBUG
+         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index f55ab2790..2348a5369 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -648,6 +648,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             return v[0];
+         };
+ 
++        if (getenv("GGML_GALLOCR_TRACE") != nullptr) { // 0115
++            LLAMA_LOG_INFO("lm graph: n_tokens %lld n_kv %lld lm_kv_end %u reserve %d blocks %zu, first block keys %lld\n", (long long) n_tokens,
++                (long long) n_kv, cparams.lm_kv_end, (int) cparams.lm_reserve, blocks.size(), (long long) blocks[0].n_kv);
++        }
+         std::vector<ggml_tensor *> top_k_prev(blocks.size(), nullptr);
+         for (int il = 0; il < n_layer; ++il) {
+             const auto & L = model.layers[il];
+-- 
+2.43.0
+

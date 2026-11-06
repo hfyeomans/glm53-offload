@@ -1,0 +1,76 @@
+From 18fee94187e78c0e8619868e300f5a80a48b6861 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:20:37 -0600
+Subject: [PATCH 081/141] upload ring: GGML_CUDA_RING_MIXED=1 copies runs of
+ uncached experts host-to-device and cached ones from their banks (copy engine
+ both ways); the TP expert views build their table
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 24 ++++++++++++++++++++++++
+ src/llama-context.cpp           | 14 +++++++++++++-
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4d73204f7..754bda5f9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7130,6 +7130,30 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     char * dst = (char *) r.slot[s] + r.used;
+     r.used += GGML_PAD(bytes, 256);
+ 
++    // 0082 GGML_CUDA_RING_MIXED=1: given both the table and the host tensor, the copy engine copies a run of host entries in one
++    // host-to-device transfer and a cached expert (an entry elsewhere, a device bank) device-to-device, so the cache saves PCIe bytes
++    static const bool ring_mixed = getenv("GGML_CUDA_RING_MIXED") != nullptr && atoi(getenv("GGML_CUDA_RING_MIXED")) != 0;
++    if (host_all != nullptr && srcs != nullptr && ring_mixed) {
++        const char * hb = (const char *) host_all;
++        int64_t e = 0;
++        while (e < n) {
++            if (srcs[e] == hb + (size_t) e*size) {
++                int64_t e1 = e + 1;
++                while (e1 < n && srcs[e1] == hb + (size_t) e1*size) {
++                    e1++;
++                }
++                CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e*size, hb + (size_t) e*size, (size_t) (e1 - e)*size, cudaMemcpyHostToDevice, r.stream));
++                e = e1;
++            } else {
++                CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e*size, srcs[e], size, cudaMemcpyDeviceToDevice, r.stream));
++                e++;
++            }
++        }
++        CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++        CUDA_CHECK(cudaStreamWaitEvent(main_stream, r.ev_upload, 0));
++        return dst;
++    }
++
+     if (host_all != nullptr) {
+         // the whole tensor from the pinned host weights in one DMA transfer
+         CUDA_CHECK(cudaMemcpyAsync(dst, host_all, bytes, cudaMemcpyHostToDevice, r.stream));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index df26efe81..9200633a2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3153,8 +3153,20 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             auto it = st.tp_ring_il.find(backend);
+             const bool first = il < 0 || it == st.tp_ring_il.end() || it->second != il;
+             st.tp_ring_il[backend] = il;
++            // 0082: the half's experts the card's MoE cache holds come from its banks (GGML_CUDA_RING_MIXED=1; the card that does not
++            // hold the layer finds none), the rest from the host
++            static const bool ring_mixed = getenv("GGML_CUDA_RING_MIXED") != nullptr && atoi(getenv("GGML_CUDA_RING_MIXED")) != 0;
++            const void * table[256];
++            const bool use_table = ring_mixed && lctx->moe_cache && n_expert <= 256;
++            if (use_table) {
++                const int64_t e0 = (int64_t) (((const uint8_t *) src->data - (const uint8_t *) src->view_src->data)/expert_size);
++                for (int64_t e = 0; e < n_expert; ++e) {
++                    const void * pc = lctx->moe_cache->cached_expert(backend, src->view_src, e0 + e);
++                    table[e] = pc != nullptr ? pc : (const void *) ((const uint8_t *) src->data + e*expert_size);
++                }
++            }
+             // 0077: slots sized for the layer-split path as well, so a later layer-split prompt does not grow them (a device sync)
+-            void * p = ggml_backend_cuda_upload_ring_gather(backend, first, nullptr, n_expert, expert_size,
++            void * p = ggml_backend_cuda_upload_ring_gather(backend, first, use_table ? table : nullptr, n_expert, expert_size,
+                 std::max({ st.tp_ring_slot, 3*GGML_PAD(ggml_nbytes(dst), 256), ring_split_max(backend) }), src->data);
+             if (p != nullptr) {
+                 dst->data = p;
+-- 
+2.43.0
+

@@ -1,0 +1,291 @@
+From 017eb0231521c635940b30068e17ab50a3e9087b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 19:41:34 -0600
+Subject: [PATCH 095/141] lightning indexer as a tensor-core tile
+ (GGML_CUDA_LID_MMA=1): 8 queries a block in mma A fragments, 64-key f16 tiles
+ by cp.async, keys dequantized once a call
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 210 ++++++++++++++++++++++++
+ tests/test-backend-ops.cpp              |  23 +++
+ 2 files changed, 233 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 429d2e200..f17469f4c 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -2,6 +2,7 @@
+ #include "lightning-indexer.cuh"
+ #include "fattn-common.cuh"
+ #include "convert.cuh"
++#include "cp-async.cuh"
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ #if defined(TURING_MMA_AVAILABLE)
+@@ -551,6 +552,187 @@ static __global__ void lightning_indexer_kernel_tile(
+     }
+ }
+ 
++
++// 0096 GGML_CUDA_LID_MMA=1: the indexer as a tensor-core tile (32 heads x 128 dims)
++#define LID_MMA_QPB   8     // queries per block, one per warp
++#define LID_MMA_KT    64    // keys per shared-memory tile
++#define LID_MMA_KPB   1024  // keys per block (grid.y covers the rest)
++#define LID_MMA_KSTR  136   // halves per key row in shared memory (128 + 8: conflict-free fragment loads)
++
++template <ggml_type TYPE_K>
++static __global__ void lightning_indexer_k_to_f16(const char * __restrict__ K, half * __restrict__ dst,
++        const int64_t n_kv, const int64_t n_stream, const size_t nbk2, const size_t nbk3) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; // a group of 4 values
++    const int64_t n4 = n_stream*n_kv*32;
++    if (i >= n4) {
++        return;
++    }
++    const int64_t i_s  = i / (n_kv*32);
++    const int64_t i_kv = (i / 32) % n_kv;
++    const int     i4   = i % 32;
++    const void * k_base = (const void *) (K + i_kv*nbk2 + i_s*nbk3);
++    constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, half, 4>();
++    __align__(8) half tmp[4];
++    dequantize_k(k_base, tmp, i4*4);
++    *(int2 *) (dst + (i_s*n_kv + i_kv)*128 + i4*4) = *(const int2 *) tmp;
++}
++
++static __device__ __forceinline__ void lid_mma_16816(float * c, const uint32_t * a, const uint32_t b0, const uint32_t b1) {
++#if defined(AMPERE_MMA_AVAILABLE)
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED_VARS(c, a, b0, b1);
++    NO_DEVICE_CODE;
++#endif // defined(AMPERE_MMA_AVAILABLE)
++}
++
++static __device__ __forceinline__ uint32_t lid_pack_h2(const float2 v) {
++    const half2 h = __float22half2_rn(v);
++    return *(const uint32_t *) &h;
++}
++
++__launch_bounds__(LID_MMA_QPB*WARP_SIZE, 2)
++static __global__ void lightning_indexer_kernel_mma(
++        const float * __restrict__ Q, const half * __restrict__ K16, const float * __restrict__ W, const half * __restrict__ M,
++        float * __restrict__ dst,
++        const int64_t n_batch, const int64_t n_kv,
++        const size_t nb1, const size_t nb3,
++        const size_t nbq1, const size_t nbq2, const size_t nbq3,
++        const size_t nbw1, const size_t nbw3,
++        const size_t nbm1, const size_t nbm3, const int64_t nem3) {
++#if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
++    __shared__ __align__(16) half k_tile[2][LID_MMA_KT*LID_MMA_KSTR];
++
++    const int lane     = threadIdx.x;
++    const int warp     = threadIdx.y;
++    const int tid      = warp*WARP_SIZE + lane;
++    const int i_stream = blockIdx.z;
++    const int64_t i_q  = (int64_t) blockIdx.x*LID_MMA_QPB + warp;
++    const bool q_ok    = i_q < n_batch;
++    const int64_t kv0  = (int64_t) blockIdx.y*LID_MMA_KPB;
++    const int64_t kv1  = kv0 + LID_MMA_KPB < n_kv ? kv0 + LID_MMA_KPB : n_kv;
++    const int n_tiles  = (int) ((kv1 - kv0 + LID_MMA_KT - 1)/LID_MMA_KT);
++
++    const half * k_s = K16 + (int64_t) i_stream*n_kv*128;
++
++    // the 64-key tile t into buffer b: 1,024 16-byte pieces, 4 a thread; rows past the end read key 0 (their outputs are not written)
++    auto load_tile = [&](const int t, const int b) {
++#pragma unroll
++        for (int p = 0; p < (LID_MMA_KT*128/8)/(LID_MMA_QPB*WARP_SIZE); ++p) {
++            const int piece = p*LID_MMA_QPB*WARP_SIZE + tid;
++            const int row   = piece / 16;
++            const int col   = (piece % 16)*8;
++            int64_t kv = kv0 + (int64_t) t*LID_MMA_KT + row;
++            kv = kv < kv1 ? kv : 0;
++            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(&k_tile[b][row*LID_MMA_KSTR + col]), k_s + kv*128 + col);
++        }
++        asm volatile("cp.async.commit_group;");
++    };
++
++    if (n_tiles > 0) {
++        load_tile(0, 0);
++    }
++
++    // this warp's query as A fragments: m-tile m = heads 16m..16m+15, k-step s = dims 16s..16s+15
++    uint32_t a[2][8][4];
++    float    wv[2][2];
++    {
++        const int64_t iq = q_ok ? i_q : 0;
++        const char * q_base = (const char *) Q + iq*nbq2 + i_stream*nbq3;
++        const float * w_base = (const float *) ((const char *) W + iq*nbw1 + i_stream*nbw3);
++        const int r = lane / 4;
++        const int c = 2*(lane % 4);
++#pragma unroll
++        for (int m = 0; m < 2; ++m) {
++            const float * q0 = (const float *) (q_base + (16*m + r    )*nbq1);
++            const float * q8 = (const float *) (q_base + (16*m + r + 8)*nbq1);
++#pragma unroll
++            for (int s = 0; s < 8; ++s) {
++                a[m][s][0] = lid_pack_h2(*(const float2 *) (q0 + 16*s + c));
++                a[m][s][1] = lid_pack_h2(*(const float2 *) (q8 + 16*s + c));
++                a[m][s][2] = lid_pack_h2(*(const float2 *) (q0 + 16*s + c + 8));
++                a[m][s][3] = lid_pack_h2(*(const float2 *) (q8 + 16*s + c + 8));
++            }
++            wv[m][0] = w_base[16*m + r];
++            wv[m][1] = w_base[16*m + r + 8];
++        }
++    }
++
++    const half * m_base = (const half *) ((const char *) M + (q_ok ? i_q : 0)*nbm1 + (i_stream % nem3)*nbm3);
++    float      * d_base = (float *) ((char *) dst + (q_ok ? i_q : 0)*nb1 + i_stream*nb3);
++
++    for (int t = 0; t < n_tiles; ++t) {
++        const int b = t & 1;
++        if (t + 1 < n_tiles) {
++            load_tile(t + 1, b ^ 1);
++            asm volatile("cp.async.wait_group 1;");
++        } else {
++            asm volatile("cp.async.wait_group 0;");
++        }
++        __syncthreads();
++
++        const uint32_t * kt = (const uint32_t *) k_tile[b];
++#pragma unroll
++        for (int ht = 0; ht < 2; ++ht) { // two passes of 32 keys: 4 n-tiles of 8
++            float c[2][4][4] = {};
++#pragma unroll
++            for (int s = 0; s < 8; ++s) {
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    const int key = 32*ht + 8*j + lane/4;
++                    const uint32_t b0 = kt[(key*LID_MMA_KSTR + 16*s + 2*(lane % 4))/2];
++                    const uint32_t b1 = kt[(key*LID_MMA_KSTR + 16*s + 2*(lane % 4) + 8)/2];
++                    lid_mma_16816(c[0][j], a[0][s], b0, b1);
++                    lid_mma_16816(c[1][j], a[1][s], b0, b1);
++                }
++            }
++            // sum_h w_h relu(.) over this thread's 4 head rows, then over the 8 row groups (lanes with the same lane % 4)
++            float sc[4][2];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {
++                    float v = 0.0f;
++#pragma unroll
++                    for (int m = 0; m < 2; ++m) {
++                        v += wv[m][0]*fmaxf(c[m][j][e], 0.0f) + wv[m][1]*fmaxf(c[m][j][2 + e], 0.0f);
++                    }
++                    v += __shfl_xor_sync(0xFFFFFFFF, v,  4);
++                    v += __shfl_xor_sync(0xFFFFFFFF, v,  8);
++                    v += __shfl_xor_sync(0xFFFFFFFF, v, 16);
++                    sc[j][e] = v;
++                }
++            }
++            // every lane holds all 32 keys' sums; lanes 0-15 write them, n-tile j = lane/4, keys 8j + 2(lane%4) + {0, 1}
++            if (q_ok && lane < 16) {
++                const int j = lane / 4;
++                float s0 = sc[0][0], s1 = sc[0][1];
++#pragma unroll
++                for (int jj = 1; jj < 4; ++jj) {
++                    if (j == jj) {
++                        s0 = sc[jj][0];
++                        s1 = sc[jj][1];
++                    }
++                }
++                const int64_t kv = kv0 + (int64_t) t*LID_MMA_KT + 32*ht + 8*j + 2*(lane % 4);
++                if (kv + 1 < kv1) {
++                    const half2 mk = *(const half2 *) (m_base + kv);
++                    *(float2 *) (d_base + kv) = make_float2(s0 + __low2float(mk), s1 + __high2float(mk));
++                } else if (kv < kv1) {
++                    d_base[kv] = s0 + __half2float(m_base[kv]);
++                }
++            }
++        }
++        __syncthreads(); // buffer b is reloaded two tiles on
++    }
++#else
++    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++    NO_DEVICE_CODE;
++#endif // defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
++}
++
+ #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
+     if (K->type == (type_K)) {                                                              \
+         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+@@ -615,6 +797,34 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int device = ggml_cuda_get_device();
+     const int cc     = ggml_cuda_info().devices[device].cc;
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    // 0096 GGML_CUDA_LID_MMA=1: 32 heads x 128 on Ampere+ NVIDIA as a tensor-core tile
++    static const bool lid_mma = getenv("GGML_CUDA_LID_MMA") != nullptr && atoi(getenv("GGML_CUDA_LID_MMA")) != 0;
++    if (lid_mma && n_embd == 128 && n_head == 32 && GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc) &&
++            nbq0 == sizeof(float) && nbw0 == sizeof(float) && n_kv % 2 == 0 && nbm1 % 4 == 0 && nb1 % 8 == 0 &&
++            (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q4_1 ||
++             k->type == GGML_TYPE_Q5_0 || k->type == GGML_TYPE_Q5_1)) {
++        ggml_cuda_pool_alloc<half> k16(ctx.pool(), (size_t) n_stream*n_kv*128);
++        const int64_t n4 = (int64_t) n_stream*n_kv*32;
++        const int nthr = 256;
++        const dim3 grid_k((unsigned) ((n4 + nthr - 1)/nthr), 1, 1);
++        switch (k->type) {
++            case GGML_TYPE_F16:  lightning_indexer_k_to_f16<GGML_TYPE_F16 ><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            case GGML_TYPE_Q8_0: lightning_indexer_k_to_f16<GGML_TYPE_Q8_0><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            case GGML_TYPE_Q4_0: lightning_indexer_k_to_f16<GGML_TYPE_Q4_0><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            case GGML_TYPE_Q4_1: lightning_indexer_k_to_f16<GGML_TYPE_Q4_1><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            case GGML_TYPE_Q5_0: lightning_indexer_k_to_f16<GGML_TYPE_Q5_0><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            case GGML_TYPE_Q5_1: lightning_indexer_k_to_f16<GGML_TYPE_Q5_1><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
++            default: GGML_ABORT("fatal error");
++        }
++        const dim3 block(WARP_SIZE, LID_MMA_QPB, 1);
++        const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + LID_MMA_KPB - 1)/LID_MMA_KPB), (unsigned) n_stream);
++        lightning_indexer_kernel_mma<<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
++            nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++        return;
++    }
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
+     if (n_embd == 128 && n_head == 64) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+         if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 667733109..4bff34e79 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12784,6 +12784,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // 0096: 32 heads at the tile kernel's edges (GGML_CUDA_LID_MMA=1 takes even key counts): partial key tiles, a second key block
++    // (1,024 keys a block), partial query blocks (8 a block), 4 streams
++    for (int kv : { 2, 8, 62, 64, 66, 1026, 2050 }) {
++        for (int bs : { 1, 7, 9, 33 }) {
++            for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++                test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, bs, 1, 1, type_K));
++                test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, bs, 4, 1, type_K));
++            }
++        }
++    }
++
+     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
+         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
+             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
+@@ -12823,6 +12834,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         return test_cases;
+     }
+ 
++    if (getenv("LLAMA_TEST_LID_PP") != nullptr) {
++        // 0096: the lightning indexer at one card's prompt shapes, 32 heads x 128
++        for (ggml_type type_K : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
++            for (int nb : { 4096, 8192 }) {
++                for (int kv : { 4096, 16384, 32768, 49152 }) {
++                    test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, nb, 1, 1, type_K));
++                }
++            }
++        }
++        return test_cases;
++    }
++
+     if (getenv("LLAMA_TEST_PP_GEMM") != nullptr) {
+         // 0095: the prompt path's matmuls at GLM-5.3's shapes: routed experts (256, top-8) and the dense attention projections
+         for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+-- 
+2.43.0
+

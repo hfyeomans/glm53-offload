@@ -1,0 +1,79 @@
+From 0708c244542532577ea17925a73b3acd477dc135 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:50:15 -0600
+Subject: [PATCH 036/141] speculative: the draft context shares the target
+ context's CPU threadpools instead of spawning a disposable pool per graph
+
+---
+ common/speculative.cpp | 5 +++++
+ src/llama-context.cpp  | 8 ++++++++
+ src/llama-context.h    | 2 ++
+ src/llama-ext.h        | 4 ++++
+ 4 files changed, 19 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4305ac6ac..d65e26bec 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2756,6 +2756,11 @@ common_speculative_init_result::common_speculative_init_result(
+             LOG_ERR("%s: failed to create MTP context\n", __func__);
+             return;
+         }
++        // the draft context shares the target's CPU threadpools (otherwise every CPU graph spawns a disposable pool)
++        if (llama_get_threadpool(ctx_tgt) != nullptr) {
++            llama_attach_threadpool(ctx_dft, llama_get_threadpool(ctx_tgt), llama_get_threadpool_batch(ctx_tgt));
++            LOG_INF("%s: MTP draft context shares the target's threadpools\n", __func__);
++        }
+ 
+         pimpl->context.reset(ctx_dft);
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07e388991..e50c4529d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1414,6 +1414,14 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
+ }
+ 
+ 
++ggml_threadpool_t llama_get_threadpool(llama_context * ctx) {
++    return ctx->threadpool;
++}
++
++ggml_threadpool_t llama_get_threadpool_batch(llama_context * ctx) {
++    return ctx->threadpool_batch;
++}
++
+ void llama_context::attach_threadpool(
+            ggml_threadpool_t threadpool,
+            ggml_threadpool_t threadpool_batch) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 25ba18cba..a95c7dd9e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -424,6 +424,8 @@ private:
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+ 
++public:
++    // read by llama_get_threadpool(_batch) (staging API)
+     ggml_threadpool_t threadpool       = nullptr;
+     ggml_threadpool_t threadpool_batch = nullptr;
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index fcd91e912..1aab7a514 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -30,6 +30,10 @@ LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
+ 
+ LLAMA_API bool llama_arch_supports_sm_tensor(llm_arch arch);
+ 
++// the threadpools attached to a context (nullptr when none): a speculative draft context shares the target's
++LLAMA_API ggml_threadpool_t llama_get_threadpool(struct llama_context * ctx);
++LLAMA_API ggml_threadpool_t llama_get_threadpool_batch(struct llama_context * ctx);
++
+ LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
+ 
+ // FIXME temporary function for better error messages
+-- 
+2.43.0
+

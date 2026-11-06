@@ -1,0 +1,51 @@
+From d361361688ac321e21a4e7084b738d13845c0303 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:34:49 -0600
+Subject: [PATCH 135/141] GGML_SCHED_PAIR_GATE_UP=1: an expert gate / up
+ MUL_MAT_ID pair stays in one scheduler split, so the CUDA backend can fuse it
+ with its GLU
+
+---
+ ggml/src/ggml-backend.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 0f293d0e5..01342f976 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1765,6 +1765,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         split->i_start = 0;
+         split->n_inputs = 0;
+         int cur_backend_id = split->backend_id;
++        // 0131 GGML_SCHED_PAIR_GATE_UP=1: the last node placed (view ops aside), to keep an expert gate / up pair in one split
++        static const bool pair_gate_up = getenv("GGML_SCHED_PAIR_GATE_UP") != nullptr && atoi(getenv("GGML_SCHED_PAIR_GATE_UP")) != 0;
++        struct ggml_tensor * prev_node = NULL;
+         for (; i < graph->n_nodes; i++) {
+             struct ggml_tensor * node = graph->nodes[i];
+ 
+@@ -1776,9 +1779,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
+ 
++            // 0131: a MUL_MAT_ID reading the input and ids of the MUL_MAT_ID just before it stays in that one's split
++            const bool pair = pair_gate_up && node->op == GGML_OP_MUL_MAT_ID && prev_node != NULL && prev_node->op == GGML_OP_MUL_MAT_ID &&
++                tensor_backend_id(prev_node) == node_backend_id && prev_node->src[1] == node->src[1] && prev_node->src[2] == node->src[2];
++
+             // check if we should start a new split based on the sources of the current node
+             bool need_new_split = false;
+-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
++            if (node_backend_id == cur_backend_id && split->n_inputs > 0 && !pair) {
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     struct ggml_tensor * src = node->src[j];
+                     if (src == NULL) {
+@@ -1866,6 +1873,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                 }
+             }
++            prev_node = node; // 0131
+         }
+         split->i_end = graph->n_nodes;
+         sched->n_splits = i_split + 1;
+-- 
+2.43.0
+

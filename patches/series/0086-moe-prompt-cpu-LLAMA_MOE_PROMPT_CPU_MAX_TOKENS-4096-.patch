@@ -1,0 +1,30 @@
+From 70df85cbff2b0d6060be393c34655c2ead469a04 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:07:28 -0600
+Subject: [PATCH 086/141] moe prompt cpu: LLAMA_MOE_PROMPT_CPU_MAX_TOKENS
+ (4096), the plan only for small ubatches (an 8K ubatch loses: the next
+ attention no longer overlaps an upload)
+
+---
+ src/llama-moe-cache.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 9dc2e25a4..d0c51afdb 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1524,7 +1524,10 @@ struct llama_moe_cache::impl {
+     }
+ 
+     ggml_tensor * get_prompt_map(int32_t il, int64_t n_tokens) const {
+-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].p_map == nullptr || n_tokens <= max_batch || prompt_n_pairs(n_tokens) > p_alloc) {
++        // 0087: a larger ubatch's next attention costs more than the plan saves (the upload no longer overlaps it)
++        static const int64_t max_tokens = (int64_t) prompt_env("LLAMA_MOE_PROMPT_CPU_MAX_TOKENS", 4096);
++        if (il < 0 || il >= (int32_t) layers.size() || layers[il].p_map == nullptr || n_tokens <= max_batch || n_tokens > max_tokens ||
++            prompt_n_pairs(n_tokens) > p_alloc) {
+             return nullptr;
+         }
+         return layers[il].p_map;
+-- 
+2.43.0
+

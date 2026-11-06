@@ -1,0 +1,86 @@
+From a3722fda15441ce921fc5267d5327cac383652c0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 22:21:18 -0600
+Subject: [PATCH 101/141] quantize_row_q8_K in AVX-512 on x86
+ (GGML_CPU_Q8K_SIMD, default on): bit for bit the reference, 6x
+
+---
+ ggml/src/ggml-cpu/arch/x86/quants.c | 60 +++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index 21cd6312a..35a95d57a 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -501,8 +501,68 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
+ #endif
+ }
+ 
++#if defined(__AVX512F__) && defined(__AVX512BW__)
++// 0102 GGML_CPU_Q8K_SIMD (default on): quantize_row_q8_K_ref in AVX-512, bit for bit (tools/offload/mb_q8k.cpp)
++static int ggml_cpu_q8k_simd(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * s = getenv("GGML_CPU_Q8K_SIMD");
++        v = s == NULL || atoi(s) != 0;
++    }
++    return v;
++}
++
++static void quantize_row_q8_K_avx512(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++    const __m512  absmask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
++    const __m512i c127    = _mm512_set1_epi32(127);
++    for (int64_t i = 0; i < nb; i++) {
++        __m512 v[16];
++        __m512 am = _mm512_setzero_ps();
++        for (int g = 0; g < 16; ++g) {
++            v[g] = _mm512_loadu_ps(x + 16*g);
++            am   = _mm512_max_ps(am, _mm512_and_ps(v[g], absmask));
++        }
++        const float amax = _mm512_reduce_max_ps(am);
++        if (!amax) {
++            y[i].d = 0;
++            memset(y[i].qs, 0, QK_K);
++            memset(y[i].bsums, 0, sizeof(y[i].bsums));
++            x += QK_K;
++            continue;
++        }
++        // the reference keeps the first element of largest |x|: its sign sets the scale's
++        float max = 0;
++        const __m512 amv = _mm512_set1_ps(amax);
++        for (int g = 0; g < 16; ++g) {
++            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_and_ps(v[g], absmask), amv, _CMP_EQ_OQ);
++            if (m) {
++                max = x[16*g + __builtin_ctz((unsigned) m)];
++                break;
++            }
++        }
++        const float  iscale = -127.f/max;
++        const __m512 isv    = _mm512_set1_ps(iscale);
++        for (int g = 0; g < 16; ++g) {
++            const __m512i q = _mm512_min_epi32(_mm512_cvt_roundps_epi32(_mm512_mul_ps(isv, v[g]), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), c127);
++            _mm_storeu_si128((__m128i *) (y[i].qs + 16*g), _mm512_cvtsepi32_epi8(q));
++            y[i].bsums[g] = (int16_t) _mm512_reduce_add_epi32(q);
++        }
++        y[i].d = 1/iscale;
++        x += QK_K;
++    }
++}
++#endif
++
+ // placeholder implementation for Apple targets
+ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
++#if defined(__AVX512F__) && defined(__AVX512BW__)
++    if (ggml_cpu_q8k_simd()) {
++        quantize_row_q8_K_avx512(x, (block_q8_K *) y, k);
++        return;
++    }
++#endif
+     quantize_row_q8_K_ref(x, y, k);
+ }
+ 
+-- 
+2.43.0
+

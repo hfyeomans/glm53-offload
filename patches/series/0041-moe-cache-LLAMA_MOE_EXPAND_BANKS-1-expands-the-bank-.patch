@@ -1,0 +1,37 @@
+From 57f969c157e6d4d6f55bdf6c483c2d7dd2639651 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 16:28:32 -0600
+Subject: [PATCH 041/141] moe cache: LLAMA_MOE_EXPAND_BANKS=1 expands the bank
+ views before the expert matmuls so gate, up and the GLU stay adjacent and
+ fuse
+
+---
+ src/llama-graph.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 724051edb..ff4e904df 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2431,6 +2431,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+         ggml_tensor * up = nullptr;
+ 
++        // LLAMA_MOE_EXPAND_BANKS (0040): the cached banks are views, i.e. graph nodes; put them in the graph before the expert matmuls so
++        // the gate and up MUL_MAT_IDs sit next to each other and to their GLU, which the CUDA backend then fuses into one kernel
++        static const bool expand_banks = getenv("LLAMA_MOE_EXPAND_BANKS") != nullptr && atoi(getenv("LLAMA_MOE_EXPAND_BANKS")) != 0;
++        if (expand_banks && cached && mm_ids != nullptr && moe_cache != nullptr) {
++            for (ggml_tensor * w : { gate_exps, up_exps, down_exps, gate_up_exps }) {
++                ggml_tensor * bank = w != nullptr ? moe_cache->get_experts(w) : nullptr;
++                if (bank != nullptr) {
++                    ggml_build_forward_expand(gf, bank);
++                }
++            }
++        }
++
+         if (gate_up_exps) {
+             // merged gate_up path: one mul_mat_id, then split into gate and up views
+             ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+-- 
+2.43.0
+

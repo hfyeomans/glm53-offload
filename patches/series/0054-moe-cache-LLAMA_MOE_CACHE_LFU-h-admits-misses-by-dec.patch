@@ -1,0 +1,153 @@
+From d7a6c057bc48fe3ee82244133ca6dabcc571bd88 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:13:43 -0600
+Subject: [PATCH 054/141] moe-cache: LLAMA_MOE_CACHE_LFU=h admits misses by
+ decayed use counts (half-life h decode steps), busiest first and only over a
+ sampled victim with a lower count
+
+---
+ src/llama-moe-cache.cpp | 93 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 88 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index a9f6157e6..a8ae82a70 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -47,6 +47,14 @@ struct moe_cache_slru {
+     std::vector<int32_t> misses;
+     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+ 
++    // LLAMA_MOE_CACHE_LFU=h (0053): decayed use counts, the weight of a use doubles every h decode steps
++    float              lfu_half    = 0.0f;
++    float              lfu_mul     = 1.0f;
++    float              lfu_w       = 1.0f;
++    int32_t            lfu_sample  = 64;
++    int32_t            lfu_il_last = -1;
++    std::vector<float> lfu_f;               // [n_layer*n_expert]
++
+     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+         this->n_expert = n_expert;
+         this->n_slots  = n_slots;
+@@ -63,6 +71,15 @@ struct moe_cache_slru {
+         tail[0] = n_slots - 1;
+         is_protected.assign(n_slots, false);
+         seen.assign(n_expert, 0);
++        if (const char * s = getenv("LLAMA_MOE_CACHE_LFU"); s != nullptr && atof(s) > 0.0) {
++            lfu_half = (float) atof(s);
++            lfu_mul  = std::exp2(1.0f/lfu_half);
++            lfu_f.assign((size_t) n_layer*n_expert, 0.0f);
++            if (const char * k = getenv("LLAMA_MOE_CACHE_LFU_SAMPLE"); k != nullptr && atoi(k) > 0) {
++                lfu_sample = atoi(k);
++            }
++            LLAMA_LOG_INFO("llama_moe_cache: LFU admission (0053), half-life %.0f steps, %d samples, %d slots\n", (double) lfu_half, lfu_sample, n_slots);
++        }
+     }
+ 
+     // move slot s to the most recently used end of a segment
+@@ -119,6 +136,40 @@ struct moe_cache_slru {
+         int32_t slot;
+     };
+ 
++    // 0053: an empty slot in slot order, else the lowest count of lfu_sample random slots that do not hold an expert of this lookup
++    int32_t lfu_victim(int32_t il, uint64_t & rng) const {
++        if (n_filled < n_slots) {
++            return n_filled;
++        }
++        int32_t best = -1;
++        float   bf   = 0.0f;
++        for (int32_t i = 0; i < lfu_sample || best < 0; ++i) {
++            rng = rng*6364136223846793005ull + 1442695040888963407ull;
++            const int32_t s   = (int32_t) ((rng >> 33) % (uint64_t) n_slots);
++            const int32_t key = key_of[s];
++            if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
++                continue;
++            }
++            if (best < 0 || lfu_f[key] < bf) {
++                best = s;
++                bf   = lfu_f[key];
++            }
++        }
++        return best;
++    }
++
++    void lfu_fill(int32_t il, int32_t e, int32_t s, std::vector<fill> & fills) {
++        if (key_of[s] >= 0) {
++            slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
++        } else {
++            n_filled++;
++        }
++        key_of[s] = il*n_expert + e;
++        slot_map[il][e] = s;
++        move(s, false);
++        fills.push_back({ e, s });
++    }
++
+     // give a slot to each expert selected by ids in layer il, evicting from probation first
+     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
+     // a zero slot is used at most once per token, a miss that does not get one is cached instead
+@@ -145,6 +196,22 @@ struct moe_cache_slru {
+         if (uniq.size() > (size_t) n_slots) {
+             return false;
+         }
++        if (lfu_half > 0.0f) {
++            if (il <= lfu_il_last) {
++                lfu_w *= lfu_mul;
++                if (lfu_w > 1e12f) {
++                    for (float & f : lfu_f) {
++                        f /= lfu_w;
++                    }
++                    lfu_w = 1.0f;
++                }
++            }
++            lfu_il_last = il;
++            float * f = lfu_f.data() + (size_t) il*n_expert;
++            for (size_t i = 0; i < n_ids; ++i) {
++                f[ids[i]] += lfu_w;
++            }
++        }
+ 
+         int32_t * slots = slot_map[il];
+ 
+@@ -160,10 +227,26 @@ struct moe_cache_slru {
+         }
+ 
+         // the misses left to the CPU are picked at random, so that every expert can enter the cache
+-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+-        for (size_t i = 0; i < n_c; ++i) {
+-            rng = rng*6364136223846793005ull + 1442695040888963407ull;
+-            std::swap(misses[i], misses[i + (rng >> 33) % (misses.size() - i)]);
++        size_t n_c = std::min(n_cpu(misses.size()), misses.size());
++        if (lfu_half > 0.0f) {
++            // 0053: the busiest misses first, up to the upload budget, each over a lower count only; the rest are left to the CPU
++            const float * f = lfu_f.data() + (size_t) il*n_expert;
++            std::sort(misses.begin(), misses.end(), [f](int32_t a, int32_t b) { return f[a] > f[b]; });
++            size_t k = 0;
++            for (; k < misses.size() - n_c; ++k) {
++                const int32_t s = lfu_victim(il, rng);
++                if (key_of[s] >= 0 && lfu_f[key_of[s]] >= f[misses[k]]) {
++                    break;
++                }
++                lfu_fill(il, misses[k], s, fills);
++            }
++            misses.erase(misses.begin(), misses.begin() + k);
++            n_c = misses.size();
++        } else {
++            for (size_t i = 0; i < n_c; ++i) {
++                rng = rng*6364136223846793005ull + 1442695040888963407ull;
++                std::swap(misses[i], misses[i + (rng >> 33) % (misses.size() - i)]);
++            }
+         }
+         if (n_c > 0) {
+             const size_t n_tokens = n_ids/n_used;
+@@ -204,7 +287,7 @@ struct moe_cache_slru {
+         // sorted misses usually get consecutive slots, so the uploads can be merged
+         std::sort(misses.begin(), misses.end());
+         for (int32_t e : misses) {
+-            const int32_t s = victim(il);
++            const int32_t s = lfu_half > 0.0f ? lfu_victim(il, rng) : victim(il);
+             if (key_of[s] >= 0) {
+                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+             } else {
+-- 
+2.43.0
+

@@ -1,0 +1,50 @@
+From c025268ec991ba9aac905249fc4c9cf38ec98257 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:17:11 -0600
+Subject: [PATCH 032/141] ring-only: define the switch before sched_new uses it
+
+---
+ src/llama-context.cpp | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bb3f1d8c3..f806283b7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -800,6 +800,16 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+     return (int) users.size();
+ }
+ 
++// LLAMA_MOE_RING_ONLY=1 (needs LLAMA_MOE_UPLOAD_RING=1 and LLAMA_MOE_UPLOAD_RING_MEMCPY=1): the MUL_MAT_ID expert copies of large batches
++// live in the upload ring only, the graph allocator reserves nothing for them
++static bool llama_moe_ring_only() {
++    static const bool v = [] {
++        auto on = [](const char * k) { return getenv(k) != nullptr && atoi(getenv(k)) != 0; };
++        return on("LLAMA_MOE_RING_ONLY") && on("LLAMA_MOE_UPLOAD_RING") && on("LLAMA_MOE_UPLOAD_RING_MEMCPY");
++    }();
++    return v;
++}
++
+ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     sched.reset(ggml_backend_sched_new(
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+@@ -3231,16 +3241,6 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
+-// LLAMA_MOE_RING_ONLY=1 (needs LLAMA_MOE_UPLOAD_RING=1 and LLAMA_MOE_UPLOAD_RING_MEMCPY=1): the MUL_MAT_ID expert copies of large batches
+-// live in the upload ring only, the graph allocator reserves nothing for them
+-static bool llama_moe_ring_only() {
+-    static const bool v = [] {
+-        auto on = [](const char * k) { return getenv(k) != nullptr && atoi(getenv(k)) != 0; };
+-        return on("LLAMA_MOE_RING_ONLY") && on("LLAMA_MOE_UPLOAD_RING") && on("LLAMA_MOE_UPLOAD_RING_MEMCPY");
+-    }();
+-    return v;
+-}
+-
+ static bool llama_has_host_weight(const ggml_tensor * t) {
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+         if (t->src[i] && llama_tensor_is_host_weight(t->src[i])) {
+-- 
+2.43.0
+

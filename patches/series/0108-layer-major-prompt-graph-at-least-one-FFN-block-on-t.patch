@@ -1,0 +1,27 @@
+From 5073dc76e8e457bafdced7d16e7dd473de763661 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:17:45 -0600
+Subject: [PATCH 108/141] layer-major prompt graph: at least one FFN block on
+ the last layer, on 0 rows when the ubatch has no outputs (an empty block list
+ crashed the builder for every ubatch of a prompt but its last)
+
+---
+ src/models/glm-dsa.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index e751a314a..edd024fdc 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -733,7 +733,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             // the FFN in balanced blocks of at most LLAMA_LM_MOE_ROWS rows (a block of a prompt ubatch never shrinks to the decode
+             // path's 8 rows); a layer's experts are one copy for all of them
+             const int64_t nh  = h->ne[1];
+-            const int64_t nbm = (nh + lm_moe_rows - 1)/lm_moe_rows;
++            const int64_t nbm = std::max<int64_t>(1, (nh + lm_moe_rows - 1)/lm_moe_rows); // 0110: one block on 0 rows when none is an output
+             std::vector<ggml_tensor *> fouts;
+             for (int64_t m = 0, m0 = 0; m < nbm; ++m) {
+                 const int64_t nm = nh/nbm + (m < nh % nbm ? 1 : 0);
+-- 
+2.43.0
+

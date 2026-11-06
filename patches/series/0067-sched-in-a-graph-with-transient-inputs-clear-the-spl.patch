@@ -1,0 +1,31 @@
+From c08b9f9e5d011963afc7d3c33fb80f83aa5236a6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:27:02 -0600
+Subject: [PATCH 067/141] sched: in a graph with transient inputs, clear the
+ split uid when the copy callback moves a copy, so a reused split does not
+ replay a CUDA graph with the old address
+
+---
+ ggml/src/ggml-backend.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 4f24c1eea..095cd1ee4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2217,8 +2217,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         ggml_backend_synchronize(split_backend);
+     }
+ 
++    void * const cpy_data = input_cpy->data;
+     if (sched->callback_copy != NULL &&
+         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++        if (sched->transient_inputs && input_cpy->data != cpy_data) {
++            split->graph.uid = 0; // 0066: a reused split's CUDA graph must not replay the copy's old address
++        }
+         ggml_sched_copy_account(1, tc0);
+         return;
+     }
+-- 
+2.43.0
+

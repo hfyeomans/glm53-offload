@@ -1,0 +1,169 @@
+From 88489caed60c8d075e68501bd98ff396f087156a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 07:37:29 -0600
+Subject: [PATCH 077/141] TP: the expert ring sized for the layer-split path
+ too (no growth sync later); host-memory weight copies through a second upload
+ ring per card (LLAMA_TP_WEIGHT_RING=0 off)
+
+---
+ ggml/include/ggml-cuda.h        |  3 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 +++++++++++--
+ src/llama-context.cpp           | 23 ++++++++++++++++++++++-
+ src/llama-context.h             |  2 ++
+ src/llama-model.cpp             | 11 +++++++++++
+ src/llama-model.h               |  3 +++
+ 6 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 521e38510..4c162b23d 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -38,6 +38,9 @@ GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void *
+ // `host_all`, when given, is the contiguous host copy of all n experts: the slot is then filled with one cudaMemcpyAsync (the copy
+ // engine) instead of the gather kernel, and `srcs` is ignored
+ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all);
++// 0078: the same two-slot ring, a second instance per device for weights in host memory: `bytes` from `host` into the current slot (a
++// new slot when first_of_layer), slots of slot_bytes
++GGML_BACKEND_API void * ggml_backend_cuda_weight_ring_upload(ggml_backend_t backend, bool first_of_layer, size_t bytes, size_t slot_bytes, const void * host);
+ 
+ // side uploads: a host -> device copy on the device's upload stream, beside the main stream's work; `wait` makes the main stream wait
+ // for every side upload issued since the last wait
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 01352fc69..4de95e9e6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7080,12 +7080,13 @@ struct ggml_cuda_upload_ring {
+ };
+ 
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
++static ggml_cuda_upload_ring g_cuda_weight_ring[GGML_CUDA_MAX_DEVICES]; // 0078: host-memory weights (LLAMA_TP_SHADOW_HOST)
+ 
+-void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
++static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     const int dev = cuda_ctx->device;
+     ggml_cuda_set_device(dev);
+-    ggml_cuda_upload_ring & r = g_cuda_upload_ring[dev];
++    ggml_cuda_upload_ring & r = rings[dev];
+     if (r.stream == nullptr) {
+         CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
+         for (int i = 0; i < 2; ++i) {
+@@ -7155,6 +7156,14 @@ void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_o
+     return dst;
+ }
+ 
++void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
++    return ggml_cuda_ring_gather_impl(g_cuda_upload_ring, backend, first_of_split, srcs, n, size, split_bytes, host_all);
++}
++
++void * ggml_backend_cuda_weight_ring_upload(ggml_backend_t backend, bool first_of_layer, size_t bytes, size_t slot_bytes, const void * host) {
++    return ggml_cuda_ring_gather_impl(g_cuda_weight_ring, backend, first_of_layer, nullptr, 1, bytes, slot_bytes, host);
++}
++
+ static void ggml_cuda_upload_ring_init(ggml_cuda_upload_ring & r) {
+     if (r.stream == nullptr) {
+         CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 82b629603..7cf1c3deb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3062,6 +3062,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+ 
+     auto & st = lctx->copy_experts;
+ 
++#ifdef GGML_USE_CUDA
++    // 0078 LLAMA_TP_SHADOW_HOST: a host-memory weight copy of the both-cards prompt graph goes up through the card's weight ring, on its
++    // own stream ahead of the split that reads it; a layer's copies share a slot, reused two layers later
++    {
++        static const bool wring = getenv("LLAMA_TP_WEIGHT_RING") == nullptr || atoi(getenv("LLAMA_TP_WEIGHT_RING")) != 0;
++        const auto it = wring ? lctx->model.tp_shadow_il.find(src) : lctx->model.tp_shadow_il.end();
++        if (it != lctx->model.tp_shadow_il.end() && ggml_backend_is_cuda(backend) && ggml_backend_cuda_host_ptr_device_accessible(src->data)) {
++            const auto jt = st.tp_wring_il.find(backend);
++            const bool first = jt == st.tp_wring_il.end() || jt->second != it->second;
++            st.tp_wring_il[backend] = it->second;
++            void * p = ggml_backend_cuda_weight_ring_upload(backend, first, ggml_nbytes(dst), lctx->model.tp_shadow_slot, src->data);
++            if (p != nullptr) {
++                dst->data = p;
++                st.cur_path = 1;
++                return true;
++            }
++        }
++    }
++#endif
++
+     // 0054: the largest MoE split this backend's device uploads (the layers whose router lives there), so the upload ring sizes its slots
+     // once: a later growth synchronizes the device
+     auto ring_split_max = [&](ggml_backend_t be) -> size_t {
+@@ -3124,8 +3144,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             auto it = st.tp_ring_il.find(backend);
+             const bool first = il < 0 || it == st.tp_ring_il.end() || it->second != il;
+             st.tp_ring_il[backend] = il;
++            // 0077: slots sized for the layer-split path as well, so a later layer-split prompt does not grow them (a device sync)
+             void * p = ggml_backend_cuda_upload_ring_gather(backend, first, nullptr, n_expert, expert_size,
+-                std::max(st.tp_ring_slot, 3*GGML_PAD(ggml_nbytes(dst), 256)), src->data);
++                std::max({ st.tp_ring_slot, 3*GGML_PAD(ggml_nbytes(dst), 256), ring_split_max(backend) }), src->data);
+             if (p != nullptr) {
+                 dst->data = p;
+                 st.cur_path = 1;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6ac7d0725..0aaf76b8f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -395,6 +395,7 @@ private:
+         std::map<ggml_backend_t, int32_t> tp_ring_il; // 0061: the same per backend, for the expert views of LLAMA_TP_PROMPT
+         size_t tp_ring_slot = 0;                      // 0061: the largest half layer of experts, the ring's slot size for those views
+         int32_t tp_noted_il = -1;                     // 0072: the last layer whose prompt ids the MoE cache was given
++        std::map<ggml_backend_t, int32_t> tp_wring_il; // 0078: the layer in each card's weight ring slot
+         std::map<ggml_backend_dev_t, size_t> ring_split_max; // 0054: the largest MoE split per device (kept across graphs)
+ 
+         bool    timing = false;
+@@ -408,6 +409,7 @@ private:
+             ring_il = -1;
+             tp_ring_il.clear();
+             tp_noted_il = -1;
++            tp_wring_il.clear();
+             ids_data.clear();
+             used.clear();
+             upload_all = false;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 626226d49..716c139f7 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2149,9 +2149,20 @@ void llama_model_base::load_tensors_tp_shadow() {
+                 t.bytes/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c])));
+         }
+         ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        const bool in_host = ggml_backend_buffer_is_host(buf.get());
++        std::map<int, size_t> layer_bytes;
+         for (auto & [w, s] : t.pairs) {
+             ggml_backend_tensor_copy(w, s);
+             tp_shadow[w] = s;
++            // 0078: the layer of a host-memory copy (the weight ring uploads a card's copies a layer at a time)
++            int sil = -1;
++            if (in_host && sscanf(ggml_get_name(s), "tp.blk.%d.", &sil) == 1) {
++                tp_shadow_il[s] = sil;
++                layer_bytes[sil] += GGML_PAD(ggml_nbytes(s), 256);
++            }
++        }
++        for (const auto & [sil, b] : layer_bytes) {
++            tp_shadow_slot = std::max(tp_shadow_slot, b);
+         }
+         LLAMA_LOG_INFO("%s: LLAMA_TP_PROMPT: %zu layer weights (%.1f MiB) copied for %s (%s)\n", __func__, t.pairs.size(),
+             t.bytes/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c]), ggml_backend_buft_name(buft));
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 0fee115b4..473198b2e 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -883,6 +883,9 @@ struct llama_model {
+     // LLAMA_TP_PROMPT (0059): every layer weight that lives on one of the two GPUs, copied to the other (the prompt graph runs each layer
+     // on both cards); tp_devs are the two cards in layer order, empty when the copies were not made
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> tp_shadow;
++    // 0078: a host-memory copy's layer, and the largest layer of them on one card (the weight ring's slot)
++    std::unordered_map<const ggml_tensor *, int> tp_shadow_il;
++    size_t tp_shadow_slot = 0;
+     std::vector<ggml_backend_dev_t> tp_devs;
+     // w on card c: w itself on its home card (or in host memory), else its copy
+     ggml_tensor * tp_w(ggml_tensor * w, int c) const;
+-- 
+2.43.0
+

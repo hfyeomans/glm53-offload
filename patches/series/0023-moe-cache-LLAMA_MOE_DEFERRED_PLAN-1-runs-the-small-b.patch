@@ -1,0 +1,239 @@
+From d4d09f42bfe3611c58ad550554feddb0eb1aa52b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:55:00 -0600
+Subject: [PATCH 023/141] moe cache: LLAMA_MOE_DEFERRED_PLAN=1 runs the
+ small-batch slot lookup on the map as it is and plans behind an event when
+ the CPU part asks for its inputs; every miss is computed on the CPU this
+ token, the usual uploaded share enters the cache for the next
+
+---
+ src/llama-graph.cpp     |  10 +++-
+ src/llama-moe-cache.cpp | 126 +++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-cache.h   |   4 ++
+ 3 files changed, 136 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 98fd58184..174d0f850 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2371,8 +2371,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * sel = lookup->src[1];
+         if (moe_cache->cpu_share() > 0.0f && !weight_before_ffn && loras->empty() &&
+             std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; })) {
+-            cpu_ids = ggml_get_rows(ctx0, moe_cache->get_cpu_map(il), sel); // [1, n_expert_used*n_tokens]
+-            cpu_ids = ggml_reshape_2d(ctx0, cpu_ids, n_expert_used, n_tokens);
++            ggml_tensor * cpu_ids_host = moe_cache->get_cpu_ids(il);
++            if (cpu_ids_host != nullptr) {
++                // the deferred plan writes the token's CPU experts here (-1 elsewhere): no lookup on the device, no copy
++                cpu_ids = ggml_view_2d(ctx0, cpu_ids_host, n_expert_used, n_tokens, cpu_ids_host->nb[1], 0);
++            } else {
++                cpu_ids = ggml_get_rows(ctx0, moe_cache->get_cpu_map(il), sel); // [1, n_expert_used*n_tokens]
++                cpu_ids = ggml_reshape_2d(ctx0, cpu_ids, n_expert_used, n_tokens);
++            }
+             sel2d   = ggml_reshape_2d(ctx0, sel, n_expert_used, n_tokens);
+         } else {
+             moe_cache->set_cpu_part(lookup, n_expert_used, {});
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index b00a117a7..b34893591 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -288,6 +288,7 @@ struct llama_moe_cache::impl {
+         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
+         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
+         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
++        ggml_tensor * cpu_ids = nullptr;    // I32 [n_expert_used, max_batch] in host memory: the token's CPU experts, -1 elsewhere (deferred plan)
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+         std::vector<uint32_t> hist;         // prompt-informed admission: selections per expert in large batches
+     };
+@@ -347,6 +348,23 @@ struct llama_moe_cache::impl {
+     std::vector<stash_entry> stash;
+     ggml_backend_buffer_ptr stash_buf;
+ 
++    // LLAMA_MOE_DEFERRED_PLAN=1: the slot lookup of a small batch runs on the map as it is, the plan waits for the ids behind an
++    // event and runs when the CPU part asks for its inputs, after the hits were launched; every miss is computed on the CPU this
++    // token and cached for the next
++    static bool deferred_plan() {
++        static const bool v = getenv("LLAMA_MOE_DEFERRED_PLAN") != nullptr && atoi(getenv("LLAMA_MOE_DEFERRED_PLAN")) != 0;
++        return v;
++    }
++    struct pending_plan {
++        int32_t              il      = -1;
++        int32_t              n_used  = 1;
++        ggml_backend_t       backend = nullptr;
++        ggml_backend_event_t ev      = nullptr; // recorded behind the reads of the ids and of the stash
++    };
++    pending_plan defer_st;
++    std::unordered_map<ggml_backend_t, ggml_backend_event_t> ev_ids; // one per backend: an event belongs to its device
++    std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
++
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+ 
+@@ -507,7 +525,7 @@ struct llama_moe_cache::impl {
+             }
+             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+-            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 2 : 1); // slot map and CPU map
++            n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
+         }
+         if (n_tensors_host == 0) {
+             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+@@ -566,6 +584,9 @@ struct llama_moe_cache::impl {
+                     l.cpu_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                     ggml_format_name(l.cpu_map, "moe_cache.cpu_map-%d", il);
+                     buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_map), alignment_host);
++                    l.cpu_ids = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, n_expert_used, max_batch);
++                    ggml_format_name(l.cpu_ids, "moe_cache.cpu_ids-%d", il);
++                    buf_host_size += GGML_PAD(ggml_nbytes(l.cpu_ids), alignment_host);
+                 }
+             }
+             devices[g.id].buf_size += alloc_size(g, g.n_slots);
+@@ -594,6 +615,10 @@ struct llama_moe_cache::impl {
+                         std::fill(slots, slots + layers[il].slot_map->ne[1], g.slru.empty);
+                         g.slru.slot_map[il] = slots;
+                     }
++                    if (layers[il].cpu_ids != nullptr) {
++                        int32_t * cpu_ids = (int32_t *) layers[il].cpu_ids->data;
++                        std::fill(cpu_ids, cpu_ids + ggml_nelements(layers[il].cpu_ids), -1);
++                    }
+                 }
+             }
+         }
+@@ -752,7 +777,85 @@ struct llama_moe_cache::impl {
+     }
+ 
+     // an input of the CPU part of the last layer, it was read from the device with the selected experts
+-    bool copy_cpu_input(const ggml_tensor * src, ggml_tensor * dst) const {
++    // the deferred plan of the layer whose CPU part is about to run: the ids are in, the hits are launched
++    void run_pending() {
++        const int32_t il = defer_st.il;
++        defer_st.il = -1;
++        layer & l = layers[il];
++        group & g = groups[l.ig];
++        ggml_backend_event_synchronize(defer_st.ev);
++        if (trace != nullptr) {
++            write_trace(il, defer_st.n_used);
++        }
++        // the usual share of the misses is left to the CPU (not cached) and the rest is uploaded for the next token; all of them
++        // are computed on the CPU for this one, since the lookup ran on the map as it was
++        const uint32_t share_q = g.slru.n_filled == g.slru.n_slots ? cpu_share_q : 0;
++        auto n_cpu = [&](size_t n_miss) {
++            const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
++            l.cpu_acc = acc & 0xffff;
++            return (size_t) (acc >> 16);
++        };
++        size_t n_hit = 0;
++        if (!g.slru.plan(il, ids.data(), ids.size(), defer_st.n_used, n_zero, n_cpu, rng, fills, cpu, n_hit)) {
++            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
++        }
++        fill_mark.assign(g.slru.n_expert, 0);
++        for (const auto & f : fills) {
++            fill_mark[f.expert] = 1;
++        }
++        for (const auto & f : cpu) {
++            fill_mark[f.expert] = 1;
++        }
++        int32_t * cpu_ids = (int32_t *) l.cpu_ids->data;
++        for (size_t i = 0; i < ids.size(); ++i) {
++            cpu_ids[i] = fill_mark[ids[i]] ? ids[i] : -1;
++        }
++        // the uploads go behind the hits of this layer on the stream, consecutive experts going to consecutive slots together
++        ggml_backend_t backend = defer_st.backend;
++        size_t bytes = 0;
++        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++            const ggml_tensor * w    = l.experts[ip];
++            ggml_tensor       * bank = g.banks[ip];
++            const size_t expert_size = w->nb[2];
++            for (size_t i = 0; i < fills.size();) {
++                size_t n = 1;
++                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                    n++;
++                }
++                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                bytes += n*expert_size;
++                i += n;
++            }
++        }
++        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
++        st.hits   += n_hit;
++        st.misses += fills.size() + cpu.size();
++        st.cpu    += fills.size() + cpu.size();
++        st.bytes  += bytes;
++        if (log_every > 0 && ids.size() <= (size_t) 8*n_expert_used) {
++            win.hits   += n_hit;
++            win.misses += fills.size() + cpu.size();
++            win.cpu    += fills.size() + cpu.size();
++            win.bytes  += bytes;
++            if (il_first < 0 || il < il_first) {
++                il_first = il;
++            }
++            if (il == il_first && ++win_tokens >= (size_t) log_every) {
++                win_total += win_tokens;
++                const size_t n = win.hits + win.misses;
++                LLAMA_LOG_INFO("llama_moe_cache: window: tokens %zu-%zu: hit rate = %.2f%% (%zu hits, %zu misses, %zu on the CPU), uploaded = %.1f MiB\n",
++                    win_total - win_tokens, win_total, n > 0 ? 100.0*win.hits/n : 0.0, win.hits, win.misses, win.cpu, win.bytes/1024.0/1024.0);
++                win_tokens = 0;
++                win = stats();
++            }
++        }
++    }
++
++    bool copy_cpu_input(const ggml_tensor * src, ggml_tensor * dst) {
++        // an input of a CPU part: the deferred plan of its layer runs now
++        if (defer_st.il >= 0 && dst->buffer != nullptr && ggml_backend_buffer_is_host(dst->buffer)) {
++            run_pending();
++        }
+         if (stash.empty() || dst->buffer == nullptr || !ggml_backend_buffer_is_host(dst->buffer) || src->data == nullptr) {
+             return false;
+         }
+@@ -852,6 +955,21 @@ struct llama_moe_cache::impl {
+ 
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        if (deferred_plan() && has_cpu && l.cpu_ids != nullptr && ids.size() <= (size_t) 8*n_expert_used) {
++            // the lookup runs on the map as it is: record the reads, upload the map, plan when the CPU part asks for its inputs
++            if (defer_st.il >= 0) {
++                GGML_ABORT("the deferred plan of layer %d never ran: its CPU part asked for no input", defer_st.il);
++            }
++            ggml_backend_event_t & ev = ev_ids[backend];
++            if (ev == nullptr) {
++                ev = ggml_backend_event_new(ggml_backend_get_device(backend));
++                GGML_ASSERT(ev != nullptr);
++            }
++            ggml_backend_event_record(ev, backend);
++            defer_st = { il, it_cpu->second.n_used, backend, ev };
++            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++            return true;
++        }
+         ggml_backend_synchronize(backend);
+ 
+         if (trace != nullptr) {
+@@ -1113,6 +1231,10 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
+     return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_map : nullptr;
+ }
+ 
++ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il) const {
++    return impl::deferred_plan() && il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_ids : nullptr;
++}
++
+ void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs) {
+     pimpl->set_cpu_part(lookup, n_used, std::move(inputs));
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 4fa6a7fbd..1a69c949f 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -32,6 +32,10 @@ public:
+     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
+     ggml_tensor * get_cpu_map(int32_t il) const;
+ 
++    // LLAMA_MOE_DEFERRED_PLAN=1: the experts of the token computed on the CPU, I32 [n_expert_used, max_batch] in host memory
++    // written by the deferred plan (-1 for the experts the device computes), nullptr when the plan is not deferred
++    ggml_tensor * get_cpu_ids(int32_t il) const;
++
+     // the CPU part of the layer of the slot lookup, with n_used experts per token, no inputs if the graph has no CPU part
+     // its inputs on the device are read together with the selected experts, so the CPU part does not wait for the device
+     void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs);
+-- 
+2.43.0
+

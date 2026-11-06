@@ -1,0 +1,77 @@
+From 3b5648d41a07676a0af849f6dda37a00fcc4baae Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:37:49 -0600
+Subject: [PATCH 048/141] moe-cache: the deferred plan host ids reach the graph
+ only for batches whose plan is deferred (up to 8 tokens); a 9-32 token batch
+ read stale ids
+
+---
+ src/llama-graph.cpp     | 2 +-
+ src/llama-moe-cache.cpp | 8 +++++---
+ src/llama-moe-cache.h   | 4 ++--
+ 3 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ff4e904df..32702e96c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2405,7 +2405,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * sel = lookup->src[1];
+         if (moe_cache->cpu_share() > 0.0f && !weight_before_ffn && loras->empty() &&
+             std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; })) {
+-            ggml_tensor * cpu_ids_host = moe_cache->get_cpu_ids(il);
++            ggml_tensor * cpu_ids_host = moe_cache->get_cpu_ids(il, n_tokens);
+             if (cpu_ids_host != nullptr) {
+                 // the deferred plan writes the token's CPU experts here (-1 elsewhere): no lookup on the device, no copy
+                 cpu_ids = ggml_view_2d(ctx0, cpu_ids_host, n_expert_used, n_tokens, cpu_ids_host->nb[1], 0);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 64d946dec..f74e6b25c 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -368,6 +368,7 @@ struct llama_moe_cache::impl {
+         static const bool v = getenv("LLAMA_MOE_DEFERRED_PLAN") != nullptr && atoi(getenv("LLAMA_MOE_DEFERRED_PLAN")) != 0;
+         return v;
+     }
++    static constexpr int64_t defer_max_tokens = 8; // the largest batch whose plan is deferred (0047: the graph and the lookup agree)
+     struct pending_plan {
+         int32_t              il      = -1;
+         int32_t              n_used  = 1;
+@@ -1131,7 +1132,7 @@ struct llama_moe_cache::impl {
+             ggml_backend_tensor_get_async(backend, pred, pred_ids.data(), 0, ggml_nbytes(pred));
+             pred_pending = true;
+         }
+-        if (deferred_plan() && has_cpu && l.cpu_ids != nullptr && ids.size() <= (size_t) 8*n_expert_used) {
++        if (deferred_plan() && has_cpu && l.cpu_ids != nullptr && ids.size() <= (size_t) defer_max_tokens*n_expert_used) {
+             // the lookup runs on the map as it is: record the reads, upload the map, plan when the CPU part asks for its inputs
+             if (defer_st.il >= 0) {
+                 GGML_ABORT("the deferred plan of layer %d never ran: its CPU part asked for no input", defer_st.il);
+@@ -1557,8 +1558,9 @@ bool llama_moe_cache::route_bias_folded(int32_t il) const {
+     return il >= 0 && il < (int32_t) pimpl->layers.size() && !pimpl->layers[il].route_epb.empty();
+ }
+ 
+-ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il) const {
+-    return impl::deferred_plan() && il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_ids : nullptr;
++ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il, int64_t n_tokens) const {
++    return impl::deferred_plan() && n_tokens <= impl::defer_max_tokens && il >= 0 && il < (int32_t) pimpl->layers.size() ?
++        pimpl->layers[il].cpu_ids : nullptr;
+ }
+ 
+ void llama_moe_cache::set_pred(int32_t il, ggml_tensor * sel) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index bfd90b530..006663d30 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -34,8 +34,8 @@ public:
+     ggml_tensor * get_cpu_map(int32_t il) const;
+ 
+     // LLAMA_MOE_DEFERRED_PLAN=1: the experts of the token computed on the CPU, I32 [n_expert_used, max_batch] in host memory
+-    // written by the deferred plan (-1 for the experts the device computes), nullptr when the plan is not deferred
+-    ggml_tensor * get_cpu_ids(int32_t il) const;
++    // written by the deferred plan (-1 for the experts the device computes), nullptr when the plan of a batch of n_tokens is not deferred
++    ggml_tensor * get_cpu_ids(int32_t il, int64_t n_tokens) const;
+ 
+     // LLAMA_MOE_ROUTE_BIAS=d: F32 [n_expert] on the layer's device, d for the experts cached in layer il and 0 elsewhere, to add to the
+     // selection scores; nullptr when off or when the cache does not serve batches of n_tokens
+-- 
+2.43.0
+

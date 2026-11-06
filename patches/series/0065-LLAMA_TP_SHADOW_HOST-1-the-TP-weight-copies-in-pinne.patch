@@ -1,0 +1,47 @@
+From 4a6ad7525220cd729ba607c5378ce29d767db940 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:03:45 -0600
+Subject: [PATCH 065/141] LLAMA_TP_SHADOW_HOST=1: the TP weight copies in
+ pinned host memory (uploaded per prompt graph), so the MoE cache keeps its
+ GPU memory
+
+---
+ src/llama-model.cpp | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index f0694b659..626226d49 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2134,7 +2134,16 @@ void llama_model_base::load_tensors_tp_shadow() {
+         if (t.pairs.empty()) {
+             continue;
+         }
+-        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(t.ctx.get(), ggml_backend_dev_buffer_type(tp_devs[c])) };
++        // 0064 LLAMA_TP_SHADOW_HOST=1: the copies in pinned host memory, uploaded with each prompt graph, so the MoE cache keeps the GPU memory
++        static const bool shadow_host = getenv("LLAMA_TP_SHADOW_HOST") != nullptr && atoi(getenv("LLAMA_TP_SHADOW_HOST")) != 0;
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(tp_devs[c]);
++        if (shadow_host) {
++            buft = ggml_backend_dev_host_buffer_type(tp_devs[c]);
++            if (buft == nullptr) {
++                buft = ggml_backend_cpu_buffer_type();
++            }
++        }
++        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(t.ctx.get(), buft) };
+         if (!buf) {
+             throw std::runtime_error(format("LLAMA_TP_PROMPT: unable to allocate %.1f MiB of weight copies on %s",
+                 t.bytes/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c])));
+@@ -2144,8 +2153,8 @@ void llama_model_base::load_tensors_tp_shadow() {
+             ggml_backend_tensor_copy(w, s);
+             tp_shadow[w] = s;
+         }
+-        LLAMA_LOG_INFO("%s: LLAMA_TP_PROMPT: %zu layer weights (%.1f MiB) copied to %s\n", __func__, t.pairs.size(),
+-            t.bytes/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c]));
++        LLAMA_LOG_INFO("%s: LLAMA_TP_PROMPT: %zu layer weights (%.1f MiB) copied for %s (%s)\n", __func__, t.pairs.size(),
++            t.bytes/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c]), ggml_backend_buft_name(buft));
+         std::vector<ggml_backend_buffer_ptr> buffers;
+         buffers.emplace_back(std::move(buf));
+         pimpl->ctxs_bufs.emplace_back(std::move(t.ctx), std::move(buffers));
+-- 
+2.43.0
+

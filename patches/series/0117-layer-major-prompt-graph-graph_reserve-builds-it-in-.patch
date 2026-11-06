@@ -1,0 +1,81 @@
+From ece1a2f7786dbdff995091e9136fb83e03646c9d Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:38:58 -0600
+Subject: [PATCH 117/141] layer-major prompt graph: graph_reserve builds it in
+ reserve mode whenever lm_rows is set, and a run of layer-major ubatches keeps
+ the pipeline worst-case plan, so a block views its own keys again (the 512K
+ abort: the worst-case re-reserve built it with a batch state on a reserve
+ ubatch)
+
+---
+ src/llama-context.cpp  | 11 +++++++++--
+ src/models/glm-dsa.cpp | 10 ++++------
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 719a6f271..f730ad4f3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -904,7 +904,7 @@ void llama_context::lm_z_init() {
+     const uint32_t R  = llama_lm_rows();
+     const int64_t  Rp = GGML_PAD((int64_t) R, 8);
+     const int64_t  S  = GGML_PAD((int64_t) cparams.n_ctx, 8);
+-    const int64_t  W  = S + Rp + 512 + GGML_PAD((int64_t) std::min(cparams.n_batch, cparams.n_ctx), 8); // 0114: keys to the batch's end
++    const int64_t  W  = S + Rp + 512; // 0118: a block's own keys again (0114 had made it wider by a batch)
+     const int64_t  H  = Rp + 8;
+     std::vector<ggml_backend_dev_t> devs;
+     for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+@@ -1788,7 +1788,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // (e.g. a small batch with host weights), otherwise every ubatch of the prompt reallocates the compute buffers
+     if (cparams.pipeline_parallel && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
+         const uint32_t n_tokens_reserve = std::min(cparams.n_ctx, cparams.n_ubatch);
+-        if (ubatch.n_tokens != n_tokens_reserve) {
++        // 0118: a layer-major ubatch of any size fits the worst-case layer-major graph (graph_reserve builds it in reserve mode)
++        if (ubatch.n_tokens != n_tokens_reserve && cparams.lm_rows == 0) {
+             worst_case_reserved = false;
+         } else if (!worst_case_reserved) {
+             const auto mctx_reserve = memory ? memory->init_full() : nullptr;
+@@ -3004,6 +3005,12 @@ ggml_cgraph * llama_context::graph_reserve(
+     // [TAG_PIPELINE_RESERVE] the worst-case graph of sched_reserve
+     const bool worst_case = n_tokens == std::min(cparams.n_ctx, cparams.n_ubatch) && n_outputs == std::min(n_tokens, cparams.n_outputs_max);
+ 
++    // 0118: a layer-major graph is reserved with every block over the whole cache (a reserve ubatch's positions are not its cells)
++    struct lm_reserve_restore { bool & f; const bool v; ~lm_reserve_restore() { f = v; } } lm_restore { cparams.lm_reserve, cparams.lm_reserve };
++    if (cparams.lm_rows > 0) {
++        cparams.lm_reserve = true;
++    }
++
+     if (n_tokens % n_seqs != 0) {
+         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 48081c18a..5071c57a4 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -601,7 +601,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         };
+         ggml_tensor * Z0 = lm_z->front().second;
+         const int64_t Rp = GGML_PAD(R, 8);
+-        const int64_t S  = GGML_PAD((int64_t) cparams.n_ctx, 8); // 0114: the staircase is wider by a batch
++        const int64_t S  = GGML_PAD((int64_t) cparams.n_ctx, 8); // 0118: the staircase is S + Rp + 512 wide again
+         GGML_ASSERT(S > 0 && S + Rp + 512 <= Z0->ne[0] && Z0->ne[1] >= Rp + 8);
+ 
+         // the attention blocks: rows [r0, r0 + nr), keys [0, n_kv), the staircase view at column c, row d
+@@ -617,11 +617,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             if (!cparams.lm_reserve) {
+                 const int64_t p0   = ubatch.pos[b.r0];
+                 const int64_t base = S - p0;
+-                // 0114: the batch's key extent for every block (the usual graph's n_kv is one value for a batch): keys that grew with p0
+-                // outgrew the allocator's plan each ubatch, and re-planning synchronizes every backend
+-                // 0116: the extent itself, past the ubatch's n_kv if need be (a view is checked against the whole cache tensor)
+-                b.n_kv = cparams.lm_kv_end > 0 ? std::min<int64_t>((int64_t) cparams.lm_kv_end, (int64_t) cparams.n_ctx)
+-                                               : std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
++                // 0118: the block's own keys -- the allocator's plan is the worst-case graph (process_ubatch reserves it before a run of
++                // layer-major ubatches), every block over the whole cache, so keys that grow with p0 never outgrow it
++                b.n_kv = std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
+                 b.c    = GGML_PAD(base, 8);
+                 b.d    = b.c - base;
+                 if (!(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1])) { // 0117: the values
+-- 
+2.43.0
+

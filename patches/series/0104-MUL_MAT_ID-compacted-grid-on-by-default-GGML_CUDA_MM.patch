@@ -1,0 +1,27 @@
+From 645cbbaec1c26d0b4e82250b0c4909dc3b373af2 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 01:26:48 -0600
+Subject: [PATCH 104/141] MUL_MAT_ID compacted grid on by default
+ (GGML_CUDA_MMQ_MMID_COMPACT=0 turns it off): ub 12K 25K / 50K +5 %, ub 8K
+ +2-3 %
+
+---
+ ggml/src/ggml-cuda/mmq.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 7a0fd8582..55640a98d 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -424,7 +424,7 @@ void ggml_cuda_mul_mat_q(
+         ne12, J_best, fusion_device};
+ 
+     // 0104 GGML_CUDA_MMQ_MMID_COMPACT=1: one block a real tile, from the experts' column tiles scanned on the card
+-    static const bool mmid_compact = getenv("GGML_CUDA_MMQ_MMID_COMPACT") != nullptr && atoi(getenv("GGML_CUDA_MMQ_MMID_COMPACT")) != 0;
++    static const bool mmid_compact = getenv("GGML_CUDA_MMQ_MMID_COMPACT") == nullptr || atoi(getenv("GGML_CUDA_MMQ_MMID_COMPACT")) != 0; // 0105: on by default
+     ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool());
+     mmq_args args_c = args;
+     if (mmid_compact && ne02 <= 1024) {
+-- 
+2.43.0
+

@@ -1,0 +1,62 @@
+From 84da2cafba4950ed24b8c0dc4cfc117450d8a27d Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:52:19 -0600
+Subject: [PATCH 099/141] MUL_MAT_ID fill probe: LLAMA_TEST_MMID_BALANCED=1
+ (every expert the same token count) and GGML_CUDA_MMQ_MMID_J=N (the column
+ tile forced)
+
+---
+ ggml/src/ggml-cuda/mmq.cu  | 10 ++++++++++
+ tests/test-backend-ops.cpp | 10 +++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2abe380f4..cb17d93ad 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -248,6 +248,16 @@ void ggml_cuda_mul_mat_q(
+         }
+ 
+         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
++
++        // 0100 GGML_CUDA_MMQ_MMID_J=N: MUL_MAT_ID's column tile forced to N where a config exists and fits
++        static const int mmid_j = getenv("GGML_CUDA_MMQ_MMID_J") != nullptr ? atoi(getenv("GGML_CUDA_MMQ_MMID_J")) : 0;
++        if (ids && mmid_j >= 8 && mmid_j <= 128 && mmid_j % 8 == 0) {
++            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, mmid_j, fallback, cc, prec_src1);
++            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
++                J_best        = mmid_j;
++                nthreads_best = config.nthreads;
++            }
++        }
+     }
+     GGML_ASSERT(J_best > 0);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4bff34e79..6d39bf08a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5621,12 +5621,20 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = fals
+         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+             continue;
+         }
++        // 0100 LLAMA_TEST_MMID_BALANCED=1: token r takes experts (8r ..) mod n_mats in order, every expert the same count
++        static const bool balanced = getenv("LLAMA_TEST_MMID_BALANCED") != nullptr && atoi(getenv("LLAMA_TEST_MMID_BALANCED")) != 0;
+         for (int64_t r = 0; r < ggml_nrows(t); r++) {
+             std::vector<int32_t> data(t->ne[0]);
+             for (int i = 0; i < t->ne[0]; i++) {
+                 data[i] = i % n_mats;
+             }
+-            std::shuffle(data.begin(), data.end(), rng);
++            if (balanced) {
++                for (int i = 0; i < t->ne[0]; i++) {
++                    data[i] = (int32_t) ((r*8 + i) % n_mats);
++                }
++            } else {
++                std::shuffle(data.begin(), data.end(), rng);
++            }
+             if (skip) {
+                 mask_skipped_ids(data, r);
+             }
+-- 
+2.43.0
+

@@ -1,0 +1,59 @@
+From c796f20bc97a8a51c32b30a943bc721f661efb12 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:16:49 -0600
+Subject: [PATCH 087/141] moe prompt cpu: the skips of a plan hold only in the
+ graph compute that ran it (an unplanned large ubatch used the last plan s
+ skips: wrong output)
+
+---
+ src/llama-moe-cache.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index d0c51afdb..8a5838e8d 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -399,6 +399,7 @@ struct llama_moe_cache::impl {
+         ggml_tensor * p_w   = nullptr;      // 0085: F32 [1, 1, n_pairs]: its router weight
+         std::vector<uint8_t> p_skip;        // 0085: the uploads skip these experts (no token selects them, or the CPU computes them)
+         bool p_valid = false;               // 0085: p_skip holds the last plan of the layer
++        uint64_t p_epoch = 0;               // 0088: the graph compute of that plan; the skips hold only there
+         llama_moe_prompt_csr p_csr;         // 0085: the pairs of each token
+     };
+ 
+@@ -1458,6 +1459,7 @@ struct llama_moe_cache::impl {
+     int64_t p_alloc = 0;   // pairs allocated per layer
+     double  p_cap   = 0.15;
+     int32_t p_last  = -1;  // the last layer with a prompt map: the ubatch's log line
++    uint64_t p_cur  = 1;   // 0088: the graph compute in progress, advanced by begin()
+     std::vector<int32_t> p_cnt;
+     std::vector<int32_t> p_order;
+     struct prompt_stats {
+@@ -1539,7 +1541,7 @@ struct llama_moe_cache::impl {
+             return false;
+         }
+         const layer & l = layers[it->second.il];
+-        return l.p_valid && e >= 0 && e < (int64_t) l.p_skip.size() && l.p_skip[e] != 0;
++        return l.p_valid && l.p_epoch == p_cur && e >= 0 && e < (int64_t) l.p_skip.size() && l.p_skip[e] != 0;
+     }
+ 
+     // the copy of a prompt map: read the routing of the layer, plan it, write the map and the CPU's pairs
+@@ -1713,6 +1715,7 @@ struct llama_moe_cache::impl {
+             pw[p]   = 0.0f;
+         }
+         l.p_valid = true;
++        l.p_epoch = p_cur;
+ 
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+ 
+@@ -1743,6 +1746,7 @@ struct llama_moe_cache::impl {
+ 
+     void begin() {
+         stash.clear();
++        p_cur++; // 0088
+     }
+ 
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+-- 
+2.43.0
+

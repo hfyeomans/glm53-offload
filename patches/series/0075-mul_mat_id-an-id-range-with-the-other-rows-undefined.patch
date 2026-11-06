@@ -1,0 +1,99 @@
+From 0fc31bf1b9977df2edd42b4a642d5f6900dd6d80 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:58:07 -0600
+Subject: [PATCH 075/141] mul_mat_id: an id range with the other rows undefined
+ (no zero fill); the TP expert branch uses it for up and gate
+ (LLAMA_TP_MMID_UNDEF=0 restores the fill)
+
+---
+ ggml/include/ggml.h       | 2 ++
+ ggml/src/ggml-cuda/mmf.cu | 4 +++-
+ ggml/src/ggml-cuda/mmq.cu | 4 +++-
+ ggml/src/ggml.c           | 6 ++++++
+ src/llama-graph.cpp       | 8 ++++++--
+ 5 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index f85b7b0ed..abef09ddc 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1529,6 +1529,8 @@ extern "C" {
+     // the ids of a MUL_MAT_ID are read as id - offset; an id outside [0, n_as) after it is skipped like -1 (its row of the result is zero),
+     // so a backend handed every expert's id computes only the ones of its own range (expert parallelism); CUDA zeroes the result first
+     GGML_API void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset);
++    // the same range, the rows of ids outside it left undefined instead of zeroed (for results only the range's rows are read from)
++    GGML_API void ggml_mul_mat_id_set_id_offset_undef(struct ggml_tensor * a, int32_t offset);
+ 
+     // A: m columns, n rows,
+     // B: p columns, n rows,
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 1d73133ad..9a88a8a8b 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -87,7 +87,9 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
+         // 0058: see mmq.cu
+         const int  id_offset = ggml_get_op_params_i32(dst, 6);
+         if (ggml_get_op_params_i32(dst, 7) != 0) {
+-            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
++            if (ggml_get_op_params_i32(dst, 7) == 1) { // 0074: 2 leaves the other experts' rows undefined
++                CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
++            }
+             CUDA_CHECK(cudaMemsetAsync(ids_src_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
+         }
+         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 35d2af0d3..2abe380f4 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -321,7 +321,9 @@ void ggml_cuda_mul_mat_q(
+     const int  id_offset = ggml_get_op_params_i32(dst, 6);
+     const bool id_range  = ggml_get_op_params_i32(dst, 7) != 0;
+     if (id_range) {
+-        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
++        if (ggml_get_op_params_i32(dst, 7) == 1) { // 0074: 2 leaves the other experts' rows undefined
++            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
++        }
+         CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
+     }
+     GGML_ASSERT(!id_range || !use_native_fp4);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9e69dd204..3124b75d8 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3483,6 +3483,12 @@ void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset) {
+     ggml_set_op_params_i32(a, 7, 1);      // ids may fall outside the range: the result is zeroed first
+ }
+ 
++void ggml_mul_mat_id_set_id_offset_undef(struct ggml_tensor * a, int32_t offset) {
++    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
++    ggml_set_op_params_i32(a, 6, offset);
++    ggml_set_op_params_i32(a, 7, 2);      // 0074: ids may fall outside the range, their rows are left undefined
++}
++
+ // ggml_out_prod
+ 
+ static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index edf63c9a9..c4e64211f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2404,10 +2404,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 return ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], n_half, w->nb[1], w->nb[2], c*n_half*w->nb[2]);
+             };
+             ggml_tensor * x = ggml_reshape_3d(ctx0, moe_ep_in[c], n_embd, 1, n_tokens);
++            // 0074: up and gate only feed this card's down projection, which reads its own experts' rows: no zero fill
++            // (LLAMA_TP_MMID_UNDEF=0 restores it)
++            static const bool mmid_undef = getenv("LLAMA_TP_MMID_UNDEF") == nullptr || atoi(getenv("LLAMA_TP_MMID_UNDEF")) != 0;
++            auto set_range = mmid_undef ? ggml_mul_mat_id_set_id_offset_undef : ggml_mul_mat_id_set_id_offset;
+             ggml_tensor * up = ggml_mul_mat_id(ctx0, half(up_exps), x, selected_experts);
+-            ggml_mul_mat_id_set_id_offset(up, (int32_t) (c*n_half));
++            set_range(up, (int32_t) (c*n_half));
+             ggml_tensor * gate = ggml_mul_mat_id(ctx0, half(gate_exps), x, selected_experts);
+-            ggml_mul_mat_id_set_id_offset(gate, (int32_t) (c*n_half));
++            set_range(gate, (int32_t) (c*n_half));
+             ggml_tensor * act = nullptr;
+             const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+             if (limit > 1e-6f) {
+-- 
+2.43.0
+

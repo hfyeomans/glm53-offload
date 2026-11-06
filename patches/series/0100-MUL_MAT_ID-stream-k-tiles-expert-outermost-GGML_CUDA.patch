@@ -1,0 +1,166 @@
+From 999ae314faef40986b0731feb0ae84e88a345dbc Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 22:15:38 -0600
+Subject: [PATCH 100/141] MUL_MAT_ID stream-k tiles expert-outermost
+ (GGML_CUDA_MMQ_MMID_ORDER=1): row tiles of a column tile back to back, its
+ activations read once
+
+---
+ ggml/src/ggml-cuda/mmq.cuh | 78 +++++++++++++++++++++-----------------
+ 1 file changed, 43 insertions(+), 35 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 308968be9..e1ca3b4cc 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -994,6 +994,34 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ }
+ 
+ 
++// 0101: a tile's coordinates from its index in the stream-k order.  tile_order 1 (GGML_CUDA_MMQ_MMID_ORDER=1, MUL_MAT_ID) runs the row
++// tiles of an expert's column tile back to back (row tile fastest, expert slowest): the column tile's activations are read from HBM once
++// and stay in L2 for its other row tiles.  tile_order 0 is the upstream order (column tile fastest, row tile slowest).
++static __device__ __forceinline__ void mmq_tile_coords(int tmp, const uint3 ntx, const uint3 nchannels_y, const uint3 nsamples_y,
++        const int nty, const int tile_order, int & jt, int & zt, int & wt, int & it) {
++    uint2 tmp2;
++    if (tile_order == 1) {
++        it   = tmp % nty;
++        tmp  = tmp / nty;
++        tmp2 = fast_div_modulo(tmp, ntx);
++        jt   = tmp2.y;
++        tmp  = tmp2.x;
++        tmp2 = fast_div_modulo(tmp, nchannels_y);
++        zt   = tmp2.y;
++        wt   = tmp2.x;
++        return;
++    }
++    tmp2 = fast_div_modulo(tmp, ntx);
++    jt   = tmp2.y;
++    tmp  = tmp2.x;
++    tmp2 = fast_div_modulo(tmp, nchannels_y);
++    zt   = tmp2.y;
++    tmp  = tmp2.x;
++    tmp2 = fast_div_modulo(tmp, nsamples_y);
++    wt   = tmp2.y;
++    it   = tmp2.x;
++}
++
+ // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
+ 
+ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+@@ -1005,7 +1033,7 @@ static __global__ void mul_mat_q(
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx, const int tile_order) {
+ 
+ #ifdef TURING_MMA_AVAILABLE
+     constexpr bool fusion_available = true;
+@@ -1130,16 +1158,8 @@ static __global__ void mul_mat_q(
+     int kb0_start = fastmodulo(kbc, blocks_per_ne00);
+     int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
+     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
+-        int tmp = fastdiv(kbc, blocks_per_ne00);
+-        uint2 tmp2 = fast_div_modulo(tmp, ntx);
+-        const int jt = tmp2.y;
+-        tmp = tmp2.x;
+-        tmp2 = fast_div_modulo(tmp, nchannels_y);
+-        const int zt = tmp2.y;
+-        tmp = tmp2.x;
+-        tmp2 = fast_div_modulo(tmp, nsamples_y);
+-        const int wt = tmp2.y;
+-        const int it = tmp2.x;
++        int jt, zt, wt, it;
++        mmq_tile_coords(fastdiv(kbc, blocks_per_ne00), ntx, nchannels_y, nsamples_y, (nrows_x + I - 1)/I, tile_order, jt, zt, wt, it);
+ 
+         // Defaults for regular matrix multiplication:
+         int col_low    = 0;
+@@ -1219,16 +1239,8 @@ static __global__ void mul_mat_q(
+         return;
+     }
+ 
+-    int tmp = fastdiv(kbc, blocks_per_ne00);
+-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
+-    const int jt = tmp2.y;
+-    tmp = tmp2.x;
+-    tmp2 = fast_div_modulo(tmp, nchannels_y);
+-    const int zt = tmp2.y;
+-    tmp = tmp2.x;
+-    tmp2 = fast_div_modulo(tmp, nsamples_y);
+-    const int wt = tmp2.y;
+-    const int it = tmp2.x;
++    int jt, zt, wt, it;
++    mmq_tile_coords(fastdiv(kbc, blocks_per_ne00), ntx, nchannels_y, nsamples_y, (nrows_x + I - 1)/I, tile_order, jt, zt, wt, it);
+ 
+     // Defaults for regular matrix multiplication:
+     int col_low    = 0;
+@@ -1299,7 +1311,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
+         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
+-        const int stride_sample_dst, const uint3 ntx) {
++        const int stride_sample_dst, const uint3 ntx, const int tile_order) {
+     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 2) / warp_size;
+     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
+@@ -1366,16 +1378,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
+         return;
+     }
+ 
+-    int tmp = fastdiv(kbc0, blocks_per_ne00);
+-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
+-    const int jt = tmp2.y;
+-    tmp = tmp2.x;
+-    tmp2 = fast_div_modulo(tmp, nchannels_y);
+-    const int zt = tmp2.y;
+-    tmp = tmp2.x;
+-    tmp2 = fast_div_modulo(tmp, nsamples_y);
+-    const int wt = tmp2.y;
+-    const int it = tmp2.x;
++    int jt, zt, wt, it;
++    mmq_tile_coords(fastdiv(kbc0, blocks_per_ne00), ntx, nchannels_y, nsamples_y, nty, tile_order, jt, zt, wt, it);
+ 
+     if (!ids_dst) {
+         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
+@@ -1458,6 +1462,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+ 
+     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+     GGML_ASSERT(config.nthreads % warp_size == 0);
++
++    // 0101 GGML_CUDA_MMQ_MMID_ORDER=1: MUL_MAT_ID's stream-k tiles expert-outermost, row tile fastest
++    static const int mmid_order = getenv("GGML_CUDA_MMQ_MMID_ORDER") != nullptr ? atoi(getenv("GGML_CUDA_MMQ_MMID_ORDER")) : 0;
++    const int tile_order = args.ids_dst != nullptr && mmid_order == 1 ? 1 : 0;
+     const int nwarps = config.nthreads / warp_size;
+     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+ 
+@@ -1494,7 +1502,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, tile_order);
+         return;
+     }
+ 
+@@ -1525,7 +1533,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd, tile_order);
+ 
+     if (!fixup_needed) {
+         return;
+@@ -1535,7 +1543,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd, tile_order);
+ }
+ 
+ template <ggml_type type, bool fallback, ggml_prec prec_src1, bool has_fusion>
+-- 
+2.43.0
+

@@ -1,0 +1,101 @@
+From 498a842bb0f1e82535e40a9e794e1c3187241b17 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 22:43:03 -0600
+Subject: [PATCH 053/141] moe-cache: the deferred plan reads the selected
+ experts into pinned memory (a read into pageable memory held the host until
+ the router was done); the predictor uses eight accumulators
+
+---
+ src/llama-moe-cache.cpp | 37 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ef1a70bdc..a9f6157e6 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -375,7 +375,11 @@ struct llama_moe_cache::impl {
+         ggml_backend_t       backend = nullptr;
+         ggml_backend_event_t ev      = nullptr; // recorded behind the reads of the ids and of the stash
+         const ggml_tensor *  x_t     = nullptr; // 0050: the layer's FFN input (an input of its CPU part, in the stash)
++        bool                 ids_pin = false;   // 0052: the ids were read into ids_pin, not into ids
+     };
++    // 0052: the deferred plan reads the selected experts into pinned memory, so the read does not hold the host until the router is done
++    ggml_backend_buffer_ptr ids_pin_buf;
++    int32_t *               ids_pin = nullptr;
+     pending_plan defer_st;
+ 
+     // LLAMA_MOE_ASYNC_FILL=1 and LLAMA_MOE_ROUTE_BIAS=d, see get_route_bias and the small-batch path of copy
+@@ -516,8 +520,15 @@ struct llama_moe_cache::impl {
+             const float * w = p.router.data() + e*ne;
+             for (int64_t t = 0; t < nt; ++t) {
+                 const float * x = self->pq_xp.data() + t*ne;
+-                float s = 0.0f;
+-                for (int64_t j = 0; j < ne; ++j) {
++                float a[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
++                int64_t j = 0;
++                for (; j + 8 <= ne; j += 8) {
++                    for (int k = 0; k < 8; ++k) {
++                        a[k] += w[j + k]*x[j + k];
++                    }
++                }
++                float s = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
++                for (; j < ne; ++j) {
+                     s += w[j]*x[j];
+                 }
+                 self->pq_logits[t*nx + e] = s;
+@@ -630,7 +641,7 @@ struct llama_moe_cache::impl {
+                 std::vector<float> w = pqs.win;
+                 std::sort(w.begin(), w.end());
+                 LLAMA_LOG_INFO("llama_moe_cache: predict: %.0f layer-steps, top-%d overlap %.1f %%, misses %.2f per layer of which predicted %.1f %% (recall), "
+-                    "predicted misses %.2f per layer of which real %.1f %% (precision), prediction %.1f us, window to the ids %.0f us (p25 %.0f, p75 %.0f)\n",
++                    "predicted misses %.2f per layer of which real %.1f %% (precision), prediction %.1f us, top of the plan to the ids %.0f us (p25 %.0f, p75 %.0f)\n",
+                     pqs.n, n_expert_used, 100.0*pqs.sel_hit/std::max(1.0, pqs.sel), pqs.miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.miss),
+                     pqs.pred_miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.pred_miss), pqs.t_pred/pqs.n,
+                     (double) w[w.size()/2], (double) w[w.size()/4], (double) w[w.size()*3/4]);
+@@ -1187,10 +1198,13 @@ struct llama_moe_cache::impl {
+         // LLAMA_MOE_PREDICT (0050): the prediction runs while the card may still be on the layer's attention
+         int64_t t_ready = 0;
+         if (predict_enabled()) {
+-            pq_predict(il);
+             t_ready = ggml_time_us();
++            pq_predict(il);
+         }
+         ggml_backend_event_synchronize(defer_st.ev);
++        if (defer_st.ids_pin) {
++            memcpy(ids.data(), ids_pin, ids.size()*sizeof(int32_t));
++        }
+         const int64_t t_ids = predict_enabled() ? ggml_time_us() : 0;
+         if (trace != nullptr) {
+             write_trace(il, defer_st.n_used);
+@@ -1399,7 +1413,19 @@ struct llama_moe_cache::impl {
+         }
+ 
+         ids.resize(ggml_nelements(sel));
+-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        // 0052: a deferred plan reads into pinned memory (a read into pageable memory returns only once the router is done)
++        bool ids_in_pin = false;
++        if (deferred_plan() && has_cpu && l.cpu_ids != nullptr && ids.size() <= (size_t) defer_max_tokens*n_expert_used) {
++            if (!ids_pin_buf) {
++                ggml_backend_buffer_type_t buft_pin = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
++                if (buft_pin != nullptr) {
++                    ids_pin_buf.reset(ggml_backend_buft_alloc_buffer(buft_pin, 64*1024));
++                    ids_pin = ids_pin_buf ? (int32_t *) ggml_backend_buffer_get_base(ids_pin_buf.get()) : nullptr;
++                }
++            }
++            ids_in_pin = ids_pin != nullptr && ggml_nbytes(sel) <= 64*1024;
++        }
++        ggml_backend_tensor_get_async(backend, sel, ids_in_pin ? (void *) ids_pin : (void *) ids.data(), 0, ggml_nbytes(sel));
+         pred_pending = false;
+         if (prefetch_enabled() && il + 1 < (int32_t) layers.size() && layers[il + 1].pred != nullptr && layers[il + 1].pred->data != nullptr &&
+             ids.size() == (size_t) n_expert_used) {
+@@ -1421,6 +1447,7 @@ struct llama_moe_cache::impl {
+             ggml_backend_event_record(ev, backend);
+             defer_st = { il, it_cpu->second.n_used, backend, ev };
+             defer_st.x_t = it_cpu->second.inputs.size() > 1 ? it_cpu->second.inputs[1] : nullptr;
++            defer_st.ids_pin = ids_in_pin;
+             if (l.fill_ev_pending) {
+                 // 0046: the hits read the slots that the layer's last deferred plan filled on the side stream
+                 ggml_backend_event_wait(backend, l.fill_ev);
+-- 
+2.43.0
+

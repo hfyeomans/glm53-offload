@@ -1,0 +1,31 @@
+From 0ba38effa2519e07f578fbf11a800534751bc5ec Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 16:06:32 -0600
+Subject: [PATCH 092/141] moe prompt prefetch part two capped at the next
+ attention (LLAMA_MOE_PROMPT_POST_US, 5 us a token): the next plan s read-back
+ queued behind it
+
+---
+ src/llama-moe-cache.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ac51010f5..c69e25aa5 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1937,6 +1937,12 @@ struct llama_moe_cache::impl {
+             // 0091: part one (the guess's first, as many as the CPU window takes), then part two; each by expert, so consecutive experts
+             // are one copy
+             ln.p_pf_n1 = std::min<int32_t>((int32_t) cand.size(), l.p_pf_want1);
++            // 0093: part two no longer than the next layer's attention (the next plan's read-back queues behind it)
++            static const double post_us = prompt_env("LLAMA_MOE_PROMPT_POST_US", 5.0);
++            const int32_t n2_max = (int32_t) std::floor(post_us*n_tok/1e3/u_ms);
++            if ((int32_t) cand.size() > ln.p_pf_n1 + n2_max) {
++                cand.resize(ln.p_pf_n1 + n2_max);
++            }
+             std::sort(cand.begin(), cand.begin() + ln.p_pf_n1);
+             std::sort(cand.begin() + ln.p_pf_n1, cand.end());
+             ln.p_pf_issued2 = false;
+-- 
+2.43.0
+

@@ -1,0 +1,66 @@
+From 2bb9c1297c056c8ddcb17452115dec9347acf84b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:07:22 -0600
+Subject: [PATCH 003/141] moe cache: LLAMA_MOE_CACHE_LOG_EVERY=N logs the hit
+ rate of the last N decode tokens
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/llama-moe-cache.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 03881217f..22bbe327b 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -348,6 +348,12 @@ struct llama_moe_cache::impl {
+     size_t pending_pos = 0;
+     struct { size_t prompts = 0, layers = 0, uploaded = 0, bytes = 0; double ms = 0.0; } stats_admit;
+ 
++    // LLAMA_MOE_CACHE_LOG_EVERY: hit rate of the last N small-batch tokens, counted at the first cached layer
++    int32_t log_every  = 0;
++    int32_t il_first   = -1;
++    size_t  win_tokens = 0, win_total = 0;
++    stats   win;
++
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+     ggml_backend_buffer_ptr buf_host;
+@@ -452,6 +458,9 @@ struct llama_moe_cache::impl {
+         if (const char * s = getenv("LLAMA_MOE_CACHE_ADMIT"); s != nullptr && *s != '\0') {
+             admit_k = atoi(s);
+         }
++        if (const char * s = getenv("LLAMA_MOE_CACHE_LOG_EVERY"); s != nullptr && *s != '\0') {
++            log_every = atoi(s);
++        }
+         if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
+             trace = fopen(path, "wb");
+             if (trace == nullptr) {
+@@ -853,6 +862,24 @@ struct llama_moe_cache::impl {
+         st.cpu    += cpu.size();
+         st.bytes  += bytes;
+ 
++        if (log_every > 0 && ids.size() <= (size_t) 8*n_expert_used) {
++            win.hits   += n_hit;
++            win.misses += fills.size() + cpu.size();
++            win.cpu    += cpu.size();
++            win.bytes  += bytes;
++            if (il_first < 0 || il < il_first) {
++                il_first = il;
++            }
++            if (il == il_first && ++win_tokens >= (size_t) log_every) {
++                win_total += win_tokens;
++                const size_t n = win.hits + win.misses;
++                LLAMA_LOG_INFO("llama_moe_cache: window: tokens %zu-%zu: hit rate = %.2f%% (%zu hits, %zu misses, %zu on the CPU), uploaded = %.1f MiB\n",
++                    win_total - win_tokens, win_total, n > 0 ? 100.0*win.hits/n : 0.0, win.hits, win.misses, win.cpu, win.bytes/1024.0/1024.0);
++                win_tokens = 0;
++                win = stats();
++            }
++        }
++
+         // the next copy synchronizes the backend before it changes the slot map again
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+ 
+-- 
+2.43.0
+

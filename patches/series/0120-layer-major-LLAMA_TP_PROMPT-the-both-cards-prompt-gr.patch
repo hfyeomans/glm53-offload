@@ -1,0 +1,41 @@
+From 634c120b3d5e4e97ab98149e02816d3f7dd7c2e4 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 15:47:00 -0600
+Subject: [PATCH 120/141] layer-major + LLAMA_TP_PROMPT: the both-cards prompt
+ graph reserved at the fallback ubatch with the layer-major state off (the
+ batches it takes), and the fallback reserve the usual layer-split graph
+
+---
+ src/llama-context.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f730ad4f3..0c8c9d64a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1081,15 +1081,21 @@ void llama_context::sched_reserve() {
+         // 0075 LLAMA_TP_PROMPT: the both-cards prompt graph too (single-ubatch batches), so neither prompt graph grows the buffers later
+         if (model.tp_devs.size() == 2) {
+             cparams.tp_batch_single = true;
+-            if (!graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc())) {
++            // 0121: under LLAMA_LAYER_MAJOR it takes only the batches the layer-major graph does not -- at most the fallback ubatch
++            const uint32_t n_tp       = lm ? std::min(n_tokens, llama_lm_fallback_ub()) : n_tokens;
++            const uint32_t lm_rows_tp = cparams.lm_rows;
++            cparams.lm_rows = 0;
++            if (!graph_reserve(n_tp, n_seqs, std::min(n_tp, cparams.n_outputs_max), mctx.get(), model.no_alloc())) {
+                 throw std::runtime_error("failed to allocate compute pp buffers (both-cards prompt graph)");
+             }
++            cparams.lm_rows = lm_rows_tp;
+         }
+ 
+         // 0108: the usual prompt graph at the fallback ubatch (a batch the layer-major graph cannot take)
+         if (lm) {
+             cparams.lm_rows    = 0;
+             cparams.lm_reserve = false;
++            cparams.tp_batch_single = false; // 0121: the usual layer-split graph (the both-cards one is reserved above)
+             const uint32_t n_fb = std::min(n_tokens, llama_lm_fallback_ub());
+             if (!graph_reserve(n_fb, n_seqs, std::min(n_fb, cparams.n_outputs_max), mctx.get(), model.no_alloc())) {
+                 throw std::runtime_error("failed to allocate compute pp buffers (fallback prompt graph)");
+-- 
+2.43.0
+

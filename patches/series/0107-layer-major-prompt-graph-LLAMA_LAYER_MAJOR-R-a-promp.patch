@@ -1,0 +1,709 @@
+From e3cc91d09b7914e2b0926740daf48f78606ba1ad Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 10:42:10 -0600
+Subject: [PATCH 107/141] layer-major prompt graph (LLAMA_LAYER_MAJOR=R): a
+ prompt ubatch runs each layer's attention in blocks of R query rows and its
+ FFN in blocks of LLAMA_LM_MOE_ROWS rows, so a layer's experts go up once a
+ ubatch while the indexer's scores and masks stay [n_kv, R]; the masks are
+ views of a causal staircase per device; decode() takes it for batches whose
+ tokens sit at the cells of their positions (lm_positional), ubatches of
+ ~1/LLAMA_LM_PIPE of the batch, the usual graph at LLAMA_LM_FALLBACK_UB rows
+ otherwise
+
+---
+ src/llama-context.cpp      | 146 +++++++++++++++++++++-
+ src/llama-context.h        |   7 ++
+ src/llama-cparams.h        |   4 +
+ src/llama-graph.cpp        |   6 +-
+ src/llama-graph.h          |   5 +
+ src/llama-kv-cache-dsa.cpp |   5 +
+ src/llama-kv-cache-dsa.h   |   3 +
+ src/llama-kv-cache.cpp     |  39 ++++++
+ src/llama-kv-cache.h       |   6 +
+ src/llama-memory.h         |   4 +
+ src/models/glm-dsa.cpp     | 241 +++++++++++++++++++++++++++++++++++++
+ 11 files changed, 464 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 591d9e693..a5d76ba1e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -680,6 +680,17 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
++    // 0108: the causal staircases
++    for (ggml_backend_buffer_t b : lm_z_buf) {
++        ggml_backend_buffer_free(b);
++    }
++    lm_z_buf.clear();
++    lm_z.clear();
++    if (lm_z_ctx != nullptr) {
++        ggml_free(lm_z_ctx);
++        lm_z_ctx = nullptr;
++    }
++
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.no_alloc() && !opt_ctx) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -857,6 +868,75 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
++// 0108 LLAMA_LAYER_MAJOR=R (rows of an attention block, 0 = off), LLAMA_LM_PIPE (the ubatches a prompt batch is cut into, default 6),
++// LLAMA_LM_FALLBACK_UB (the ubatch of a batch the layer-major graph cannot take, default 512)
++static uint32_t llama_lm_rows() {
++    static const uint32_t v = getenv("LLAMA_LAYER_MAJOR") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_LAYER_MAJOR"))) : 0;
++    return v;
++}
++static uint32_t llama_lm_pipe() {
++    static const uint32_t v = getenv("LLAMA_LM_PIPE") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_PIPE"))) : 6;
++    return v;
++}
++static uint32_t llama_lm_fallback_ub() {
++    static const uint32_t v = getenv("LLAMA_LM_FALLBACK_UB") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_FALLBACK_UB"))) : 512;
++    return v;
++}
++static bool llama_lm_enabled(const llama_model & model, const llama_cparams & cparams) {
++    return llama_lm_rows() >= 512 && model.arch == LLM_ARCH_GLM_DSA && cparams.n_ubatch > llama_lm_rows();
++}
++
++// 0108: the causal staircase of every device that holds layers: Z[j][i] = 0 for column j <= S + i, -inf after (S = n_ctx rounded up to
++// 8).  Rows whose first position is p0 read the view at column c = pad8(S - p0), row d = c - (S - p0): element (j, i) is Z[c + j][d + i],
++// visible iff j <= p0 + i -- the causal mask of a sequence whose cells are its positions.  Uploaded once, row by row.
++void llama_context::lm_z_init() {
++    if (!lm_z.empty() || !llama_lm_enabled(model, cparams)) {
++        return;
++    }
++    const uint32_t R  = llama_lm_rows();
++    const int64_t  Rp = GGML_PAD((int64_t) R, 8);
++    const int64_t  S  = GGML_PAD((int64_t) cparams.n_ctx, 8);
++    const int64_t  W  = S + Rp + 512;
++    const int64_t  H  = Rp + 8;
++    std::vector<ggml_backend_dev_t> devs;
++    for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
++        ggml_backend_dev_t d = model.dev_layer(il);
++        if (d != nullptr && std::find(devs.begin(), devs.end(), d) == devs.end()) {
++            devs.push_back(d);
++        }
++    }
++    ggml_init_params ip = { ggml_tensor_overhead()*(devs.size() + 1), nullptr, true };
++    lm_z_ctx = ggml_init(ip);
++    std::vector<ggml_fp16_t> row(W);
++    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
++    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
++    for (ggml_backend_dev_t d : devs) {
++        ggml_tensor * z = ggml_new_tensor_2d(lm_z_ctx, GGML_TYPE_F16, W, H);
++        ggml_format_name(z, "lm_z.%s", ggml_backend_dev_name(d));
++        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(d), ggml_nbytes(z));
++        if (buf == nullptr) {
++            throw std::runtime_error("LLAMA_LAYER_MAJOR: failed to allocate the causal staircase");
++        }
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        if (ggml_backend_tensor_alloc(buf, z, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS) {
++            throw std::runtime_error("LLAMA_LAYER_MAJOR: failed to place the causal staircase");
++        }
++        for (int64_t j = 0; j < W; ++j) {
++            row[j] = j <= S ? zero : ninf;
++        }
++        for (int64_t i = 0; i < H; ++i) {
++            if (i > 0) {
++                row[S + i] = zero;
++            }
++            ggml_backend_tensor_set(z, row.data(), (size_t) i*z->nb[1], (size_t) W*sizeof(ggml_fp16_t));
++        }
++        lm_z_buf.push_back(buf);
++        lm_z.emplace_back(d, z);
++        LLAMA_LOG_INFO("%s: LLAMA_LAYER_MAJOR=%u: causal staircase %lld x %lld f16 on %s (%.1f MiB)\n", __func__, R,
++            (long long) W, (long long) H, ggml_backend_dev_name(d), ggml_nbytes(z)/1024.0/1024.0);
++    }
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -901,6 +981,15 @@ void llama_context::sched_reserve() {
+ 
+     resolve_fused_ops(mctx.get(), n_seqs);
+ 
++    // 0108 LLAMA_LAYER_MAJOR: the prompt graphs at n_ubatch are the layer-major one, every block over the whole cache; the usual prompt
++    // graph is reserved at the fallback ubatch at the end
++    const bool lm = llama_lm_enabled(model, cparams);
++    if (lm) {
++        lm_z_init();
++    }
++    cparams.lm_rows    = lm ? llama_lm_rows() : 0;
++    cparams.lm_reserve = lm;
++
+     // reserve worst-case graph
+     int n_splits_pp        = -1;
+     int n_nodes_pp         = -1;
+@@ -945,6 +1034,8 @@ void llama_context::sched_reserve() {
+         n_splits_tg = n_splits_pp;
+         n_nodes_tg  = n_nodes_pp;
+     } else {
++        cparams.lm_rows    = 0; // 0108: the token graph is the usual one
++        cparams.lm_reserve = false;
+         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute tg buffers");
+@@ -960,6 +1051,8 @@ void llama_context::sched_reserve() {
+     {
+         // TODO: the worst case graph is not always reached for `n_seqs > 1`
+         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
++        cparams.lm_rows    = lm ? llama_lm_rows() : 0; // 0108
++        cparams.lm_reserve = lm;
+         ggml_cgraph * gf = nullptr;
+         switch (model.arch) {
+             case LLM_ARCH_KIMI_LINEAR:
+@@ -984,6 +1077,18 @@ void llama_context::sched_reserve() {
+                 throw std::runtime_error("failed to allocate compute pp buffers (both-cards prompt graph)");
+             }
+         }
++
++        // 0108: the usual prompt graph at the fallback ubatch (a batch the layer-major graph cannot take)
++        if (lm) {
++            cparams.lm_rows    = 0;
++            cparams.lm_reserve = false;
++            const uint32_t n_fb = std::min(n_tokens, llama_lm_fallback_ub());
++            if (!graph_reserve(n_fb, n_seqs, std::min(n_fb, cparams.n_outputs_max), mctx.get(), model.no_alloc())) {
++                throw std::runtime_error("failed to allocate compute pp buffers (fallback prompt graph)");
++            }
++        }
++        cparams.lm_rows    = 0;
++        cparams.lm_reserve = false;
+     }
+ 
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+@@ -2127,8 +2232,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    // 0108 LLAMA_LAYER_MAJOR=R: a batch of more than 8 tokens is cut into ubatches of ~1/LLAMA_LM_PIPE of it (a multiple of R, R to
++    // n_ubatch) for the layer-major prompt graph when every token lands on the cell of its position (lm_positional); otherwise, and for a
++    // batch of 8 tokens or fewer, the usual graph at LLAMA_LM_FALLBACK_UB rows a ubatch
++    const bool lm_on = llama_lm_enabled(model, cparams);
++    const uint32_t lm_R = llama_lm_rows();
++    uint32_t n_ub = lm_on ? std::min(cparams.n_ubatch, llama_lm_fallback_ub()) : cparams.n_ubatch;
++    bool lm_try = false;
++    if (lm_on && balloc->get_n_tokens() > 8) {
++        const uint32_t n_all = balloc->get_n_tokens();
++        const uint32_t k = llama_lm_pipe();
++        uint32_t u = (n_all + k - 1)/k;
++        u = (u + lm_R - 1)/lm_R*lm_R;
++        n_ub = std::min(cparams.n_ubatch, std::max(lm_R, u));
++        lm_try = true;
++    }
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
++        mctx = memory->init_batch(*balloc, n_ub, embd_all);
+         if (!mctx) {
+             return -2;
+         }
+@@ -2167,6 +2288,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+                 }
+         }
+ 
++        // 0108: the layer-major graph's masks need every token at the cell of its position; otherwise the usual graph, small ubatches
++        if (lm_try && !mctx->lm_positional()) {
++            static int n_warn = 0;
++            if (n_warn++ < 4) {
++                LLAMA_LOG_WARN("%s: LLAMA_LAYER_MAJOR: a batch of %d tokens is not positional, the usual graph at %u rows a ubatch\n",
++                    __func__, balloc->get_n_tokens(), llama_lm_fallback_ub());
++            }
++            lm_try = false;
++            n_ub = std::min(cparams.n_ubatch, llama_lm_fallback_ub());
++            continue;
++        }
++
+         break;
+     }
+ 
+@@ -2186,6 +2319,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     // 0071 LLAMA_TP_PROMPT: the both-cards prompt graph only for a batch that is one ubatch
+     cparams.tp_batch_single = balloc->get_n_tokens() <= cparams.n_ubatch;
++    cparams.lm_rows    = lm_try ? lm_R : 0; // 0108
++    cparams.lm_reserve = false;
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+@@ -2762,6 +2897,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         res *= 3;
+     }
+ 
++    // 0108 LLAMA_LAYER_MAJOR: the layer-major prompt graph builds each layer's attention once a block of R rows and its FFN once a block
++    // of LLAMA_LM_MOE_ROWS rows (~30-40 nodes each)
++    if (llama_lm_rows() > 0 && n_tokens > llama_lm_rows()) {
++        const char * mr = getenv("LLAMA_LM_MOE_ROWS");
++        const uint32_t M = mr != nullptr ? (uint32_t) std::max(256, atoi(mr)) : 8192;
++        res += 64u*(n_tokens/llama_lm_rows() + n_tokens/M + 2)*model.hparams.n_layer();
++    }
++
+     return res;
+ }
+ 
+@@ -2929,6 +3072,7 @@ llm_graph_params llama_context::graph_params(
+         /*.twins       =*/ twins.empty() ? nullptr : &twins,
+         /*.prec_policy =*/ &model.prec_policy,
+         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
++        /*.lm_z        =*/ lm_z.empty() ? nullptr : &lm_z, // 0108
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0aaf76b8f..b9397bf36 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -421,6 +421,13 @@ private:
+     // twin backends for the prefill overlap (LLAMA_TWIN_BACKENDS): primary -> second backend on the same device
+     std::vector<std::pair<ggml_backend_t, ggml_backend_t>> twins;
+ 
++    // 0108 LLAMA_LAYER_MAJOR=R: per device that holds layers, the causal staircase [pad8(n_ctx) + pad8(R) + 512, pad8(R) + 8] f16 whose
++    // views are the masks of the layer-major prompt graph (see lm_z_init)
++    std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> lm_z;
++    ggml_context * lm_z_ctx = nullptr;
++    std::vector<ggml_backend_buffer_t> lm_z_buf;
++    void lm_z_init();
++
+     // LLAMA_MOE_RING_ONLY: per CUDA backend, the placeholder buffer of the MUL_MAT_ID expert copies (see sched_new)
+     std::vector<ggml_backend_buffer_ptr> expert_placeholders;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 71e233675..6c2877a8b 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -51,6 +51,10 @@ struct llama_cparams {
+     bool fused_top_k_mask;   // use fused top-k sparse attention mask
+ 
+     bool tp_batch_single = true; // 0071 LLAMA_TP_PROMPT: the batch being decoded is one ubatch (set by decode())
++    // 0108 LLAMA_LAYER_MAJOR: the rows of an attention block when the batch being decoded runs the layer-major prompt graph (0 = the
++    // usual graph; set by decode() and sched_reserve()); lm_reserve: a reserve graph, every block sized for the whole cache
++    uint32_t lm_rows    = 0;
++    bool     lm_reserve = false;
+     bool auto_ftkm;
+     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+     bool auto_fkvr;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d8ba6f635..5dbb63524 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -703,7 +703,10 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
+ 
+     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
+ 
+-    mctx->get_lid()->set_input_attn_mask(self_attn_mask_lid, ubatch, cparams.causal_attn);
++    // 0108: unallocated in the layer-major prompt graph, whose masks are views of the causal staircase
++    if (self_attn_mask_lid.raw->buffer) {
++        mctx->get_lid()->set_input_attn_mask(self_attn_mask_lid, ubatch, cparams.causal_attn);
++    }
+ }
+ 
+ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
+@@ -1566,6 +1569,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     twins            (params.twins),
+     prec_policy      (params.prec_policy),
+     hdmd             (params.hdmd),
++    lm_z             (params.lm_z),
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 37e36239a..f6d6255a7 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -797,6 +797,9 @@ struct llm_graph_params {
+ 
+     const llama_hadamard * hdmd = nullptr;
+ 
++    // 0108 LLAMA_LAYER_MAJOR: the causal staircase of each device that holds layers (llama_context::lm_z_init)
++    const std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> * lm_z = nullptr;
++
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     static bool samplers_equal(
+@@ -1081,6 +1084,8 @@ struct llm_graph_context {
+ 
+     const llama_hadamard * hdmd;
+ 
++    const std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> * lm_z; // 0108, see llm_graph_params
++
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+     const llm_graph_cb & cb_func;
+diff --git a/src/llama-kv-cache-dsa.cpp b/src/llama-kv-cache-dsa.cpp
+index 405eee36b..b4e95d270 100644
+--- a/src/llama-kv-cache-dsa.cpp
++++ b/src/llama-kv-cache-dsa.cpp
+@@ -272,3 +272,8 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
+ 
+     return static_cast<const llama_kv_cache_context *>(ctx_lid.get());
+ }
++
++// 0108 LLAMA_LAYER_MAJOR
++bool llama_kv_cache_dsa_context::lm_positional() const {
++    return status == LLAMA_MEMORY_STATUS_SUCCESS && get_mla()->lm_positional() && get_lid()->lm_positional();
++}
+diff --git a/src/llama-kv-cache-dsa.h b/src/llama-kv-cache-dsa.h
+index 13a59047c..2c05a858c 100644
+--- a/src/llama-kv-cache-dsa.h
++++ b/src/llama-kv-cache-dsa.h
+@@ -124,6 +124,9 @@ public:
+     const llama_kv_cache_context * get_mla() const;
+     const llama_kv_cache_context * get_lid()  const;
+ 
++    // 0108 LLAMA_LAYER_MAJOR: both caches (llama_memory_context_i)
++    bool lm_positional() const override;
++
+ private:
+     //llama_kv_cache_dsa * kv;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 84f547ae1..11db7d318 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -3085,3 +3085,42 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+ void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+     kv->get_prev_tokens(ubatch, n, res);
+ }
++
++// 0108 LLAMA_LAYER_MAJOR
++bool llama_kv_cache::lm_cells_positional(uint32_t strm, llama_seq_id seq_id, llama_pos p_first) const {
++    if (strm >= v_cells.size()) {
++        return false;
++    }
++    const auto & cells = v_cells[strm];
++    if (p_first < 0 || (uint32_t) p_first > cells.size()) {
++        return false;
++    }
++    for (uint32_t i = 0; i < (uint32_t) p_first; ++i) {
++        if (cells.is_empty(i) || cells.pos_get(i) != (llama_pos) i || !cells.seq_has(i, seq_id)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool llama_kv_cache_context::lm_positional() const {
++    if (ubatches.empty() || sinfos.size() != ubatches.size()) {
++        return false;
++    }
++    const llama_seq_id seq = ubatches[0].seq_id[0][0];
++    llama_pos next = ubatches[0].pos[0];
++    for (size_t k = 0; k < ubatches.size(); ++k) {
++        const auto & ub = ubatches[k];
++        const auto & si = sinfos[k];
++        if (ub.n_seqs_unq != 1 || si.n_stream() != 1 || si.idxs[0].size() != ub.n_tokens) {
++            return false;
++        }
++        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
++            if (ub.n_seq_id[i] != 1 || ub.seq_id[i][0] != seq || ub.pos[i] != next + (llama_pos) i || (llama_pos) si.idxs[0][i] != ub.pos[i]) {
++                return false;
++            }
++        }
++        next += (llama_pos) ub.n_tokens;
++    }
++    return kv->lm_cells_positional((uint32_t) sinfos[0].strm[0], seq, ubatches[0].pos[0]);
++}
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9ed36c562..2aac939ad 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -256,6 +256,9 @@ public:
+     // note: used by n-gram input embeddings
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+ 
++    // 0108 LLAMA_LAYER_MAJOR: cells [0, p_first) of stream strm hold seq_id's tokens at their own positions
++    bool lm_cells_positional(uint32_t strm, llama_seq_id seq_id, llama_pos p_first) const;
++
+ private:
+     const llama_model & model;
+     const llama_hparams & hparams;
+@@ -447,6 +450,9 @@ public:
+     // see llama_kv_cache::get_prev_tokens()
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+ 
++    // 0108 LLAMA_LAYER_MAJOR (llama_memory_context_i)
++    bool lm_positional() const override;
++
+ private:
+     llama_memory_status status;
+ 
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 37d01ed11..7b3a02025 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -95,6 +95,10 @@ struct llama_memory_context_i {
+ 
+     // get the status of the memory context - used for error handling and checking if any updates would be applied
+     virtual llama_memory_status get_status() const = 0;
++
++    // 0108 LLAMA_LAYER_MAJOR: every ubatch of the batch is one sequence whose tokens sit at the cells of their positions, above cells that
++    // hold the same sequence at their own positions (the layer-major graph's masks assume it)
++    virtual bool lm_positional() const { return false; }
+ };
+ 
+ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index bf02594e9..e751a314a 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -3,6 +3,12 @@
+ #include "llama-kv-cache-dsa.h"
+ #include "llama-moe-cache.h"
+ 
++// 0108 LLAMA_LAYER_MAJOR: an input that keeps the layer-major prompt graph from being reused (its mask views carry the ubatch's positions)
++struct llm_graph_input_lm_once : public llm_graph_input_i {
++    void set_input(const llama_ubatch * ubatch) override { GGML_UNUSED(ubatch); }
++    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return false; }
++};
++
+ // https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L26
+ const std::array<uint32_t, LLAMA_MAX_LAYERS> GLM_5_2_DEFAULT_INDEXER_TYPES = {
+     1, 1,
+@@ -553,6 +559,241 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         return;
+     }
+ 
++    // 0108 LLAMA_LAYER_MAJOR=R (llama_context::decode sets cparams.lm_rows for a batch whose tokens sit at the cells of their positions):
++    // each layer's attention in blocks of R query rows and its FFN in blocks of LLAMA_LM_MOE_ROWS rows, so a ubatch of up to n_ubatch
++    // tokens uploads each layer's experts once while the indexer's scores and masks stay [n_kv, R].  The masks are views of the device's
++    // causal staircase (llama_context::lm_z_init); a block's keys are the cache's first pad256(p0 + rows) cells, a reserve sizes every
++    // block for the whole cache.
++    if (cparams.lm_rows > 0 && lm_z != nullptr && !tp) {
++        GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
++        static const int64_t lm_moe_rows = getenv("LLAMA_LM_MOE_ROWS") != nullptr ? std::max(256, atoi(getenv("LLAMA_LM_MOE_ROWS"))) : 8192;
++        const int64_t R = cparams.lm_rows;
++
++        ggml_tensor * x       = build_inp_embd(model.tok_embd);
++        ggml_tensor * pos_all = build_inp_pos();
++        llm_graph_input_attn_k_dsa * inp = build_attn_inp_k_dsa();
++        ggml_tensor * out_ids = build_inp_out_ids();
++        res->add_input(std::make_unique<llm_graph_input_lm_once>());
++        if (moe_cache != nullptr) {
++            moe_cache->clear_preds();
++        }
++
++        const auto * mctx_mla = inp->mctx->get_mla();
++        const auto * mctx_lid = inp->mctx->get_lid();
++        const int64_t n_kv = mctx_mla->get_n_kv();
++
++        auto z_of = [&](int il) -> ggml_tensor * {
++            const ggml_backend_dev_t d = model.dev_layer(il);
++            for (const auto & e : *lm_z) {
++                if (e.first == d) {
++                    return e.second;
++                }
++            }
++            GGML_ABORT("LLAMA_LAYER_MAJOR: no causal staircase on the device of layer %d", il);
++        };
++        ggml_tensor * Z0 = lm_z->front().second;
++        const int64_t Rp = GGML_PAD(R, 8);
++        const int64_t S  = Z0->ne[0] - Rp - 512;
++        GGML_ASSERT(S > 0 && Z0->ne[1] >= Rp + 8);
++
++        // the attention blocks: rows [r0, r0 + nr), keys [0, n_kv), the staircase view at column c, row d
++        struct lm_block { int64_t r0, nr, n_kv, c, d; };
++        std::vector<lm_block> blocks;
++        for (int64_t r0 = 0; r0 < n_tokens; r0 += R) {
++            lm_block b = { r0, std::min(R, n_tokens - r0), n_kv, 0, 0 };
++            if (!cparams.lm_reserve) {
++                const int64_t p0   = ubatch.pos[r0];
++                const int64_t base = S - p0;
++                b.n_kv = std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
++                b.c    = GGML_PAD(base, 8);
++                b.d    = b.c - base;
++                GGML_ASSERT(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1]);
++            }
++            blocks.push_back(b);
++        }
++        auto z_view = [&](ggml_tensor * Z, const lm_block & b) {
++            return ggml_view_4d(ctx0, Z, b.n_kv, b.nr, 1, 1, Z->nb[1], Z->nb[1]*Z->ne[1], Z->nb[1]*Z->ne[1],
++                                (size_t) b.c*ggml_element_size(Z) + (size_t) b.d*Z->nb[1]);
++        };
++        auto rows = [&](ggml_tensor * t, int64_t r0, int64_t nr) {
++            return ggml_view_2d(ctx0, t, t->ne[0], nr, t->nb[1], r0*t->nb[1]);
++        };
++        // pairwise, so each row is copied log2(blocks) times
++        auto concat_rows = [&](std::vector<ggml_tensor *> v) {
++            while (v.size() > 1) {
++                std::vector<ggml_tensor *> w;
++                for (size_t i = 0; i + 1 < v.size(); i += 2) {
++                    w.push_back(ggml_concat(ctx0, v[i], v[i + 1], 1));
++                }
++                if (v.size() % 2 == 1) {
++                    w.push_back(v.back());
++                }
++                v.swap(w);
++            }
++            return v[0];
++        };
++
++        std::vector<ggml_tensor *> top_k_prev(blocks.size(), nullptr);
++        for (int il = 0; il < n_layer; ++il) {
++            const auto & L = model.layers[il];
++            ggml_tensor * Z    = z_of(il);
++            ggml_tensor * x_sa = x;
++
++            ggml_tensor * cur = build_norm(x, L.attn_norm, NULL, LLM_NORM_RMS, il);
++            ggml_tensor * qr  = ggml_mul_mat(ctx0, L.wq_a, cur);
++            qr = build_norm(qr, L.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++
++            // the indexer's queries and weights; its keys stored for the whole ubatch before any block reads them
++            ggml_tensor * iq = nullptr;
++            ggml_tensor * iw = nullptr;
++            ggml_tensor * ik_cache = nullptr;
++            if (hparams.is_indexer_full(il)) {
++                iq = ggml_mul_mat(ctx0, L.indexer_attn_q_b, qr);
++                iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer_head, n_indexer_head, n_tokens);
++                iq = ggml_rope_ext(ctx0, iq, pos_all, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                   ext_factor, attn_factor, beta_fast, beta_slow);
++                ggml_tensor * ik = ggml_mul_mat(ctx0, L.indexer_attn_k, cur);
++                ik = build_norm(ik, L.indexer_k_norm, L.indexer_k_norm_b, LLM_NORM, il);
++                ik = ggml_reshape_3d(ctx0, ik, n_embd_indexer_head, 1, n_tokens);
++                ik = ggml_rope_ext(ctx0, ik, pos_all, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                   ext_factor, attn_factor, beta_fast, beta_slow);
++                iq = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], iq);
++                ik = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], ik);
++                ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik, inp->get_k_idxs_lid(), il));
++                ik_cache = mctx_lid->get_k(ctx0, il);
++                iw = ggml_mul_mat(ctx0, L.indexer_proj, cur);
++                iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
++            }
++
++            // the latent keys of the whole ubatch, stored likewise
++            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, L.wkv_a_mqa, cur);
++            ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
++                                                 ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
++            ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
++                                              ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                              ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                              ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
++            k_pe = ggml_rope_ext(ctx0, k_pe, pos_all, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                 ext_factor, attn_factor, beta_fast, beta_slow);
++            kv_cmpr = build_norm(kv_cmpr, L.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
++            kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
++            ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, ggml_concat(ctx0, kv_cmpr, k_pe, 0), inp->get_k_idxs_mla(), il));
++            ggml_tensor * k_cache = mctx_mla->get_k(ctx0, il);
++
++            // the attention, a block of query rows at a time
++            std::vector<ggml_tensor *> outs;
++            for (size_t ib = 0; ib < blocks.size(); ++ib) {
++                const lm_block & b = blocks[ib];
++                ggml_tensor * mask  = z_view(Z, b);
++                ggml_tensor * top_k = nullptr;
++                if (iq != nullptr) {
++                    ggml_tensor * iq_b = ggml_view_3d(ctx0, iq, iq->ne[0], iq->ne[1], b.nr, iq->nb[1], iq->nb[2], b.r0*iq->nb[2]);
++                    ggml_tensor * ik_b = ggml_view_4d(ctx0, ik_cache, ik_cache->ne[0], ik_cache->ne[1], b.n_kv, ik_cache->ne[3],
++                                                      ik_cache->nb[1], ik_cache->nb[2], ik_cache->nb[3], 0);
++                    ggml_tensor * sc = ggml_lightning_indexer(ctx0, iq_b, ik_b, rows(iw, b.r0, b.nr), mask);
++                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
++                    const uint32_t n_top = sc->ne[0] < n_indexer_top_k ? sc->ne[0] : n_indexer_top_k;
++                    top_k = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
++                    top_k_prev[ib] = top_k;
++                } else {
++                    GGML_ASSERT(top_k_prev[ib] != nullptr && "shared indexer layer must follow a previous full indexer layer");
++                    top_k = top_k_prev[ib];
++                }
++                ggml_tensor * kq_mask = build_fused_top_k_mask(mask, top_k, il);
++
++                ggml_tensor * pos_b = ggml_view_1d(ctx0, pos_all, b.nr, b.r0*ggml_element_size(pos_all));
++                ggml_tensor * q = ggml_mul_mat(ctx0, L.wq_b, rows(qr, b.r0, b.nr));
++                ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, b.nr, ggml_row_size(q->type, n_embd_head_k),
++                                                    ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
++                ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, b.nr, ggml_row_size(q->type, n_embd_head_k),
++                                                  ggml_row_size(q->type, n_embd_head_k) * n_head, ggml_row_size(q->type, n_embd_head_qk_nope));
++                q_pe = ggml_rope_ext(ctx0, q_pe, pos_b, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
++                ggml_tensor * q_abs = ggml_mul_mat(ctx0, L.wk_b, q_nope);
++                q_abs = ggml_permute(ctx0, q_abs, 0, 2, 1, 3);
++                ggml_tensor * Q = ggml_concat(ctx0, q_abs, q_pe, 0);
++
++                ggml_tensor * K = ggml_view_4d(ctx0, k_cache, k_cache->ne[0], k_cache->ne[1], b.n_kv, k_cache->ne[3],
++                                               k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], 0);
++                ggml_tensor * V = ggml_view_4d(ctx0, K, kv_lora_rank, K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3], 0);
++                ggml_tensor * o = build_attn_mha(Q, K, V, nullptr, kq_mask, nullptr, nullptr, L.wv_b, top_k->ne[0], kq_scale, il);
++                o = build_lora_mm(L.wo, o, L.wo_s);
++                outs.push_back(o);
++                ggml_build_forward_expand(gf, o);
++            }
++            ggml_tensor * attn = concat_rows(outs);
++            if (il == n_layer - 1 && crop_before_nextn(out_ids)) {
++                attn = ggml_get_rows(ctx0, attn, out_ids);
++                x_sa = ggml_get_rows(ctx0, x_sa, out_ids);
++            }
++            ggml_tensor * ffn_inp = ggml_add(ctx0, attn, x_sa);
++            ggml_tensor * h = build_norm(ffn_inp, L.ffn_norm, NULL, LLM_NORM_RMS, il);
++
++            // the FFN in balanced blocks of at most LLAMA_LM_MOE_ROWS rows (a block of a prompt ubatch never shrinks to the decode
++            // path's 8 rows); a layer's experts are one copy for all of them
++            const int64_t nh  = h->ne[1];
++            const int64_t nbm = (nh + lm_moe_rows - 1)/lm_moe_rows;
++            std::vector<ggml_tensor *> fouts;
++            for (int64_t m = 0, m0 = 0; m < nbm; ++m) {
++                const int64_t nm = nh/nbm + (m < nh % nbm ? 1 : 0);
++                ggml_tensor * hm = rows(h, m0, nm);
++                m0 += nm;
++                ggml_tensor * f = nullptr;
++                if ((uint32_t) il < hparams.n_layer_dense_lead) {
++                    f = build_ffn(hm,
++                        L.ffn_up, NULL, L.ffn_up_s,
++                        L.ffn_gate, NULL, L.ffn_gate_s,
++                        L.ffn_down, NULL, L.ffn_down_s,
++                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                } else {
++                    ggml_tensor * moe = build_moe_ffn(hm,
++                        L.ffn_gate_inp,
++                        L.ffn_up_exps,
++                        L.ffn_gate_exps,
++                        L.ffn_down_exps,
++                        L.ffn_exp_probs_b,
++                        n_expert, n_expert_used,
++                        LLM_FFN_SILU, hparams.expert_weights_norm,
++                        hparams.expert_weights_scale,
++                        (llama_expert_gating_func_type) hparams.expert_gating_func,
++                        il,
++                        nullptr,
++                        L.ffn_gate_up_exps,
++                        L.ffn_up_exps_s,
++                        L.ffn_gate_exps_s,
++                        L.ffn_down_exps_s);
++                    ggml_tensor * sh = build_ffn(hm,
++                        L.ffn_up_shexp, NULL, L.ffn_up_shexp_s,
++                        L.ffn_gate_shexp, NULL, L.ffn_gate_shexp_s,
++                        L.ffn_down_shexp, NULL, L.ffn_down_shexp_s,
++                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                    f = ggml_add(ctx0, moe, sh);
++                }
++                fouts.push_back(f);
++                ggml_build_forward_expand(gf, f);
++            }
++            ggml_tensor * y = ggml_add(ctx0, concat_rows(fouts), ffn_inp);
++            y = build_cvec(y, il);
++            cb(y, "l_out", il);
++            x = y;
++        }
++
++        ggml_tensor * y = build_norm(x, model.output_norm, NULL, LLM_NORM_RMS, -1);
++        cb(y, "h_nextn", -1);
++        res->t_h_nextn = y;
++        if (crop_after_nextn(out_ids)) {
++            y = ggml_get_rows(ctx0, y, out_ids);
++        }
++        cb(y, "result_norm", -1);
++        res->t_embd = y;
++        y = ggml_mul_mat(ctx0, model.output, y);
++        cb(y, "result_output", -1);
++        res->t_logits = y;
++        ggml_build_forward_expand(gf, y);
++        return;
++    }
++
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
+-- 
+2.43.0
+

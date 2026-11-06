@@ -1,0 +1,259 @@
+From 02661442765b6ed4d52ac47a64606b39a20064f9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:43:59 -0600
+Subject: [PATCH 028/141] moe cache: LLAMA_MOE_ASYNC_FILL=1 computes the cache
+ fills of one-token batches on the CPU and uploads them on the side stream;
+ LLAMA_MOE_ROUTE_BIAS=d adds d to the selection scores of the cached experts
+ (cache-aware routing)
+
+---
+ src/llama-graph.cpp     |   9 +++
+ src/llama-moe-cache.cpp | 131 ++++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-cache.h   |   4 ++
+ 3 files changed, 139 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 79724accb..89d5272bd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2276,6 +2276,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selection_probs, "ffn_moe_probs_biased", il);
+     }
+ 
++    // LLAMA_MOE_ROUTE_BIAS: favour the cached experts in the selection of the batches the MoE cache serves; the weights stay unbiased
++    if (moe_cache != nullptr) {
++        ggml_tensor * route_bias = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
++        if (route_bias != nullptr) {
++            selection_probs = ggml_add(ctx0, selection_probs, route_bias);
++            cb(selection_probs, "ffn_moe_probs_cache_bias", il);
++        }
++    }
++
+     // select top n_group_used expert groups
+     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index be647c748..291f869a3 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -295,6 +295,10 @@ struct llama_moe_cache::impl {
+         ggml_tensor * cpu_ids = nullptr;    // I32 [n_expert_used, max_batch] in host memory: the token's CPU experts, -1 elsewhere (deferred plan)
+         std::vector<int32_t> last_ids;      // the experts selected at the last small-batch lookup (LLAMA_MOE_PROBE)
+         ggml_tensor * pred = nullptr;       // LLAMA_MOE_PREFETCH: the graph's prediction of this layer's experts, per graph build
++        std::vector<std::pair<int32_t, int32_t>> pending_fills; // LLAMA_MOE_ASYNC_FILL: (expert, slot) uploaded on the side stream
++        ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
++        std::vector<float> route_bias_host; // the values of the next upload
++        std::vector<float> route_bias_last; // the values of the last upload
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+         std::vector<uint32_t> hist;         // prompt-informed admission: selections per expert in large batches
+     };
+@@ -369,6 +373,19 @@ struct llama_moe_cache::impl {
+     };
+     pending_plan defer_st;
+ 
++    // LLAMA_MOE_ASYNC_FILL=1 and LLAMA_MOE_ROUTE_BIAS=d, see get_route_bias and the small-batch path of copy
++    static bool async_fill_enabled() {
++        static const bool v = getenv("LLAMA_MOE_ASYNC_FILL") != nullptr && atoi(getenv("LLAMA_MOE_ASYNC_FILL")) != 0;
++        return v;
++    }
++    static float route_bias_value() {
++        static const float v = getenv("LLAMA_MOE_ROUTE_BIAS") != nullptr ? (float) atof(getenv("LLAMA_MOE_ROUTE_BIAS")) : 0.0f;
++        return v;
++    }
++    std::vector<ggml_context_ptr>        rb_ctx; // per device
++    std::vector<ggml_backend_buffer_ptr> rb_buf;
++    size_t win_async = 0; // misses computed on the CPU and filled on the side stream, in the window
++
+     // LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, read with the ids; the uncached ones are uploaded on the side stream
+     static bool prefetch_enabled() {
+         static const bool v = getenv("LLAMA_MOE_PREFETCH") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH")) != 0;
+@@ -688,6 +705,42 @@ struct llama_moe_cache::impl {
+         }
+         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
++        // LLAMA_MOE_ROUTE_BIAS: per cached layer, a selection bias on its device (a weight: the add runs where the router runs)
++        if (!no_alloc && route_bias_value() != 0.0f) {
++            const int64_t n_exp = (int64_t) model.hparams.n_expert;
++            rb_ctx.resize(devices.size());
++            rb_buf.resize(devices.size());
++            for (size_t id = 0; id < devices.size(); ++id) {
++                size_t n = 0;
++                for (size_t il = 0; il < layers.size(); ++il) {
++                    n += layers[il].ig >= 0 && groups[layers[il].ig].id == (int32_t) id ? 1 : 0;
++                }
++                if (n == 0) {
++                    continue;
++                }
++                ggml_init_params ip = { ggml_tensor_overhead()*n, nullptr, true };
++                rb_ctx[id].reset(ggml_init(ip));
++                for (size_t il = 0; il < layers.size(); ++il) {
++                    layer & l = layers[il];
++                    if (l.ig < 0 || groups[l.ig].id != (int32_t) id) {
++                        continue;
++                    }
++                    l.route_bias = ggml_new_tensor_1d(rb_ctx[id].get(), GGML_TYPE_F32, n_exp);
++                    ggml_format_name(l.route_bias, "moe_cache.route_bias-%d", (int) il);
++                    l.route_bias_host.assign(n_exp, 0.0f);
++                    l.route_bias_last.assign(n_exp, 0.0f);
++                }
++                rb_buf[id].reset(ggml_backend_alloc_ctx_tensors_from_buft(rb_ctx[id].get(), devices[id].buft));
++                GGML_ASSERT(rb_buf[id]);
++                ggml_backend_buffer_clear(rb_buf[id].get(), 0);
++                ggml_backend_buffer_set_usage(rb_buf[id].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            }
++            LLAMA_LOG_INFO("llama_moe_cache: cache-aware routing, selection bias %.4f for the cached experts\n", (double) route_bias_value());
++        }
++        if (async_fill_enabled()) {
++            LLAMA_LOG_INFO("llama_moe_cache: asynchronous fills (one-token batches)\n");
++        }
++
+         for (size_t id = 0; id < devices.size(); ++id) {
+             const device & d = devices[id];
+             if (d.host_bytes == 0) {
+@@ -1038,6 +1091,18 @@ struct llama_moe_cache::impl {
+         ggml_backend_synchronize(backend);
+         l.last_ids.assign(ids.begin(), ids.end());
+ 
++        // LLAMA_MOE_ASYNC_FILL: the experts filled on the side stream at the last lookup of this layer are cached from now on, unless
++        // another layer's plan took their slot since (the main stream waits for the side uploads before the map upload below)
++        if (!l.pending_fills.empty()) {
++            int32_t * slots_pf = g.slru.slot_map[il];
++            for (const auto & pf : l.pending_fills) {
++                if (g.slru.key_of[pf.second] == il*g.slru.n_expert + pf.first) {
++                    slots_pf[pf.first] = pf.second;
++                }
++            }
++            l.pending_fills.clear();
++        }
++
+         if (trace != nullptr) {
+             write_trace(il, it_cpu != cpu_parts.end() ? it_cpu->second.n_used : n_expert_used);
+         }
+@@ -1065,6 +1130,30 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        // LLAMA_MOE_ASYNC_FILL (one token, a CPU part): the misses that enter the cache are computed on the CPU this token, their device
++        // slot reads zeros, and their uploads go on the side stream; the slots are published at the next lookup of the layer
++        bool async_fill = false;
++#ifdef GGML_USE_CUDA
++        async_fill = async_fill_enabled() && has_cpu && ids.size() == (size_t) n_expert_used && !fills.empty() && ggml_backend_is_cuda(backend);
++        if (async_fill_enabled() && !async_fill && !fills.empty() && ggml_backend_is_cuda(backend)) {
++            // a main-stream fill must not race an older side upload into the same slot
++            ggml_backend_cuda_side_upload_wait(backend);
++        }
++#endif
++        if (async_fill) {
++            int32_t * cpu_map = (int32_t *) l.cpu_map->data;
++            int32_t * slots_af = g.slru.slot_map[il];
++            int32_t z = (int32_t) cpu.size();
++            for (const auto & f : fills) {
++                GGML_ASSERT(z < n_zero);
++                slots_af[f.expert] = g.slru.n_slots + z++;
++                cpu_map[f.expert] = f.expert;
++                l.cpu_experts.push_back(f.expert);
++                l.pending_fills.push_back({ f.expert, f.slot });
++            }
++            win_async += fills.size();
++        }
++
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+         size_t bytes = 0;
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+@@ -1076,25 +1165,49 @@ struct llama_moe_cache::impl {
+                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++#ifdef GGML_USE_CUDA
++                if (async_fill) {
++                    ggml_backend_cuda_side_upload_async(backend, (uint8_t *) bank->data + fills[i].slot*expert_size,
++                        (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size);
++                } else
++#endif
++                {
++                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                }
+                 bytes += n*expert_size;
+                 i += n;
+             }
+         }
+ 
++        // LLAMA_MOE_ROUTE_BIAS: the selection bias of this layer for the next token, d for the cached experts (the pending fills included)
++        if (l.route_bias != nullptr) {
++            const float d = route_bias_value();
++            const int32_t * slots_rb = g.slru.slot_map[il];
++            for (int32_t e = 0; e < g.slru.n_expert; ++e) {
++                l.route_bias_host[e] = slots_rb[e] < g.slru.n_slots ? d : 0.0f;
++            }
++            for (const auto & pf : l.pending_fills) {
++                l.route_bias_host[pf.first] = d;
++            }
++            if (l.route_bias_host != l.route_bias_last) {
++                ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
++                l.route_bias_last = l.route_bias_host;
++            }
++        }
++
+         if (pred_pending) {
+             prefetch(il + 1, backend);
+         }
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+         st.misses += fills.size() + cpu.size();
+-        st.cpu    += cpu.size();
++        st.cpu    += cpu.size() + (async_fill ? fills.size() : 0);
+         st.bytes  += bytes;
+ 
+         if (log_every > 0 && ids.size() <= (size_t) 8*n_expert_used) {
+             win.hits   += n_hit;
+             win.misses += fills.size() + cpu.size();
+-            win.cpu    += cpu.size();
++            win.cpu    += cpu.size() + (async_fill ? fills.size() : 0);
+             win.bytes  += bytes;
+             if (il_first < 0 || il < il_first) {
+                 il_first = il;
+@@ -1113,8 +1226,9 @@ struct llama_moe_cache::impl {
+         }
+ 
+ #ifdef GGML_USE_CUDA
+-        // the hits of this layer wait for the side uploads issued for it by the previous layer's callback
+-        if (prefetch_enabled() && ggml_backend_is_cuda(backend)) {
++        // the hits of this layer wait for the side uploads issued for it (the prefetch of the previous layer, the asynchronous fills of
++        // the last token published above)
++        if ((prefetch_enabled() || async_fill_enabled()) && ggml_backend_is_cuda(backend)) {
+             ggml_backend_cuda_side_upload_wait(backend);
+         }
+ #endif
+@@ -1309,6 +1423,13 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
+     return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_map : nullptr;
+ }
+ 
++ggml_tensor * llama_moe_cache::get_route_bias(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++    if (il < 0 || il >= (int32_t) pimpl->layers.size() || pimpl->layers[il].route_bias == nullptr) {
++        return nullptr;
++    }
++    return pimpl->get_slot_map(il, n_tokens, n_expert_used) != nullptr ? pimpl->layers[il].route_bias : nullptr;
++}
++
+ ggml_tensor * llama_moe_cache::get_cpu_ids(int32_t il) const {
+     return impl::deferred_plan() && il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_ids : nullptr;
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 2ec56c200..91d261bb1 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -36,6 +36,10 @@ public:
+     // written by the deferred plan (-1 for the experts the device computes), nullptr when the plan is not deferred
+     ggml_tensor * get_cpu_ids(int32_t il) const;
+ 
++    // LLAMA_MOE_ROUTE_BIAS=d: F32 [n_expert] on the layer's device, d for the experts cached in layer il and 0 elsewhere, to add to the
++    // selection scores; nullptr when off or when the cache does not serve batches of n_tokens
++    ggml_tensor * get_route_bias(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
++
+     // the experts selected at the last small-batch lookup of layer il (LLAMA_MOE_PROBE), nullptr if none
+     const std::vector<int32_t> * last_ids(int32_t il) const;
+ 
+-- 
+2.43.0
+

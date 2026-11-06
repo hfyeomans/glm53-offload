@@ -1,0 +1,97 @@
+From 1e3c5f1d6164bc0baf431a60d3974a5af92efea9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:54:14 -0600
+Subject: [PATCH 030/141] LLAMA_MOE_SHEXP_OVERLAP=1: glm-dsa builds its shared
+ expert inside build_moe_ffn after the device experts, so it runs while the
+ CPU computes the misses
+
+---
+ src/llama-graph.cpp    | 11 +++++++++++
+ src/llama-graph.h      |  4 ++++
+ src/models/glm-dsa.cpp | 16 +++++++++++++++-
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 89d5272bd..49bc68417 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2596,6 +2596,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * experts_dev = build_experts(cur, selected_experts, slots, true);
+         ggml_build_forward_expand(gf, experts_dev);
+ 
++        // LLAMA_MOE_SHEXP_OVERLAP: device work that does not need the CPU part (the shared expert) goes in the hits' split
++        if (moe_overlap_hook) {
++            moe_overlap_hook();
++            moe_overlap_hook = nullptr;
++        }
++
+         // the CPU part comes after the slot lookup, whose copy callback fills the CPU map and reads the inputs of the CPU part
+         const int n_nodes_dev = ggml_graph_n_nodes(gf);
+         ggml_tensor * experts_cpu = build_experts(cur, sel2d, cpu_ids, false);
+@@ -2680,6 +2686,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     return moe_out;
+ }
+ 
++bool llm_graph_context::moe_shexp_overlap_enabled() {
++    static const bool v = getenv("LLAMA_MOE_SHEXP_OVERLAP") != nullptr && atoi(getenv("LLAMA_MOE_SHEXP_OVERLAP")) != 0;
++    return v;
++}
++
+ bool llm_graph_context::moe_prefetch_enabled() {
+     static const bool v = getenv("LLAMA_MOE_PREFETCH") != nullptr && atoi(getenv("LLAMA_MOE_PREFETCH")) != 0;
+     return v;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c27316674..799b4313a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1055,6 +1055,10 @@ struct llm_graph_context {
+ 
+     // LLAMA_MOE_PROBE=1: build_moe_ffn stops after the expert selection and leaves it in moe_probe_sel (see models/glm-dsa.cpp)
+     mutable bool          moe_probe     = false;
++
++    // LLAMA_MOE_SHEXP_OVERLAP=1: called by build_moe_ffn after the device experts and before the CPU part (the shared expert goes here)
++    mutable std::function<void()> moe_overlap_hook;
++    static bool moe_shexp_overlap_enabled();
+     mutable ggml_tensor * moe_probe_sel = nullptr;
+     static bool moe_probe_enabled();
+     static bool moe_prefetch_enabled(); // LLAMA_MOE_PREFETCH=1: predict the next layer's experts at the top of each layer (decode)
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 5c78c021d..bec469b87 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -501,6 +501,19 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             cb(cur, "ffn_out", il);
+         } else {
+             // MoE branch
++            // LLAMA_MOE_SHEXP_OVERLAP: on the batches the MoE cache serves, the shared expert is built inside build_moe_ffn after the
++            // device experts, so it runs on the GPU while the CPU computes the misses
++            ggml_tensor * shexp_early = nullptr;
++            if (moe_shexp_overlap_enabled() && n_tokens <= 32) {
++                moe_overlap_hook = [&, il, cur]() {
++                    shexp_early = build_ffn(cur,
++                        model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
++                        model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
++                        model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
++                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                    ggml_build_forward_expand(gf, shexp_early);
++                };
++            }
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                 model.layers[il].ffn_gate_inp,
+                 model.layers[il].ffn_up_exps,
+@@ -518,10 +531,11 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 model.layers[il].ffn_gate_exps_s,
+                 model.layers[il].ffn_down_exps_s);
+             cb(moe_out, "ffn_moe_out", il);
++            moe_overlap_hook = nullptr; // not consumed: no CPU part in this graph
+ 
+             // FFN shared expert
+             {
+-                ggml_tensor * ffn_shexp =
++                ggml_tensor * ffn_shexp = shexp_early ? shexp_early :
+                     build_ffn(cur,
+                         model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                         model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+-- 
+2.43.0
+

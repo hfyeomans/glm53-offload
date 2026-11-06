@@ -1,0 +1,26 @@
+From f7953da75811d545054fbf9d28a2354a8443ee69 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 15:47:21 -0600
+Subject: [PATCH 121/141] layer-major + LLAMA_TP_PROMPT: decode never marks a
+ layer-major batch single (its ubatches are smaller than n_ubatch)
+
+---
+ src/llama-context.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0c8c9d64a..321a2b5c3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2335,7 +2335,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     int64_t n_tokens_prev  = 0;
+ 
+     // 0071 LLAMA_TP_PROMPT: the both-cards prompt graph only for a batch that is one ubatch
+-    cparams.tp_batch_single = balloc->get_n_tokens() <= cparams.n_ubatch;
++    cparams.tp_batch_single = balloc->get_n_tokens() <= cparams.n_ubatch && !lm_try; // 0121: never a layer-major batch
+     cparams.lm_rows    = lm_try ? lm_R : 0; // 0108
+     cparams.lm_reserve = false;
+     // 0114: the batch's key extent, one value for all its ubatches
+-- 
+2.43.0
+

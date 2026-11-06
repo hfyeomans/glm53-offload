@@ -1,0 +1,65 @@
+From aeba69f38db3f07471fb2c7d9058f6f24a75394e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:43:02 -0600
+Subject: [PATCH 068/141] sched: GGML_SCHED_KEPT_LOG=1 prints the inputs kept
+ in n_copies copies for graphs with transient inputs, largest first
+
+---
+ ggml/src/ggml-backend.cpp | 41 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 095cd1ee4..ca81a6a2f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2063,6 +2063,47 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         }
+     }
+ 
++    // 0067 GGML_SCHED_KEPT_LOG=1: the inputs kept for the whole graph in n_copies copies, largest first (graphs with transient inputs)
++    {
++        static const bool kept_log = getenv("GGML_SCHED_KEPT_LOG") != NULL && atoi(getenv("GGML_SCHED_KEPT_LOG")) != 0;
++        static int n_logged = 0;
++        if (kept_log && sched->n_copies > 1 && sched->transient_inputs && n_logged < 3) {
++            n_logged++;
++            struct kept { size_t bytes; const struct ggml_tensor * t; int from; int to; };
++            std::vector<kept> ks;
++            size_t total = 0, total_transient = 0, total_host = 0;
++            for (int i = 0; i < sched->n_splits; i++) {
++                struct ggml_backend_sched_split * split = &sched->splits[i];
++                for (int j = 0; j < split->n_inputs; j++) {
++                    struct ggml_tensor * input = split->inputs[j];
++                    const size_t b = ggml_nbytes(input);
++                    if (ggml_backend_sched_is_host_weight(input)) {
++                        total_host += b;
++                        continue;
++                    }
++                    if (ggml_backend_sched_input_is_transient(sched, input, split->backend_id)) {
++                        total_transient += b;
++                        continue;
++                    }
++                    const struct ggml_tensor * c0 = tensor_copy(input, split->backend_id, 0);
++                    const struct ggml_tensor * c1 = tensor_copy(input, split->backend_id, 1);
++                    const size_t kb = c0 == c1 ? b : b*sched->n_copies;
++                    total += kb;
++                    ks.push_back({ kb, input, tensor_backend_id(input), split->backend_id });
++                }
++            }
++            std::sort(ks.begin(), ks.end(), [](const kept & a, const kept & b) { return a.bytes > b.bytes; });
++            GGML_LOG_INFO("sched kept: %zu inputs kept, %.1f MiB with copies; transient %.1f MiB, host weights %.1f MiB (once each)\n",
++                ks.size(), total/1048576.0, total_transient/1048576.0, total_host/1048576.0);
++            for (size_t i = 0; i < ks.size() && i < 16; i++) {
++                const struct ggml_tensor * t = ks[i].t;
++                GGML_LOG_INFO("sched kept: %8.1f MiB %-28s %-10s view of %-24s %s -> %s\n", ks[i].bytes/1048576.0, t->name, ggml_op_desc(t),
++                    t->view_src ? t->view_src->name : "-", ks[i].from >= 0 ? ggml_backend_name(sched->backends[ks[i].from]) : "?",
++                    ggml_backend_name(sched->backends[ks[i].to]));
++            }
++        }
++    }
++
+     // add leafs from the original graph
+     for (int i = 0; i < graph->n_leafs; i++) {
+         struct ggml_tensor * leaf = graph->leafs[i];
+-- 
+2.43.0
+

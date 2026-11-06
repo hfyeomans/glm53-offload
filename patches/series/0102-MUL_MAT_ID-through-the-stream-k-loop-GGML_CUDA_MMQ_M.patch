@@ -1,0 +1,29 @@
+From 743a80370e7b222e67497eb7bdb03c59b03f351d Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 22:33:07 -0600
+Subject: [PATCH 102/141] MUL_MAT_ID through the stream-k loop
+ (GGML_CUDA_MMQ_MMID_SK=1): no block launched per empty nominal tile
+
+---
+ ggml/src/ggml-cuda/mmq.cuh | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index e1ca3b4cc..4d8b110f6 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1515,7 +1515,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+ 
+     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
+-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
++    // 0103 GGML_CUDA_MMQ_MMID_SK=1: MUL_MAT_ID always takes the stream-k loop (its nominal grid is mostly empty tiles)
++    static const bool mmid_sk = getenv("GGML_CUDA_MMQ_MMID_SK") != nullptr && atoi(getenv("GGML_CUDA_MMQ_MMID_SK")) != 0;
++    const bool one_block_a_tile = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 && !(mmid_sk && args.ids_dst != nullptr);
++    const dim3 block_nums_stream_k(one_block_a_tile ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+ 
+     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,74 @@
+From 27e75430fd54b287d6993231dc42a881250dce3c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:13:33 -0600
+Subject: [PATCH 021/141] upload ring: LLAMA_MOE_UPLOAD_RING_MEMCPY=1 fills the
+ slot with one cudaMemcpyAsync of the whole expert tensor from the pinned host
+ weights (copy engine) instead of the gather kernel
+
+---
+ ggml/include/ggml-cuda.h        |  4 +++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 +++++++++-
+ src/llama-context.cpp           |  4 +++-
+ 3 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 94dd82301..757f38ce1 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -35,7 +35,9 @@ GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void *
+ // expert upload ring: gather n experts of `size` bytes into a device ring slot on a dedicated upload stream, overlapped with the
+ // backend stream's current work; `first_of_split` starts a new slot (the next MoE split), `split_bytes` sizes the slots on first use.
+ // Returns the device address of the gathered experts (valid until the slot is reused two splits later), nullptr if unavailable.
+-GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes);
++// `host_all`, when given, is the contiguous host copy of all n experts: the slot is then filled with one cudaMemcpyAsync (the copy
++// engine) instead of the gather kernel, and `srcs` is ignored
++GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all);
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f3966eddb..12c5304e7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6601,7 +6601,7 @@ struct ggml_cuda_upload_ring {
+ 
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
+ 
+-void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes) {
++void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     const int dev = cuda_ctx->device;
+     ggml_cuda_set_device(dev);
+@@ -6646,6 +6646,14 @@ void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_o
+     char * dst = (char *) r.slot[s] + r.used;
+     r.used += GGML_PAD(bytes, 256);
+ 
++    if (host_all != nullptr) {
++        // the whole tensor from the pinned host weights in one DMA transfer
++        CUDA_CHECK(cudaMemcpyAsync(dst, host_all, bytes, cudaMemcpyHostToDevice, r.stream));
++        CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++        CUDA_CHECK(cudaStreamWaitEvent(main_stream, r.ev_upload, 0));
++        return dst;
++    }
++
+     const size_t chunk = 1024*1024;
+     const unsigned n_chunks = (unsigned) ((size + chunk - 1)/chunk);
+     for (int64_t first = 0; first < n; first += GGML_CUDA_GATHER_MAX) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ad6615e3..2ed0a3469 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2990,7 +2990,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 }
+                 const bool first = il != st.ring_il;
+                 st.ring_il = il;
+-                void * p = ggml_backend_cuda_upload_ring_gather(backend, first, table, n_expert, expert_size, split_bytes);
++                // LLAMA_MOE_UPLOAD_RING_MEMCPY=1: the whole tensor from the host by the copy engine, the device cache unused
++                static const bool ring_memcpy = getenv("LLAMA_MOE_UPLOAD_RING_MEMCPY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING_MEMCPY")) != 0;
++                void * p = ggml_backend_cuda_upload_ring_gather(backend, first, table, n_expert, expert_size, split_bytes, ring_memcpy ? src->data : nullptr);
+                 if (p != nullptr) {
+                     dst->data = p;
+                     return true;
+-- 
+2.43.0
+

@@ -1,0 +1,224 @@
+From 87106f56ce7a1d05fc9f1580a9c0b344d594da0e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 15:11:42 -0600
+Subject: [PATCH 088/141] moe prompt pred (LLAMA_MOE_PROMPT_PRED=1): the next
+ layer s router reads this layer s FFN input residual; the plan reads the
+ guess and scores it at the next layer
+
+---
+ src/llama-moe-cache.cpp | 83 +++++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-cache.h   |  3 ++
+ src/models/glm-dsa.cpp  | 43 +++++++++++++++++++++
+ 3 files changed, 129 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 8a5838e8d..70807c1df 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -400,6 +400,10 @@ struct llama_moe_cache::impl {
+         std::vector<uint8_t> p_skip;        // 0085: the uploads skip these experts (no token selects them, or the CPU computes them)
+         bool p_valid = false;               // 0085: p_skip holds the last plan of the layer
+         uint64_t p_epoch = 0;               // 0088: the graph compute of that plan; the skips hold only there
++        ggml_tensor * p_pred_t = nullptr;   // 0089: the next layer's experts guessed in this layer's graph (per graph build)
++        std::vector<int32_t> p_pred_cnt;    // 0089: this layer's selections per expert as the previous layer's plan read the guess
++        uint64_t p_pred_epoch = 0;          // 0089: the graph compute of that read
++        int64_t  p_pred_ntok  = 0;
+         llama_moe_prompt_csr p_csr;         // 0085: the pairs of each token
+     };
+ 
+@@ -1462,8 +1466,13 @@ struct llama_moe_cache::impl {
+     uint64_t p_cur  = 1;   // 0088: the graph compute in progress, advanced by begin()
+     std::vector<int32_t> p_cnt;
+     std::vector<int32_t> p_order;
++    std::vector<int32_t> p_pred_ids;
++    std::vector<int32_t> p_rank;
++    static constexpr int P_NB = 4;
++    static constexpr int P_B[P_NB] = { 25, 50, 75, 100 };
+     struct prompt_stats {
+         int64_t n_layers = 0, n_tok = 0, n_cpu = 0, n_zero = 0, n_up = 0, n_cached = 0, n_pairs = 0, n_sel = 0;
++        int64_t n_pred = 0, pred_up[P_NB] = {}, pred_cpu[P_NB] = {}, pred_zero[P_NB] = {}, pred_den[P_NB] = {}, pred_upall = 0;
+         double  link_ms = 0, cpu_ms = 0;
+         int64_t t_us = 0, t_wait_us = 0;
+     } p_st;
+@@ -1535,6 +1544,12 @@ struct llama_moe_cache::impl {
+         return layers[il].p_map;
+     }
+ 
++    void set_prompt_pred(int32_t il, ggml_tensor * sel) {
++        if (il >= 0 && il < (int32_t) layers.size()) {
++            layers[il].p_pred_t = sel;
++        }
++    }
++
+     bool prompt_skip(const ggml_tensor * w, int64_t e) const {
+         const auto it = bindings.find(w);
+         if (it == bindings.end()) {
+@@ -1594,8 +1609,27 @@ struct llama_moe_cache::impl {
+         }
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        // 0089: the next layer's guess, computed with this layer's router
++        const ggml_tensor * pred_t = l.p_pred_t;
++        const bool has_pred = pred_t != nullptr && pred_t->data != nullptr && pred_t->buffer != nullptr && !ggml_backend_buffer_is_host(pred_t->buffer) &&
++            ggml_is_contiguous(pred_t) && il + 1 < (int32_t) layers.size() && layers[il + 1].p_map != nullptr;
++        if (has_pred) {
++            p_pred_ids.resize(ggml_nelements(pred_t));
++            ggml_backend_tensor_get_async(backend, pred_t, p_pred_ids.data(), 0, ggml_nbytes(pred_t));
++        }
+         ggml_backend_synchronize(backend);
+         const int64_t t1 = ggml_time_us();
++        if (has_pred) {
++            layer & ln = layers[il + 1];
++            ln.p_pred_cnt.assign(ln.p_map->ne[1], 0);
++            for (int32_t e : p_pred_ids) {
++                if (e >= 0 && e < (int32_t) ln.p_pred_cnt.size()) {
++                    ln.p_pred_cnt[e]++;
++                }
++            }
++            ln.p_pred_epoch = p_cur;
++            ln.p_pred_ntok  = pred_t->ne[1];
++        }
+ 
+         const int32_t n_used   = it_cpu->second.n_used;
+         const int64_t n_ids    = (int64_t) ids.size();
+@@ -1717,6 +1751,39 @@ struct llama_moe_cache::impl {
+         l.p_valid = true;
+         l.p_epoch = p_cur;
+ 
++        // 0089: score the guess of this layer's experts read at the previous layer's plan
++        if (l.p_pred_epoch == p_cur && l.p_pred_ntok == n_tok && (int64_t) l.p_pred_cnt.size() == n_expert) {
++            p_rank.clear();
++            for (int64_t e = 0; e < n_expert; ++e) {
++                const bool cached = slots != nullptr && slots[e] < g.n_slots;
++                if (!cached && l.p_pred_cnt[e] > 0) {
++                    p_rank.push_back((int32_t) e);
++                }
++            }
++            std::sort(p_rank.begin(), p_rank.end(), [&](int32_t a, int32_t b) { return l.p_pred_cnt[a] != l.p_pred_cnt[b] ? l.p_pred_cnt[a] > l.p_pred_cnt[b] : a < b; });
++            int64_t n_upall = 0;
++            for (int64_t e = 0; e < n_expert; ++e) {
++                const bool cached = slots != nullptr && slots[e] < g.n_slots;
++                n_upall += !cached && p_cnt[e] > 0 && pm[e] >= 0 ? 1 : 0;
++            }
++            p_st.n_pred++;
++            p_st.pred_upall += n_upall;
++            for (int ib = 0; ib < P_NB; ++ib) {
++                const size_t nb = std::min<size_t>((size_t) P_B[ib], p_rank.size());
++                for (size_t j = 0; j < nb; ++j) {
++                    const int32_t e = p_rank[j];
++                    if (p_cnt[e] == 0) {
++                        p_st.pred_zero[ib]++;
++                    } else if (pm[e] < 0) {
++                        p_st.pred_cpu[ib]++;
++                    } else {
++                        p_st.pred_up[ib]++;
++                    }
++                }
++                p_st.pred_den[ib] += (int64_t) nb;
++            }
++        }
++
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+ 
+         p_st.n_layers++;
+@@ -1739,6 +1806,18 @@ struct llama_moe_cache::impl {
+                     (long long) p_st.n_tok, (long long) p_st.n_layers, p_st.n_cpu/nl, 100.0*p_st.n_pairs/std::max<int64_t>(1, p_st.n_sel),
+                     p_st.n_zero/nl, p_st.n_up/nl, p_st.n_cached/nl, p_st.link_ms/nl, p_st.cpu_ms/nl, p_st.t_us/nl/1e3, p_st.t_wait_us/nl/1e3);
+             }
++            if (do_log && p_st.n_pred > 0) {
++                char buf[512];
++                int  pos = 0;
++                for (int ib = 0; ib < P_NB; ++ib) {
++                    const double d = (double) std::max<int64_t>(1, p_st.pred_den[ib]);
++                    pos += snprintf(buf + pos, sizeof(buf) - pos, "; top %d: %.0f%% uploaded / %.0f%% CPU / %.0f%% unused, covers %.0f%%", P_B[ib],
++                        100.0*p_st.pred_up[ib]/d, 100.0*p_st.pred_cpu[ib]/d, 100.0*p_st.pred_zero[ib]/d,
++                        100.0*p_st.pred_up[ib]/std::max<int64_t>(1, p_st.pred_upall));
++                }
++                LLAMA_LOG_INFO("moe prompt pred: %lld layers scored, %.1f uploads a layer%s\n", (long long) p_st.n_pred,
++                    (double) p_st.pred_upall/p_st.n_pred, buf);
++            }
+             p_st = {};
+         }
+         return true;
+@@ -2395,6 +2474,10 @@ bool llama_moe_cache::prompt_skip(const ggml_tensor * w, int64_t e) const {
+     return pimpl->prompt_skip(w, e);
+ }
+ 
++void llama_moe_cache::set_prompt_pred(int32_t il, ggml_tensor * sel) {
++    pimpl->set_prompt_pred(il, sel);
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 469e92e8e..acf04e148 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -91,6 +91,9 @@ public:
+     void * prompt_scatter_userdata(int32_t il) const;
+     // the upload of a large batch's experts skips expert e of w (no token selects it, or the CPU computes it)
+     bool prompt_skip(const ggml_tensor * w, int64_t e) const;
++    // 0089 LLAMA_MOE_PROMPT_PRED=1: sel [n_expert_used, n_tokens] on the device, layer il+1's experts guessed in layer il's graph; layer
++    // il's plan reads it with the layer's routing
++    void set_prompt_pred(int32_t il, ggml_tensor * sel);
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 38d7ad2a2..b3d9ba5d5 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -833,6 +833,49 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                     ggml_build_forward_expand(gf, shexp_early);
+                 };
+             }
++            // 0089 LLAMA_MOE_PROMPT_PRED=1 (batches the MoE cache's prompt plan covers): the next layer's experts as its own router reads
++            // this layer's FFN input residual; this layer's plan reads them with its routing
++            static const bool prompt_pred = getenv("LLAMA_MOE_PROMPT_PRED") != nullptr && atoi(getenv("LLAMA_MOE_PROMPT_PRED")) != 0;
++            if (moe_cache != nullptr) {
++                moe_cache->set_prompt_pred(il, nullptr);
++            }
++            if (prompt_pred && moe_cache != nullptr && moe_cache->get_prompt_map(il, n_tokens) != nullptr && il + 1 < n_layer &&
++                (uint32_t) (il + 1) >= hparams.n_layer_dense_lead && model.dev_layer(il + 1) == model.dev_layer(il)) {
++                const int jl = il + 1;
++                ggml_tensor * h = ggml_rms_norm(ctx0, ffn_inp, hparams.f_norm_rms_eps);
++                cb(h, "moe_prompt_pred_rms", il);
++                h = ggml_mul(ctx0, h, model.layers[jl].ffn_norm);
++                cb(h, "moe_prompt_pred_norm", il);
++                moe_probe = true;
++                build_moe_ffn(h,
++                    model.layers[jl].ffn_gate_inp,
++                    model.layers[jl].ffn_up_exps,
++                    model.layers[jl].ffn_gate_exps,
++                    model.layers[jl].ffn_down_exps,
++                    model.layers[jl].ffn_exp_probs_b,
++                    n_expert, n_expert_used,
++                    LLM_FFN_SILU, hparams.expert_weights_norm,
++                    hparams.expert_weights_scale,
++                    (llama_expert_gating_func_type) hparams.expert_gating_func,
++                    jl,
++                    nullptr,
++                    model.layers[jl].ffn_gate_up_exps,
++                    model.layers[jl].ffn_up_exps_s,
++                    model.layers[jl].ffn_gate_exps_s,
++                    model.layers[jl].ffn_down_exps_s);
++                moe_probe = false;
++                ggml_tensor * sel = moe_probe_sel;
++                moe_probe_sel = nullptr;
++                if (sel != nullptr) {
++                    if (!ggml_is_contiguous(sel)) {
++                        sel = ggml_cont(ctx0, sel);
++                    }
++                    ggml_format_name(sel, "moe_prompt_pred-%d", jl);
++                    ggml_set_output(sel);
++                    ggml_build_forward_expand(gf, sel);
++                    moe_cache->set_prompt_pred(il, sel);
++                }
++            }
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                 model.layers[il].ffn_gate_inp,
+                 model.layers[il].ffn_up_exps,
+-- 
+2.43.0
+

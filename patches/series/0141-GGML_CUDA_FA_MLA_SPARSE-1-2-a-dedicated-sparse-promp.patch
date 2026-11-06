@@ -1,0 +1,443 @@
+From 160da75c828e14e76c68f4f28b88e1eb6f16ffa6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 15:29:31 -0600
+Subject: [PATCH 141/141] GGML_CUDA_FA_MLA_SPARSE=1|2: a dedicated sparse
+ prompt kernel for 64 query heads on one MLA KV head (DKQ 576 / DV 512), one
+ CTA a query, O split by dims across warps
+
+---
+ ggml/src/ggml-cuda/fattn-mla-sparse.cu  | 381 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn-mla-sparse.cuh |   8 +
+ ggml/src/ggml-cuda/fattn.cu             |   6 +
+ 3 files changed, 395 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/fattn-mla-sparse.cu
+ create mode 100644 ggml/src/ggml-cuda/fattn-mla-sparse.cuh
+
+diff --git a/ggml/src/ggml-cuda/fattn-mla-sparse.cu b/ggml/src/ggml-cuda/fattn-mla-sparse.cu
+new file mode 100644
+index 000000000..7363065e0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-mla-sparse.cu
+@@ -0,0 +1,381 @@
++// 0137: GLM-5.3's sparse prompt attention, one CTA a query (see fattn-mla-sparse.cuh)
++#include "common.cuh"
++#include "fattn-common.cuh"
++#include "fattn-mla-sparse.cuh"
++
++static constexpr int fa_mla_DK    = 576;
++static constexpr int fa_mla_DV    = 512;
++static constexpr int fa_mla_NH    = 64;
++static constexpr int fa_mla_T     = 32;              // keys a tile
++static constexpr int fa_mla_LDK   = fa_mla_DK + 8;   // halves a K tile row (padded: ldmatrix rows on distinct banks)
++static constexpr int fa_mla_LDP   = fa_mla_T + 8;    // halves a P row
++static constexpr int fa_mla_KSTEP = fa_mla_DK/16;
++
++static size_t fa_mla_sparse_nbytes_shared(const int n_kv_max) {
++    return size_t(2*fa_mla_T*fa_mla_LDK)*sizeof(half) + size_t(2*fa_mla_NH*fa_mla_LDP)*sizeof(half) + size_t(3*fa_mla_NH)*sizeof(float) +
++           size_t(n_kv_max)*sizeof(int32_t) + size_t(GGML_PAD(n_kv_max, 8))*sizeof(half);
++}
++
++#ifdef AMPERE_MMA_AVAILABLE
++static __device__ __forceinline__ void fa_mla_cp_async16(void * smem, const void * gmem) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"((uint32_t) __cvta_generic_to_shared(smem)), "l"(gmem));
++}
++static __device__ __forceinline__ void fa_mla_ldsm_x4(uint32_t & r0, uint32_t & r1, uint32_t & r2, uint32_t & r3, const void * p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"((uint32_t) __cvta_generic_to_shared(p)));
++}
++static __device__ __forceinline__ void fa_mla_ldsm_x4_t(uint32_t & r0, uint32_t & r1, uint32_t & r2, uint32_t & r3, const void * p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"((uint32_t) __cvta_generic_to_shared(p)));
++}
++static __device__ __forceinline__ void fa_mla_mma(float * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++static __device__ __forceinline__ uint32_t fa_mla_pack_h2(const float lo, const float hi) {
++    const half2 h = __floats2half2_rn(lo, hi);
++    return *(const uint32_t *) &h;
++}
++#endif // AMPERE_MMA_AVAILABLE
++
++// Q f32 [ne3][n_q][64 heads (nb02)][576]; K f16 rows of 576 (V = their first 512); lists/counts from compact_mask (one list a query and
++// mask sequence, ascending); dst f32 [ne3][n_q][64][512]
++__launch_bounds__(256, 1)
++static __global__ void flash_attn_ext_mla_sparse_h64(
++        const char * __restrict__ Q_ptr, const char * __restrict__ K_ptr, const half * __restrict__ mask_ptr,
++        const int32_t * __restrict__ indices_ptr, const int32_t * __restrict__ counts_ptr, float * __restrict__ dst_ptr,
++        const int n_q, const int n_kv_max, const float scale,
++        const int64_t nb01, const int64_t nb02, const int64_t nb03, const int64_t nb11, const int64_t nb13,
++        const int64_t s31, const int64_t s33, const int ne33) {
++    ggml_cuda_pdl_sync();
++#ifdef AMPERE_MMA_AVAILABLE
++    constexpr int DK = fa_mla_DK, DV = fa_mla_DV, NH = fa_mla_NH, T = fa_mla_T, LDK = fa_mla_LDK, LDP = fa_mla_LDP, KSTEP = fa_mla_KSTEP;
++    constexpr float log2e = 1.4426950408889634f;
++
++    extern __shared__ __align__(16) unsigned char smem[];
++    half    * tileK = (half *) smem;                    // [2][T][LDK]
++    half    * tileP = tileK + 2*T*LDK;                  // [2][NH][LDP]
++    float   * alpha = (float *) (tileP + 2*NH*LDP);     // [2][NH]
++    float   * lsum  = alpha + 2*NH;                     // [NH]
++    int32_t * sidx  = (int32_t *) (lsum + NH);          // [n_kv_max] the query's key list
++    half    * smask = (half *) (sidx + n_kv_max);       // [n_kv_max] the mask values of those keys
++
++    const int q    = blockIdx.x;
++    const int seq  = blockIdx.y;
++    const int tid  = threadIdx.x;
++    const int warp = tid / 32;
++    const int lane = tid % 32;
++    const int g    = lane / 4;
++    const int c    = lane % 4;
++
++    const int       list   = (seq % ne33)*n_q + q;
++    const int       n      = counts_ptr[list];
++    const int       ntiles = (n + T - 1)/T;
++    const int32_t * qidx   = indices_ptr + int64_t(list)*n_kv_max;
++    const half    * mrow   = mask_ptr + (seq % ne33)*s33 + int64_t(q)*s31;
++    const char    * K      = K_ptr + seq*nb13;
++
++    // Q^T B fragments for heads [8 warp, 8 warp + 8): b0 = Q[head g][dims 16 ks + 2c, +1], b1 = dims + 8, + 9
++    uint32_t qb[KSTEP][2];
++    {
++        const float * qrow = (const float *) (Q_ptr + seq*nb03 + q*nb01 + (warp*8 + g)*nb02);
++#pragma unroll
++        for (int ks = 0; ks < KSTEP; ++ks) {
++            qb[ks][0] = fa_mla_pack_h2(scale*qrow[16*ks + 2*c],     scale*qrow[16*ks + 2*c + 1]);
++            qb[ks][1] = fa_mla_pack_h2(scale*qrow[16*ks + 2*c + 8], scale*qrow[16*ks + 2*c + 9]);
++        }
++    }
++
++    auto load_tile = [&](const int t, const int buf) {
++        // 32 rows x 72 chunks of 16 B over 256 threads; a row past the list loads row 0 (its scores are masked)
++        half * tile = tileK + buf*T*LDK;
++#pragma unroll
++        for (int i = 0; i < (T*DK/8)/256; ++i) {
++            const int chunk = tid + i*256;
++            const int r     = chunk / (DK/8);
++            const int cc    = chunk % (DK/8);
++            const int j     = t*T + r;
++            const int row   = j < n ? sidx[j] : 0;
++            fa_mla_cp_async16(tile + r*LDK + cc*8, K + row*nb11 + cc*16);
++        }
++        asm volatile("cp.async.commit_group;\n" ::);
++    };
++
++    // running softmax state of this warp's heads 8 warp + 2c and + 2c + 1 (replicated over g)
++    float m_run[2] = { -INFINITY, -INFINITY };
++    float l_run[2] = { 0.0f, 0.0f };
++    // O^T accumulators: dims [64 warp + 16 mt, + 16) x heads [8 nt, 8 nt + 8)
++    float acc[4][8][4];
++#pragma unroll
++    for (int mt = 0; mt < 4; ++mt) {
++#pragma unroll
++        for (int nt = 0; nt < 8; ++nt) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                acc[mt][nt][e] = 0.0f;
++            }
++        }
++    }
++
++    for (int j = tid; j < n; j += 256) {
++        const int32_t k = qidx[j];
++        sidx[j]  = k;
++        smask[j] = mrow[k];
++    }
++    __syncthreads();
++    if (ntiles > 0) {
++        load_tile(0, 0);
++    }
++    for (int t = 0; t < ntiles; ++t) {
++        const int buf = t & 1;
++        asm volatile("cp.async.wait_group 0;\n" ::);
++        __syncthreads(); // tile t is in; every warp is done with tile t - 1 and P[buf ^ 1]
++        if (t + 1 < ntiles) {
++            load_tile(t + 1, buf ^ 1);
++        }
++        const half * tk = tileK + buf*T*LDK;
++
++        // S^T = K Q^T: two m-tiles of 16 keys x this warp's 8 heads
++        float s[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
++#pragma unroll
++        for (int ks = 0; ks < KSTEP; ++ks) {
++#pragma unroll
++            for (int mt = 0; mt < 2; ++mt) {
++                uint32_t a0, a1, a2, a3;
++                const int row = 16*mt + (lane % 8) + 8*((lane / 8) & 1);
++                const int col = 16*ks + 8*(lane / 16);
++                fa_mla_ldsm_x4(a0, a1, a2, a3, tk + row*LDK + col);
++                fa_mla_mma(s[mt], a0, a1, a2, a3, qb[ks][0], qb[ks][1]);
++            }
++        }
++        // s[mt][0] = S[key 16 mt + g][head 2c], [1] head 2c + 1, [2] key + 8 head 2c, [3] key + 8 head 2c + 1
++        const int j0 = t*T;
++        float mx[2] = { m_run[0], m_run[1] };
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int key = j0 + 16*mt + g + 8*(e >> 1);
++                s[mt][e] = key < n ? (s[mt][e] + __half2float(smask[key]))*log2e : -INFINITY;
++                mx[e & 1] = fmaxf(mx[e & 1], s[mt][e]);
++            }
++        }
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffff, mx[h], 4));
++            mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffff, mx[h], 8));
++            mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffff, mx[h], 16));
++        }
++        float al[2];
++        float ps[2] = { 0.0f, 0.0f };
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            al[h] = mx[h] == -INFINITY ? 1.0f : exp2f(m_run[h] - mx[h]);
++        }
++        half * tp = tileP + buf*NH*LDP;
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int   h = e & 1;
++                const float p = mx[h] == -INFINITY ? 0.0f : exp2f(s[mt][e] - mx[h]);
++                ps[h] += p;
++                tp[(warp*8 + 2*c + h)*LDP + 16*mt + g + 8*(e >> 1)] = __float2half(p);
++            }
++        }
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            ps[h] += __shfl_xor_sync(0xffffffff, ps[h], 4);
++            ps[h] += __shfl_xor_sync(0xffffffff, ps[h], 8);
++            ps[h] += __shfl_xor_sync(0xffffffff, ps[h], 16);
++            l_run[h] = l_run[h]*al[h] + ps[h];
++            m_run[h] = mx[h];
++        }
++        if (g == 0) {
++            alpha[buf*NH + warp*8 + 2*c]     = al[0];
++            alpha[buf*NH + warp*8 + 2*c + 1] = al[1];
++        }
++        __syncthreads(); // P[buf] and alpha[buf] are in
++
++        // O^T = O^T alpha + V^T P^T over the tile's 32 keys (two k-steps)
++#pragma unroll
++        for (int nt = 0; nt < 8; ++nt) {
++            const float a0 = alpha[buf*NH + 8*nt + 2*c];
++            const float a1 = alpha[buf*NH + 8*nt + 2*c + 1];
++#pragma unroll
++            for (int mt = 0; mt < 4; ++mt) {
++                acc[mt][nt][0] *= a0; acc[mt][nt][1] *= a1;
++                acc[mt][nt][2] *= a0; acc[mt][nt][3] *= a1;
++            }
++        }
++#pragma unroll
++        for (int kk = 0; kk < 2; ++kk) {
++            uint32_t pb[8][2];
++#pragma unroll
++            for (int np = 0; np < 4; ++np) {
++                // two n-tiles (heads 16 np .. + 16) x 16 keys: [h0-7,k0-7] [h0-7,k8-15] [h8-15,k0-7] [h8-15,k8-15]
++                const int hrow = 16*np + (lane % 8) + 8*(lane / 16);
++                const int kcol = 16*kk + 8*((lane / 8) & 1);
++                fa_mla_ldsm_x4(pb[2*np][0], pb[2*np][1], pb[2*np + 1][0], pb[2*np + 1][1], tp + hrow*LDP + kcol);
++            }
++#pragma unroll
++            for (int mt = 0; mt < 4; ++mt) {
++                uint32_t a0, a1, a2, a3;
++                // V^T [dims 16 x keys 16] from rows = keys: m0 keys 0-7 dims 0-7, m1 keys 0-7 dims 8-15, m2 keys 8-15 dims 0-7, m3 keys 8-15 dims 8-15
++                const int i    = lane / 8;
++                const int krow = 16*kk + 8*(i >> 1) + (lane % 8);
++                const int dcol = 64*warp + 16*mt + 8*(i & 1);
++                fa_mla_ldsm_x4_t(a0, a1, a2, a3, tk + krow*LDK + dcol);
++#pragma unroll
++                for (int nt = 0; nt < 8; ++nt) {
++                    fa_mla_mma(acc[mt][nt], a0, a1, a2, a3, pb[nt][0], pb[nt][1]);
++                }
++            }
++        }
++    }
++
++    // O = O^T / l
++    if (g == 0) {
++        lsum[warp*8 + 2*c]     = l_run[0];
++        lsum[warp*8 + 2*c + 1] = l_run[1];
++    }
++    __syncthreads();
++    float * orow = dst_ptr + (int64_t(seq)*n_q + q)*(NH*DV);
++#pragma unroll
++    for (int nt = 0; nt < 8; ++nt) {
++        const float i0 = 1.0f/fmaxf(lsum[8*nt + 2*c],     1e-30f);
++        const float i1 = 1.0f/fmaxf(lsum[8*nt + 2*c + 1], 1e-30f);
++#pragma unroll
++        for (int mt = 0; mt < 4; ++mt) {
++            const int d = 64*warp + 16*mt + g;
++            orow[(8*nt + 2*c)*DV     + d]     = acc[mt][nt][0]*i0;
++            orow[(8*nt + 2*c + 1)*DV + d]     = acc[mt][nt][1]*i1;
++            orow[(8*nt + 2*c)*DV     + d + 8] = acc[mt][nt][2]*i0;
++            orow[(8*nt + 2*c + 1)*DV + d + 8] = acc[mt][nt][3]*i1;
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, mask_ptr, indices_ptr, counts_ptr, dst_ptr, n_q, n_kv_max, scale, nb01, nb02, nb03, nb11, nb13, s31, s33, ne33);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++
++static int fa_mla_sparse_mode() {
++    static const int mode = getenv("GGML_CUDA_FA_MLA_SPARSE") ? atoi(getenv("GGML_CUDA_FA_MLA_SPARSE")) : 0;
++    return mode;
++}
++
++bool ggml_cuda_flash_attn_ext_mla_sparse_use(const ggml_tensor * dst) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED(dst);
++    return false;
++#else
++    const int mode = fa_mla_sparse_mode();
++    if (mode == 0) {
++        return false;
++    }
++    const int id = ggml_cuda_get_device();
++    const auto & info = ggml_cuda_info().devices[id];
++    if (!ampere_mma_available(info.cc)) {
++        return false;
++    }
++
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
++    if (!V_is_K_view || Q->ne[0] != fa_mla_DK || V->ne[0] != fa_mla_DV || Q->ne[2] != fa_mla_NH || K->ne[2] != 1 || Q->ne[3] != K->ne[3] ||
++            mask == nullptr || dst->src[4] != nullptr || dst->src[5] != nullptr || Q->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (K->type != GGML_TYPE_F16 && ggml_get_to_fp16_cuda(K->type) == nullptr) {
++        return false;
++    }
++    if (K->type == GGML_TYPE_F16 && (K->nb[1] % 16 != 0 || (K->ne[3] > 1 && K->nb[3] % 16 != 0) || ((uintptr_t) K->data) % 16 != 0)) {
++        return false;
++    }
++    const int64_t n_kv_max = std::min<int64_t>(K->ne[1], ggml_get_op_params_i32(dst, 4));
++    if (fa_mla_sparse_nbytes_shared(int(n_kv_max)) > info.smpbo) {
++        return false;
++    }
++    return mode >= 2 || Q->ne[1]*Q->ne[3] >= info.nsm;
++#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++}
++
++void ggml_cuda_flash_attn_ext_mla_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * mask = dst->src[3];
++
++    GGML_ASSERT(Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16);
++
++    ggml_cuda_pool & pool        = ctx.pool();
++    cudaStream_t     main_stream = ctx.stream();
++    const int        id          = ggml_cuda_get_device();
++
++    // K in f16, as launch_fattn converts it (V is a view of it)
++    const char * K_data = (const char *) K->data;
++    size_t nb11 = K->nb[1];
++    size_t nb13 = K->nb[3];
++    if (K->type != GGML_TYPE_F16) {
++        const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
++        const size_t bs = ggml_blck_size(K->type);
++        const size_t ts = ggml_type_size(K->type);
++
++        GGML_ASSERT(f16_extra.K != 0);
++        half * K_f16 = (half *) f16_extra.K;
++        if (ggml_is_contiguously_allocated(K)) {
++            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
++            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
++
++            nb11 = nb11*bs*sizeof(half)/ts;
++            nb13 = nb13*bs*sizeof(half)/ts;
++        } else {
++            GGML_ASSERT(K->nb[0] == ts);
++            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
++            const int64_t s01 = K->nb[1] / ts;
++            const int64_t s02 = K->nb[2] / ts;
++            const int64_t s03 = K->nb[3] / ts;
++            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
++
++            nb11 = K->ne[0] * sizeof(half);
++            nb13 = K->ne[2] * K->ne[1] * nb11;
++        }
++        K_data = (const char *) K_f16;
++    }
++    if (K->ne[3] == 1) {
++        nb13 = 0;
++    }
++    GGML_ASSERT(nb11 % 16 == 0 && nb13 % 16 == 0);
++
++    // one index list a query (ncols1 = 1) and mask sequence, the counts after the lists
++    const int32_t n_kv_max = std::min<int64_t>(K->ne[1], ggml_get_op_params_i32(dst, 4));
++    GGML_ASSERT(n_kv_max > 0);
++    const size_t n_lists = size_t(Q->ne[1]) * mask->ne[3];
++    ggml_cuda_pool_alloc<int32_t> lists(pool, size_t(n_kv_max)*n_lists + n_lists);
++    ggml_cuda_flash_attn_ext_compact_mask(mask, lists.ptr, lists.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], 1, n_kv_max, main_stream);
++
++    float scale = 1.0f;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++
++    const size_t nbytes_shared = fa_mla_sparse_nbytes_shared(n_kv_max);
++    static size_t shared_memory_limit[GGML_CUDA_MAX_DEVICES] = { 0 };
++    if (shared_memory_limit[id] == 0) {
++        GGML_LOG_INFO("%s: 0137 sparse MLA kernel on device %d (%d keys a list, %zu B shared)\n", __func__, id, n_kv_max, nbytes_shared);
++    }
++    if (shared_memory_limit[id] < nbytes_shared) {
++        CUDA_CHECK(cudaFuncSetAttribute(flash_attn_ext_mla_sparse_h64, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared));
++        shared_memory_limit[id] = nbytes_shared;
++    }
++
++    const dim3 blocks_num(Q->ne[1], Q->ne[3], 1);
++    const dim3 block_dim(256, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
++    ggml_cuda_kernel_launch(flash_attn_ext_mla_sparse_h64, launch_params,
++        (const char *) Q->data, K_data, (const half *) mask->data, (const int32_t *) lists.ptr, (const int32_t *) (lists.ptr + size_t(n_kv_max)*n_lists),
++        (float *) dst->data, int(Q->ne[1]), int(n_kv_max), scale,
++        int64_t(Q->nb[1]), int64_t(Q->nb[2]), int64_t(Q->nb[3]), int64_t(nb11), int64_t(nb13),
++        int64_t(mask->nb[1] / sizeof(half)), int64_t(mask->nb[3] / sizeof(half)), int(mask->ne[3]));
++}
+diff --git a/ggml/src/ggml-cuda/fattn-mla-sparse.cuh b/ggml/src/ggml-cuda/fattn-mla-sparse.cuh
+new file mode 100644
+index 000000000..14d8cfa93
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-mla-sparse.cuh
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "common.cuh"
++
++// 0137 GGML_CUDA_FA_MLA_SPARSE=1|2: GLM-5.3's sparse prompt attention (64 query heads on one KV head, DKQ 576, V a view of K's first 512
++// dims) in a dedicated kernel, one CTA a query.  The caller has decided that the sparse gather applies.
++bool ggml_cuda_flash_attn_ext_mla_sparse_use(const ggml_tensor * dst);
++void ggml_cuda_flash_attn_ext_mla_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 7a036e422..4bef121d4 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -4,6 +4,7 @@
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
++#include "fattn-mla-sparse.cuh"
+ 
+ #if !defined(GGML_USE_MUSA)
+ 
+@@ -432,6 +433,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
+                        (getenv("GGML_CUDA_FA_MLA64") == nullptr || atoi(getenv("GGML_CUDA_FA_MLA64")) != 0)) {
+                 // 0081: all 64 heads of a query in one tile (GLM-5.3): each key row is read once per query, and the sparse path engages
+                 // from 4K keys (GGML_CUDA_FA_MLA64=0: the 16-head grouping)
++                // 0137 GGML_CUDA_FA_MLA_SPARSE=1|2: where the tile would gather sparsely, the dedicated kernel (one CTA a query)
++                if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 64) && ggml_cuda_flash_attn_ext_mla_sparse_use(dst)) {
++                    ggml_cuda_flash_attn_ext_mla_sparse(ctx, dst);
++                    break;
++                }
+                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 64>(ctx, dst);
+             } else if (gqa_ratio % 16 == 0) {
+                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
+-- 
+2.43.0
+

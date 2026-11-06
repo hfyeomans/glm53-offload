@@ -1,0 +1,38 @@
+From 05d5c55697f731bc5cc061409faa7075b2e02565 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:11:56 -0600
+Subject: [PATCH 066/141] sched: a transient cross-GPU input is one copy, not
+ flagged input/output (reserve kept every copy x4 and lost pipeline
+ parallelism)
+
+---
+ ggml/src/ggml-backend.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d56b1af66..4f24c1eea 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1828,7 +1828,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                         // user inputs and host weights are uploaded in order on the split backend stream, so one copy is enough
+                         const bool host_weight = ggml_backend_sched_is_host_weight(src);
+-                        const bool single_copy = host_weight || ggml_backend_sched_is_user_input(src);
++                        // 0065: a transient cross-GPU input (0060) is one copy, allocated and freed like an intermediate
++                        const bool transient   = ggml_backend_sched_input_is_transient(sched, src, cur_backend_id);
++                        const bool single_copy = host_weight || transient || ggml_backend_sched_is_user_input(src);
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             if (single_copy && c > 0) {
+                                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_id_copy(src_id, cur_backend_id, 0);
+@@ -1841,7 +1843,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                                 tensor_copy->buffer = sched->expert_placeholder[cur_backend_id];
+                                 tensor_copy->data   = ggml_backend_buffer_get_base(sched->expert_placeholder[cur_backend_id]);
+                             }
+-                            if (sched->n_copies > 1 && !host_weight) {
++                            if (sched->n_copies > 1 && !host_weight && !transient) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                             }
+-- 
+2.43.0
+

@@ -1,0 +1,36 @@
+From f4d0d7c1e53d044df186b5a9dd50f72e5b7c7c36 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 10:46:12 -0600
+Subject: [PATCH 026/141] test-backend-ops: LLAMA_TEST_MMID_BANK=1 runs the
+ offload cache bank MUL_MAT_ID shapes at decode for the expert formats in
+ question
+
+---
+ tests/test-backend-ops.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index eec0423cb..cccce4ffd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12732,6 +12732,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    if (getenv("LLAMA_TEST_MMID_BANK") != nullptr) {
++        // the offload cache bank at decode: 8 of ~100 experts, GLM-5.3's shapes (gate/up 6144 -> 2048, down 2048 -> 6144), 1 and 8 tokens
++        for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
++            for (int n : { 1, 8 }) {
++                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 100, 8, false, 2048, n, 6144));
++                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 100, 8, false, 6144, n, 2048));
++            }
++        }
++        return test_cases;
++    }
++
+     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
+     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
+ 
+-- 
+2.43.0
+

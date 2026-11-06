@@ -1,0 +1,30 @@
+From 495fccc8f025744da77ee769e37d2706a9e9bc0b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:46:24 -0600
+Subject: [PATCH 049/141] moe-cache: the startup line names
+ LLAMA_MOE_ASYNC_FILL_TOKENS when set
+
+---
+ src/llama-moe-cache.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f74e6b25c..816804350 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -763,7 +763,11 @@ struct llama_moe_cache::impl {
+             LLAMA_LOG_INFO("llama_moe_cache: cache-aware routing, selection bias %.4f for the cached experts\n", (double) route_bias_value());
+         }
+         if (async_fill_enabled()) {
+-            LLAMA_LOG_INFO("llama_moe_cache: asynchronous fills (one-token batches)\n");
++            if (async_fill_tokens() > 0) {
++                LLAMA_LOG_INFO("llama_moe_cache: asynchronous fills (batches of up to %d tokens, each layer waits for its own)\n", async_fill_tokens());
++            } else {
++                LLAMA_LOG_INFO("llama_moe_cache: asynchronous fills (one-token batches)\n");
++            }
+         }
+ 
+         for (size_t id = 0; id < devices.size(); ++id) {
+-- 
+2.43.0
+

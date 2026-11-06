@@ -1,0 +1,49 @@
+From 73c3f6e6f2f904a0d33f995287f91575b388e6ff Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 12:13:31 -0600
+Subject: [PATCH 137/141] The fused gate/up/GLU MMQ kernel on MUL_MAT_ID's
+ compacted tile grid (one block a real tile, as 0104 for the unfused path)
+
+---
+ ggml/src/ggml-cuda/mmq.cuh | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index dbd7c4d30..279012ba6 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1103,11 +1103,17 @@ static __global__ void mul_mat_q(
+         // The fused kernel writes the GLU of I/2 up rows and I/2 gate rows per tile.
+         constexpr int I_dst = has_fusion ? I/2 : I;
+ 
+-        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+-        const int wt = tmp2.x;
+-        const int zt = tmp2.y;
+-        const int jt = blockIdx.x;
+-        const int it = blockIdx.y;
++        // 0133: on MUL_MAT_ID's compacted tiles (0104) the block's column tile and row tile are blockIdx.x and blockIdx.y of the compact grid
++        int wt, zt, jt, it;
++        if (tile_off != nullptr) {
++            mmq_tile_coords(blockIdx.y*gridDim.x + blockIdx.x, ntx, nchannels_y, nsamples_y, nty, 0, jt, zt, wt, it, tile_off);
++        } else {
++            const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
++            wt = tmp2.x;
++            zt = tmp2.y;
++            jt = blockIdx.x;
++            it = blockIdx.y;
++        }
+ 
+         // Defaults for regular matrix multiplication:
+         int col_low    = 0;
+@@ -1496,7 +1502,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     static const int mmid_order = getenv("GGML_CUDA_MMQ_MMID_ORDER") != nullptr ? atoi(getenv("GGML_CUDA_MMQ_MMID_ORDER")) : 0;
+     const int tile_order = args.ids_dst != nullptr && mmid_order == 1 ? 1 : 0;
+     // 0104: one block a real tile (the stream-k kernel only; the fused GLU path keeps the blockIdx grid)
+-    const bool compact = args.tile_off != nullptr && !has_fusion && config.stream_k;
++    const bool compact = args.tile_off != nullptr && (has_fusion || config.stream_k); // 0133: the fused path too
+     const int nwarps = config.nthreads / warp_size;
+     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+ 
+-- 
+2.43.0
+

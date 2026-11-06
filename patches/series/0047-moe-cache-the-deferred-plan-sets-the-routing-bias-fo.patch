@@ -1,0 +1,87 @@
+From b3ee393729f12d0a763df671feb491b94b49e354 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 19:43:29 -0600
+Subject: [PATCH 047/141] moe-cache: the deferred plan sets the routing bias
+ for the next token and, with LLAMA_MOE_ASYNC_FILL_TOKENS, fills on the side
+ stream behind a per-layer event
+
+---
+ src/llama-moe-cache.cpp | 43 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 6f7064fad..64d946dec 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -944,8 +944,13 @@ struct llama_moe_cache::impl {
+         for (size_t i = 0; i < ids.size(); ++i) {
+             cpu_ids[i] = fill_mark[ids[i]] ? ids[i] : -1;
+         }
+-        // the uploads go behind the hits of this layer on the stream, consecutive experts going to consecutive slots together
++        // the uploads go behind the hits of this layer, consecutive experts going to consecutive slots together: on the side stream with
++        // LLAMA_MOE_ASYNC_FILL_TOKENS (0046: the layer's next lookup waits for them), else on the main stream
+         ggml_backend_t backend = defer_st.backend;
++        bool side = false;
++#ifdef GGML_USE_CUDA
++        side = async_fill_enabled() && async_fill_tokens() > 0 && ggml_backend_is_cuda(backend);
++#endif
+         size_t bytes = 0;
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+             const ggml_tensor * w    = l.experts[ip];
+@@ -956,11 +961,40 @@ struct llama_moe_cache::impl {
+                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                if (side) {
++#ifdef GGML_USE_CUDA
++                    ggml_backend_cuda_side_upload_async(backend, (uint8_t *) bank->data + fills[i].slot*expert_size,
++                        (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size);
++#endif
++                } else {
++                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                }
+                 bytes += n*expert_size;
+                 i += n;
+             }
+         }
++#ifdef GGML_USE_CUDA
++        if (side && !fills.empty()) {
++            if (l.fill_ev == nullptr) {
++                l.fill_ev = ggml_backend_event_new(ggml_backend_get_device(backend));
++                GGML_ASSERT(l.fill_ev != nullptr);
++            }
++            ggml_backend_cuda_side_upload_record(backend, l.fill_ev);
++            l.fill_ev_pending = true;
++        }
++#endif
++        // LLAMA_MOE_ROUTE_BIAS (0046): the selection bias of this layer for the next token, as the lookup sets it after its plan
++        if (l.route_bias != nullptr) {
++            const float d = route_bias_value();
++            const int32_t * slots_rb = g.slru.slot_map[il];
++            for (int32_t e = 0; e < g.slru.n_expert; ++e) {
++                l.route_bias_host[e] = (l.route_epb.empty() ? 0.0f : l.route_epb[e]) + (slots_rb[e] < g.slru.n_slots ? d : 0.0f);
++            }
++            if (l.route_bias_host != l.route_bias_last) {
++                ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
++                l.route_bias_last = l.route_bias_host;
++            }
++        }
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+         st.misses += fills.size() + cpu.size();
+@@ -1109,6 +1143,11 @@ struct llama_moe_cache::impl {
+             }
+             ggml_backend_event_record(ev, backend);
+             defer_st = { il, it_cpu->second.n_used, backend, ev };
++            if (l.fill_ev_pending) {
++                // 0046: the hits read the slots that the layer's last deferred plan filled on the side stream
++                ggml_backend_event_wait(backend, l.fill_ev);
++                l.fill_ev_pending = false;
++            }
+             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+             return true;
+         }
+-- 
+2.43.0
+

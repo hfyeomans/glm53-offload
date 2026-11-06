@@ -1,0 +1,44 @@
+From b30780846cdb5b8d3aacb3669becb84b75ffaa0a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:57:59 -0600
+Subject: [PATCH 050/141] ggml-cpu: GGML_CPU_MMID_STATIC=1 gives every
+ MUL_MAT_ID expert matrix the static row split (thread k always takes the same
+ rows)
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f4eaea5df..190e58ca8 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1560,6 +1560,16 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// GGML_CPU_MMID_STATIC=1 (0049): every expert matrix of a MUL_MAT_ID split by rows, thread k always taking the same rows
++static bool ggml_cpu_mmid_static(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * s = getenv("GGML_CPU_MMID_STATIC");
++        v = s != NULL && atoi(s) != 0;
++    }
++    return v != 0;
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1707,7 +1717,7 @@ static void ggml_compute_forward_mul_mat_id(
+         }
+ 
+         // disable for NUMA
+-        const bool disable_chunking = ggml_is_numa();
++        const bool disable_chunking = ggml_is_numa() || ggml_cpu_mmid_static();
+ 
+         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+-- 
+2.43.0
+

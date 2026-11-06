@@ -1,0 +1,57 @@
+From 6eb7a745e2c6a625d4ce1bf1a07f16983b7954c9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:19:33 -0600
+Subject: [PATCH 125/141] GGML_GALLOCR_PEAK: the allocation-request log once,
+ plus the first three requests straight to stderr
+
+---
+ ggml/src/ggml-alloc.c | 26 ++++++++------------------
+ 1 file changed, 8 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index dd3049be5..0f877d056 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -680,7 +680,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+     GGML_ASSERT(buffer_id >= 0);
+     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+ 
+-    // 0123 GGML_GALLOCR_PEAK: every request for a node of 1 GiB or more, with its sources' reuse conditions
++    // 0123 GGML_GALLOCR_PEAK: every request for a node of 1 GiB or more, with its sources' reuse conditions (and the first three
++    // requests of any size, straight to stderr: the log line once never printed)
++    if (gallocr_peak_mib() > 0) {
++        static int n_any = 0;
++        if (n_any++ < 3) {
++            fprintf(stderr, "gallocr request: %s (%s) %zu bytes\n", node->name, ggml_op_desc(node), ggml_nbytes(node));
++        }
++    }
+     if (gallocr_peak_mib() > 0 && ggml_nbytes(node) >= ((size_t) 1 << 30)) {
+         static int n_said = 0;
+         if (n_said++ < 16) {
+@@ -756,23 +763,6 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+                 }
+             }
+         }
+-        // 0123 GGML_GALLOCR_PEAK: why a node of 1 GiB or more is not in place over a parent of its size
+-        if (gallocr_peak_mib() > 0 && ggml_op_can_inplace(node->op) && ggml_nbytes(node) >= ((size_t) 1 << 30)) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
+-                struct ggml_tensor * parent = node->src[i];
+-                if (parent == NULL || ggml_nbytes(parent) != ggml_nbytes(node)) {
+-                    continue;
+-                }
+-                struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+-                static int n_said = 0;
+-                if (n_said++ < 8) {
+-                    GGML_LOG_INFO("gallocr inplace: %s (%s) not over src%d %s (%s): own %d output %d same layout %d children %d views %d view %d\n",
+-                        node->name, ggml_op_desc(node), i, parent->name, ggml_op_desc(parent), (int) ggml_gallocr_is_own(galloc, parent),
+-                        (int) ((parent->flags & GGML_TENSOR_FLAG_OUTPUT) != 0), (int) ggml_are_same_layout(node, parent), p_hn->n_children,
+-                        p_hn->n_views, (int) ggml_impl_is_view(parent));
+-                }
+-            }
+-        }
+         // allocate tensor from the buffer
+         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
+         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
+-- 
+2.43.0
+

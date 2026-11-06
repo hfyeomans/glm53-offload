@@ -1,0 +1,38 @@
+From e2907561616d77e1274c2d57f149a8b4d141a535 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:59:28 -0600
+Subject: [PATCH 031/141] test-backend-ops: LLAMA_TEST_FA_MLA=1 runs the
+ GLM-5.3 decode attention shape (576/512, 1 KV head x 64 query heads) over
+ 1K-64K positions
+
+---
+ tests/test-backend-ops.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index cccce4ffd..c57940fac 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12732,6 +12732,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    if (getenv("LLAMA_TEST_FA_MLA") != nullptr) {
++        // GLM-5.3 decode attention: K 576 / V 512 (V a view of K), 1 KV head x 64 query heads, 1 token
++        for (int64_t kv : { 1024, 4096, 16384, 65536 }) {
++            for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++                for (int64_t n_kv_max : { (int64_t) 0, (int64_t) 2048 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {64, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true, n_kv_max));
++                }
++            }
++            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
++        }
++        return test_cases;
++    }
++
+     if (getenv("LLAMA_TEST_MMID_BANK") != nullptr) {
+         // the offload cache bank at decode: 8 of ~100 experts, GLM-5.3's shapes (gate/up 6144 -> 2048, down 2048 -> 6144), 1 and 8 tokens
+         for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+-- 
+2.43.0
+

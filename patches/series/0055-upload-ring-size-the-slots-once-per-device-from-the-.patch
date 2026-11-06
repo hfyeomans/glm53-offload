@@ -1,0 +1,81 @@
+From 75454c2851ef32a968570fb053b02e744fff1a2c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:53:43 -0600
+Subject: [PATCH 055/141] upload ring: size the slots once per device from the
+ largest MoE split it uploads (a growth synchronized the device inside the
+ first long prompt)
+
+---
+ src/llama-context.cpp | 29 +++++++++++++++++++++++++++--
+ src/llama-context.h   |  1 +
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 83718c41e..67ba2fcd4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3043,6 +3043,30 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+ 
+     auto & st = lctx->copy_experts;
+ 
++    // 0054: the largest MoE split this backend's device uploads (the layers whose router lives there), so the upload ring sizes its slots
++    // once: a later growth synchronizes the device
++    auto ring_split_max = [&](ggml_backend_t be) -> size_t {
++        ggml_backend_dev_t dev = ggml_backend_get_device(be);
++        auto it = st.ring_split_max.find(dev);
++        if (it != st.ring_split_max.end()) {
++            return it->second;
++        }
++        size_t mx = 0;
++        for (const auto & layer : lctx->model.layers) {
++            if (layer.ffn_gate_inp == nullptr || layer.ffn_gate_inp->buffer == nullptr ||
++                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.ffn_gate_inp->buffer)) != dev) {
++                continue;
++            }
++            size_t b = 0;
++            for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++                b += t ? GGML_PAD(ggml_nbytes(t), 256) : 0;
++            }
++            mx = std::max(mx, b);
++        }
++        st.ring_split_max[dev] = mx;
++        return mx;
++    };
++
+     // the ids must be computed before the split starts, so only the first node of the split is considered
+     if (ggml_graph_n_nodes(graph) == 0) {
+         return false;
+@@ -3075,7 +3099,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         }
+         const bool first = il < 0 || il != st.ring_il;
+         st.ring_il = il;
+-        dst->data = ggml_backend_cuda_upload_ring_reserve(backend, first, ggml_nbytes(dst), split_bytes);
++        dst->data = ggml_backend_cuda_upload_ring_reserve(backend, first, ggml_nbytes(dst), std::max(split_bytes, ring_split_max(backend)));
+         GGML_ASSERT(dst->data != nullptr);
+     }
+ #endif
+@@ -3111,7 +3135,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 st.ring_il = il;
+                 // LLAMA_MOE_UPLOAD_RING_MEMCPY=1: the whole tensor from the host by the copy engine, the device cache unused
+                 static const bool ring_memcpy = getenv("LLAMA_MOE_UPLOAD_RING_MEMCPY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING_MEMCPY")) != 0;
+-                void * p = ggml_backend_cuda_upload_ring_gather(backend, first, table, n_expert, expert_size, split_bytes, ring_memcpy ? src->data : nullptr);
++                void * p = ggml_backend_cuda_upload_ring_gather(backend, first, table, n_expert, expert_size, std::max(split_bytes, ring_split_max(backend)),
++                    ring_memcpy ? src->data : nullptr);
+                 if (p != nullptr) {
+                     dst->data = p;
+                     return true;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9bf76ae6d..a8ac5699f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -392,6 +392,7 @@ private:
+         // GGML_SCHED_TIMING=1: host time of the callback per path (0 MoE cache copy, 1 gather kernel, 2 per-expert upload,
+         // 3 ids read + synchronize, 4 other), printed and cleared by graph_compute
+         int32_t ring_il = -1; // the layer of the last expert tensor gathered into the upload ring (a change starts a new slot)
++        std::map<ggml_backend_dev_t, size_t> ring_split_max; // 0054: the largest MoE split per device (kept across graphs)
+ 
+         bool    timing = false;
+         int     cur_path = 4;
+-- 
+2.43.0
+

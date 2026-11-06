@@ -1,0 +1,67 @@
+From 330bd25781cef82cf1ff83a8d8e3a889518b6456 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:09:23 -0600
+Subject: [PATCH 083/141] measurement: LLAMA_MOE_ROUTE_HIST dumps the prompt
+ selections per expert and layer at admission; LLAMA_TEST_MMID_PROMPT times
+ MUL_MAT_ID at GLM-5.3 expert shapes and prompt sizes
+
+---
+ src/llama-moe-cache.cpp    | 19 +++++++++++++++++++
+ tests/test-backend-ops.cpp | 11 +++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index a8ae82a70..14b80204c 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1826,6 +1826,25 @@ struct llama_moe_cache::impl {
+     void admit() {
+         prompt_pending = false;
+         flush_pending();
++        // 0084 LLAMA_MOE_ROUTE_HIST: the prompt's selections per expert and layer, "c" for a cached expert
++        if (const char * path = getenv("LLAMA_MOE_ROUTE_HIST"); path != nullptr && *path != '\0') {
++            if (FILE * f = fopen(path, "a")) {
++                for (size_t il = 0; il < layers.size(); ++il) {
++                    const layer & l = layers[il];
++                    if (l.ig < 0 || l.hist.empty()) {
++                        continue;
++                    }
++                    const group & g = groups[l.ig];
++                    fprintf(f, "%zu", il);
++                    for (size_t e = 0; e < l.hist.size(); ++e) {
++                        fprintf(f, " %u%s", l.hist[e], g.slru.slot_map[il][e] < g.slru.n_slots ? "c" : "");
++                    }
++                    fprintf(f, "\n");
++                }
++                fprintf(f, "end\n");
++                fclose(f);
++            }
++        }
+         const int64_t t0 = ggml_time_us();
+         size_t n_layers = 0;
+         size_t n_up     = 0;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a91139e80..d5988e33e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12823,6 +12823,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         return test_cases;
+     }
+ 
++    if (getenv("LLAMA_TEST_MMID_PROMPT") != nullptr) {
++        // 0084: GLM-5.3's experts at prompt sizes, 256 experts, top-8: n/32 tokens an expert on average
++        for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS }) {
++            for (int n : { 32, 64, 128, 320, 640, 1280, 3200 }) {
++                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n, 6144));
++                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 6144, n, 2048));
++            }
++        }
++        return test_cases;
++    }
++
+     if (getenv("LLAMA_TEST_MMID_BANK") != nullptr) {
+         // the offload cache bank at decode: 8 of ~100 experts, GLM-5.3's shapes (gate/up 6144 -> 2048, down 2048 -> 6144), 1 and 8 tokens
+         for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+-- 
+2.43.0
+

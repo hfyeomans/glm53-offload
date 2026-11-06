@@ -1,0 +1,196 @@
+From 4f3a58cc8ebf8b6d5bbb7db5e6e296b3af99a392 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:40:34 -0600
+Subject: [PATCH 133/141] GGML_CUDA_DENSE_CUBLAS routed in ggml_cuda_mul_mat
+ (contiguous weights with a converter only); GGML_CUDA_FUSE_IQ3_XXS=1: the
+ fused gate/up/GLU MMQ kernel for IQ3_XXS weights
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu       | 36 +++++++++++++++++++++------
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh |  5 ++--
+ ggml/src/ggml-cuda/mmq.cu             |  5 +---
+ ggml/src/ggml-cuda/mmq.cuh            |  9 ++++---
+ tests/test-backend-ops.cpp            |  8 ++++++
+ 5 files changed, 45 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 32a5e2409..182a16e40 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1631,7 +1631,8 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+ };
+ 
+ template<ggml_type compute_type>
+-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const bool force_f32_output = false) { // 0128: f16 inputs with f32 compute and output
+     using traits = batched_mul_mat_traits<compute_type>;
+     using cuda_t = typename traits::cuda_type;
+ 
+@@ -1734,7 +1735,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) || force_f32_output;
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4_M(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+@@ -1848,12 +1849,22 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
+     ggml_type compute_type = src0->type;
++    bool dense_f32_output = false;
+     if (ggml_is_quantized(compute_type)) {
+         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+-        // 0126 GGML_CUDA_DENSE_CUBLAS: the dense matmuls it sends here run in bf16 with f32 compute (GGML_CUDA_DENSE_CUBLAS_TYPE=f32: f32)
+-        if (ggml_cuda_dense_cublas_min() > 0 && src1->ne[1] >= ggml_cuda_dense_cublas_min()) {
+-            static const bool dense_f32 = getenv("GGML_CUDA_DENSE_CUBLAS_TYPE") != nullptr && strcmp(getenv("GGML_CUDA_DENSE_CUBLAS_TYPE"), "f32") == 0;
+-            compute_type = dense_f32 || !fast_bf16_hardware_available(cc) ? GGML_TYPE_F32 : GGML_TYPE_BF16;
++        // 0126 / 0128 GGML_CUDA_DENSE_CUBLAS: the dense matmuls it sends here, by GGML_CUDA_DENSE_CUBLAS_TYPE: f16 (default; f16 inputs,
++        // f32 compute and output), bf16 (f32 compute), f32
++        if (ggml_cuda_dense_cublas_min() > 0 && src1->ne[1] >= ggml_cuda_dense_cublas_min() && ggml_is_contiguously_allocated(src0)) {
++            static const char * dt = getenv("GGML_CUDA_DENSE_CUBLAS_TYPE");
++            static const int dense_type = dt == nullptr || strcmp(dt, "f16") == 0 ? 0 : strcmp(dt, "bf16") == 0 ? 1 : 2;
++            if (dense_type == 0 && fast_fp16_hardware_available(cc)) {
++                compute_type     = GGML_TYPE_F16;
++                dense_f32_output = true;
++            } else if (dense_type == 1 && fast_bf16_hardware_available(cc) && ggml_get_to_bf16_cuda(src0->type) != nullptr) {
++                compute_type = GGML_TYPE_BF16;
++            } else {
++                compute_type = GGML_TYPE_F32;
++            }
+         }
+     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
+         compute_type = GGML_TYPE_F32;
+@@ -1923,7 +1934,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
+             break;
+         case GGML_TYPE_F16:
+-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
++            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst, dense_f32_output);
+             break;
+         default:
+             GGML_ABORT("fatal error");
+@@ -2141,6 +2152,11 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
+     if ((up->op != GGML_OP_MUL_MAT && up->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32) {
+         return false;
+     }
++    // 0129: IQ3_XXS fuses only with GGML_CUDA_FUSE_IQ3_XXS=1
++    static const bool fuse_iq3_xxs = getenv("GGML_CUDA_FUSE_IQ3_XXS") != nullptr && atoi(getenv("GGML_CUDA_FUSE_IQ3_XXS")) != 0;
++    if (x_up->type == GGML_TYPE_IQ3_XXS && !fuse_iq3_xxs) {
++        return false;
++    }
+ 
+     // The fused kernel is only compiled for weights whose rows fill whole tiles (no fallback).
+     if (ggml_cuda_mmq_needs_fallback(x_up->ne[1])) {
+@@ -2242,6 +2258,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    // 0126 / 0128 GGML_CUDA_DENSE_CUBLAS=N: contiguous quantized weights times N or more columns go to cuBLAS (f16 inputs, f32 compute)
++    if (ggml_is_quantized(src0->type) && ggml_cuda_dense_cublas_min() > 0 && ne11 >= ggml_cuda_dense_cublas_min() &&
++            ggml_is_contiguously_allocated(src0) && ggml_get_to_fp32_cuda(src0->type) != nullptr) {
++        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
++        return;
++    }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 4951db72e..4b7eda940 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1336,9 +1336,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+     }
+ }
+ 
+-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_xxs(
++template <ggml_type type, int J, bool fallback, bool has_fusion> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_xxs(
+         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+-    GGML_UNUSED(x_gate);
+ 
+     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+@@ -1366,7 +1365,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq3_xxs * bxi = (const block_iq3_xxs *) x + kbx0 + i*stride;
++        const block_iq3_xxs * bxi = ggml_cuda_mmq_x_row<block_iq3_xxs, has_fusion>(x, x_gate, kbx0, i, stride);
+ 
+         const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+         const uint8_t * q3 = (const uint8_t *) &q3_packed;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index a0e43b691..925406f2d 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -495,10 +495,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+         }
+     }
+ 
+-    // 0126: a dense matmul of GGML_CUDA_DENSE_CUBLAS or more columns goes to cuBLAS (ggml_cuda_mul_mat_cublas converts it to bf16)
+-    if (n_experts == 0 && ggml_cuda_dense_cublas_min() > 0 && ne11 >= ggml_cuda_dense_cublas_min()) {
+-        return false;
+-    }
++    // 0128: 0126's dense-cuBLAS routing is in ggml_cuda_mul_mat (contiguous weights only)
+ 
+     if (turing_mma_available(cc)) {
+         return true;
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index fb3fa2731..dbd7c4d30 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -436,7 +436,8 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
+ 
+ // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
+ static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const ggml_type type) {
+-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS;
++    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS ||
++        type == GGML_TYPE_IQ3_XXS; // 0129 (used only with GGML_CUDA_FUSE_IQ3_XXS=1)
+ }
+ 
+ // Fused gate/up/GLU: the weight tile alternates chunks of this many up and gate rows, so rows r and r + 8 of an MMA tile (same thread) pair up.
+@@ -681,7 +682,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+             case GGML_TYPE_IQ3_XXS:
+                 return ggml_cuda_mmq_util_funcs(
+                     VDR_IQ3_XXS_Q8_1_MMQ,
+-                    ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,
++                    ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback, false>,
+                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+             case GGML_TYPE_IQ3_S:
+@@ -851,9 +852,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
+         case GGML_TYPE_IQ3_XXS:
+             return ggml_cuda_mmq_util_funcs(
+                 -1,
+-                ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,
++                ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback, has_fusion>,
+                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
++                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+         case GGML_TYPE_IQ3_S:
+             return ggml_cuda_mmq_util_funcs(
+                 -1,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6d39bf08a..d0dbd1dff 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12664,6 +12664,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K,   GGML_GLU_OP_GEGLU,        150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K,   GGML_GLU_OP_SWIGLU_OAI,   150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
+     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU_CLAMP, 150,  6912, 256, false, 1, 1, false, false, true, false, { 2, 3 }));
++    // 0129: IQ3_XXS gate/up through the fused MMQ kernel (GGML_CUDA_FUSE_IQ3_XXS=1), dense and by expert, beside IQ4_XS's
++    for (ggml_type type : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS }) {
++        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 150, 4096, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
++        for (int64_t m : { 64, 300, 1024 }) {
++            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 2048, 512, true, 32, 8, false, false, true, false, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m, 2048, 512, true, 32, 8, true,  false, true, false, { 1, 1 }));
++        }
++    }
+     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU,       150, 40960, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+     // The same with experts (~1280 tiles each): 17 tokens with broadcast input (one MMA tile per warp), 2048 tokens without (two, several column tiles per expert).
+     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true));
+-- 
+2.43.0
+

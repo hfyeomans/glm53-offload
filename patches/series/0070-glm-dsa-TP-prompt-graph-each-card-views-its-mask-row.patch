@@ -1,0 +1,50 @@
+From ad3443eae193f09051c172ba8710d7ad4d146abc Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:09:47 -0600
+Subject: [PATCH 070/141] glm-dsa TP prompt graph: each card views its mask
+ rows once per graph (a view per layer was a separate 256 MB host copy at 32K,
+ 52 GB kept with pipeline copies)
+
+---
+ src/models/glm-dsa.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index cc6b1a412..6fe4fc209 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -288,9 +288,13 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         ggml_tensor * x[2];
+         ggml_tensor * pos[2];
+         ggml_tensor * prev_top_k[2] = { nullptr, nullptr };
++        ggml_tensor * kq_mask_c[2];  // 0069: each card's mask rows, one view for all the layers (one copy per card)
++        ggml_tensor * lid_mask_c[2];
+         for (int c = 0; c < 2; ++c) {
+             x[c]   = rows2(inp_embd, c);
+             pos[c] = ggml_view_1d(ctx0, inp_pos, n_tok[c], t_off[c]*ggml_element_size(inp_pos));
++            kq_mask_c[c]  = rows4(kq_mask, c);
++            lid_mask_c[c] = lid_mask == kq_mask ? kq_mask_c[c] : rows4(lid_mask, c);
+         }
+ 
+         for (int il = 0; il < n_layer; ++il) {
+@@ -400,7 +404,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 ggml_tensor * IK = IKk[c];
+                 ggml_tensor * top_k = nullptr;
+                 if (IQc[c] != nullptr) {
+-                    ggml_tensor * sc = ggml_lightning_indexer(ctx0, IQc[c], IK, IWc[c], rows4(lid_mask, c));
++                    ggml_tensor * sc = ggml_lightning_indexer(ctx0, IQc[c], IK, IWc[c], lid_mask_c[c]);
+                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
+                     const uint32_t n_top = sc->ne[0] < n_indexer_top_k ? sc->ne[0] : n_indexer_top_k;
+                     top_k = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
+@@ -409,7 +413,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                     GGML_ASSERT(prev_top_k[c] != nullptr && "shared indexer layer must follow a previous full indexer layer");
+                     top_k = prev_top_k[c];
+                 }
+-                ggml_tensor * mask_c = build_fused_top_k_mask(rows4(kq_mask, c), top_k, il);
++                ggml_tensor * mask_c = build_fused_top_k_mask(kq_mask_c[c], top_k, il);
+                 ggml_tensor * V = ggml_view_4d(ctx0, K, kv_lora_rank, K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3], 0);
+                 ggml_tensor * o = build_attn_mha(Qc[c], K, V, nullptr, mask_c, nullptr, nullptr, W(L.wv_b, c), top_k->ne[0], kq_scale, il);
+                 o = build_lora_mm(W(L.wo, c), o, W(L.wo_s, c));
+-- 
+2.43.0
+

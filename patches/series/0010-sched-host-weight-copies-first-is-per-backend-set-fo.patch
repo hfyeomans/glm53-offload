@@ -1,0 +1,80 @@
+From 3d40bdb11d9c71d39e504ebab4b7777d10e610f1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:23:41 -0600
+Subject: [PATCH 010/141] sched: host-weight copies first is per backend; set
+ for the twins only
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/include/ggml-backend.h |  2 +-
+ ggml/src/ggml-backend.cpp   | 10 ++++++----
+ src/llama-context.cpp       |  4 ++--
+ 3 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index ffa010c90..0f8bf17f7 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -379,7 +379,7 @@ extern "C" {
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+     // enqueue the copies of a split's weights in host memory before the copies of its other inputs, so they start before the split
+     // waits for inputs computed by other backends (the copy callback must then not read those inputs)
+-    GGML_API void                 ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, bool enable);
++    GGML_API void                 ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable);
+ 
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1e80bd7a7..f1e0939c7 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1229,7 +1229,7 @@ struct ggml_backend_sched {
+ 
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
+-    bool host_weights_first = false; // see ggml_backend_sched_set_host_weights_first
++    bool host_weights_first[GGML_SCHED_MAX_BACKENDS] = {}; // per backend, see ggml_backend_sched_set_host_weights_first
+ 
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+@@ -2215,7 +2215,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split, unless the
+         // user wants them first: their copies then start before the split backend waits for inputs computed by other backends
+         for (int pass = 0; pass < 2; pass++) {
+-            const bool host_pass = sched->host_weights_first ? pass == 0 : pass == 1;
++            const bool host_pass = sched->host_weights_first[split_backend_id] ? pass == 0 : pass == 1;
+             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                 if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) == host_pass) {
+                     ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+@@ -2376,9 +2376,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     free(sched);
+ }
+ 
+-void ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, bool enable) {
++void ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable) {
+     GGML_ASSERT(sched);
+-    sched->host_weights_first = enable;
++    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
++    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
++    sched->host_weights_first[backend_id] = enable;
+ }
+ 
+ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 121aafb9b..3b87245a2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -801,8 +801,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+-    if (!twins.empty()) {
+-        ggml_backend_sched_set_host_weights_first(sched.get(), true); // a twin's uploads start before it waits for the primary
++    for (const auto & pt : twins) {
++        ggml_backend_sched_set_host_weights_first(sched.get(), pt.second, true); // a twin's uploads start before it waits for the primary
+     }
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+-- 
+2.43.0
+

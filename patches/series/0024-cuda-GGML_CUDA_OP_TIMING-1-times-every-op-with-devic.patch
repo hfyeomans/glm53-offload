@@ -1,0 +1,171 @@
+From 67840155248be0ae147f8f03cd72936627ad1bd4 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:55:00 -0600
+Subject: [PATCH 024/141] cuda: GGML_CUDA_OP_TIMING=1 times every op with
+ device events and prints the top entries; GGML_CUDA_DISABLE_GRAPHS=1 runs
+ without CUDA graphs
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 122 ++++++++++++++++++++++++++++++++
+ 1 file changed, 122 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9b0e079d4..f2c267b2b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4756,6 +4756,119 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// GGML_CUDA_OP_TIMING=1: device time per op (op, tensor name without its layer suffix, the weight type of a matmul), the top entries
++// printed every 65536 ops; GGML_CUDA_DISABLE_GRAPHS=1 is needed with it, ops inside a captured CUDA graph cannot be timed
++struct ggml_cuda_op_timing {
++    static constexpr int N = 8192;
++    cudaEvent_t start[N] = {};
++    cudaEvent_t end[N]   = {};
++    int         key[N]   = {};
++    int         head = 0;
++    int         tail = 0;
++    std::unordered_map<std::string, int> ids;
++    std::vector<std::string> names;
++    std::vector<double>      ms;
++    std::vector<int64_t>     n;
++    int64_t n_done = 0;
++};
++
++static ggml_cuda_op_timing g_cuda_op_timing[GGML_CUDA_MAX_DEVICES];
++
++static bool ggml_cuda_op_timing_enabled(void) {
++    static const bool enabled = getenv("GGML_CUDA_OP_TIMING") != nullptr && atoi(getenv("GGML_CUDA_OP_TIMING")) > 0;
++    return enabled;
++}
++
++static bool ggml_cuda_graphs_disabled_by_env(void) {
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GRAPHS")) > 0;
++    return disabled;
++}
++
++static void ggml_cuda_op_timing_flush(int device, ggml_cuda_op_timing & t) {
++    while (t.tail != t.head) {
++        if (cudaEventQuery(t.end[t.tail]) != cudaSuccess) {
++            (void) cudaGetLastError();
++            break;
++        }
++        float ms = 0.0f;
++        CUDA_CHECK(cudaEventElapsedTime(&ms, t.start[t.tail], t.end[t.tail]));
++        t.ms[t.key[t.tail]] += ms;
++        t.n[t.key[t.tail]]  += 1;
++        t.tail = (t.tail + 1) % ggml_cuda_op_timing::N;
++        t.n_done += 1;
++    }
++    if (t.n_done >= 65536) {
++        double total = 0.0;
++        std::vector<int> order;
++        for (size_t k = 0; k < t.names.size(); ++k) {
++            total += t.ms[k];
++            order.push_back((int) k);
++        }
++        std::sort(order.begin(), order.end(), [&](int a, int b) { return t.ms[a] > t.ms[b]; });
++        GGML_LOG_INFO("cuda op timing: device %d: %lld ops, %.1f ms\n", device, (long long) t.n_done, total);
++        for (size_t r = 0; r < order.size() && r < 40; ++r) {
++            const int k = order[r];
++            GGML_LOG_INFO("cuda op timing:   %8.1f ms %5.1f %% %8lld %7.1f us  %s\n", t.ms[k], 100.0*t.ms[k]/total, (long long) t.n[k], 1000.0*t.ms[k]/t.n[k], t.names[k].c_str());
++        }
++        std::fill(t.ms.begin(), t.ms.end(), 0.0);
++        std::fill(t.n.begin(), t.n.end(), 0);
++        t.n_done = 0;
++    }
++}
++
++static int ggml_cuda_op_timing_begin(ggml_backend_cuda_context * cuda_ctx, bool capturing) {
++    if (!ggml_cuda_op_timing_enabled() || capturing) {
++        return -1;
++    }
++    ggml_cuda_op_timing & t = g_cuda_op_timing[cuda_ctx->device];
++    ggml_cuda_op_timing_flush(cuda_ctx->device, t);
++    const int slot = t.head;
++    const int next = (slot + 1) % ggml_cuda_op_timing::N;
++    if (next == t.tail) {
++        return -1;
++    }
++    if (t.start[slot] == nullptr) {
++        CUDA_CHECK(cudaEventCreate(&t.start[slot]));
++        CUDA_CHECK(cudaEventCreate(&t.end[slot]));
++    }
++    CUDA_CHECK(cudaEventRecord(t.start[slot], cuda_ctx->stream()));
++    t.head = next;
++    return slot;
++}
++
++static void ggml_cuda_op_timing_end(ggml_backend_cuda_context * cuda_ctx, int slot, const ggml_tensor * node, const ggml_tensor * last) {
++    if (slot < 0) {
++        return;
++    }
++    ggml_cuda_op_timing & t = g_cuda_op_timing[cuda_ctx->device];
++    std::string key = ggml_op_name(node->op);
++    if (last != node) {
++        key += "+";
++        key += ggml_op_name(last->op);
++    }
++    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
++        key += "(";
++        key += ggml_type_name(node->src[0]->type);
++        key += ")";
++    }
++    key += " ";
++    std::string name = node->name;
++    const size_t dash = name.rfind('-');
++    if (dash != std::string::npos && dash + 1 < name.size() && name.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
++        name.resize(dash);
++    }
++    key += name;
++    auto it = t.ids.find(key);
++    if (it == t.ids.end()) {
++        it = t.ids.emplace(key, (int) t.names.size()).first;
++        t.names.push_back(key);
++        t.ms.push_back(0.0);
++        t.n.push_back(0);
++    }
++    t.key[slot] = it->second;
++    CUDA_CHECK(cudaEventRecord(t.end[slot], cuda_ctx->stream()));
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -4912,9 +5025,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                const int op_slot = ggml_cuda_op_timing_begin(cuda_ctx, use_cuda_graph);
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    ggml_cuda_op_timing_end(cuda_ctx, op_slot, node, cgraph->nodes[i + nodes_to_skip]);
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -4946,6 +5062,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                ggml_cuda_op_timing_end(cuda_ctx, op_slot, node, node);
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+@@ -5122,6 +5239,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ #endif // USE_CUDA_GRAPH
+ 
++    if (ggml_cuda_graphs_disabled_by_env()) {
++        use_cuda_graph             = false;
++        cuda_graph_update_required = false;
++    }
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+-- 
+2.43.0
+

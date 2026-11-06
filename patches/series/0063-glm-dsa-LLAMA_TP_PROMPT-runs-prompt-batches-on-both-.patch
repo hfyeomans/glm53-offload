@@ -1,0 +1,400 @@
+From 4b44b16c9fcee80fc2fd776752d219b04d9e82c3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:45:20 -0600
+Subject: [PATCH 063/141] glm-dsa: LLAMA_TP_PROMPT runs prompt batches on both
+ cards per layer (token-half attention, expert-parallel MoE, gather /
+ reduce-scatter)
+
+---
+ src/llama-context.cpp  |   5 +
+ src/llama-graph.cpp    |  45 +++++++
+ src/llama-graph.h      |   8 ++
+ src/models/glm-dsa.cpp | 281 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 339 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8fb676fa0..729424d3e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2733,6 +2733,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         res *= 4;
+     }
+ 
++    // 0062: the LLAMA_TP_PROMPT prompt graph builds each layer twice, with the exchanges
++    if (model.tp_devs.size() == 2) {
++        res *= 3;
++    }
++
+     return res;
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 32702e96c..4b72330fa 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2391,6 +2391,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // 0062 LLAMA_TP_PROMPT: expert parallelism over two cards, see moe_ep
++    if (moe_ep) {
++        moe_ep_route_end = ggml_graph_n_nodes(gf);
++        GGML_ASSERT(gate_exps && up_exps && down_exps && !gate_up_exps && !weight_before_ffn && n_expert % 2 == 0);
++        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm);
++        const int64_t n_half = n_expert/2;
++        for (int c = 0; c < 2; ++c) {
++            const int n_nodes0 = ggml_graph_n_nodes(gf);
++            auto half = [&](ggml_tensor * w) {
++                return ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], n_half, w->nb[1], w->nb[2], c*n_half*w->nb[2]);
++            };
++            ggml_tensor * x = ggml_reshape_3d(ctx0, moe_ep_in[c], n_embd, 1, n_tokens);
++            ggml_tensor * up = ggml_mul_mat_id(ctx0, half(up_exps), x, selected_experts);
++            ggml_mul_mat_id_set_id_offset(up, (int32_t) (c*n_half));
++            ggml_tensor * gate = ggml_mul_mat_id(ctx0, half(gate_exps), x, selected_experts);
++            ggml_mul_mat_id_set_id_offset(gate, (int32_t) (c*n_half));
++            ggml_tensor * act = nullptr;
++            const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
++            if (limit > 1e-6f) {
++                // as build_experts does for the architectures without a fused clamped SwiGLU
++                up = ggml_clamp(ctx0, up, -limit, limit);
++                ggml_tensor * gate_act = ggml_clamp(ctx0, ggml_silu(ctx0, gate), -INFINITY, limit);
++                act = ggml_mul(ctx0, gate_act, up);
++            } else {
++                act = ggml_swiglu_split(ctx0, gate, up);
++            }
++            ggml_tensor * down = ggml_mul_mat_id(ctx0, half(down_exps), act, selected_experts);
++            ggml_mul_mat_id_set_id_offset(down, (int32_t) (c*n_half));
++            ggml_tensor * ew  = ggml_mul(ctx0, down, weights);
++            ggml_tensor * out = ggml_view_2d(ctx0, ew, n_embd, n_tokens, ew->nb[2], 0);
++            for (int64_t i = 1; i < n_expert_used; ++i) {
++                out = ggml_add(ctx0, out, ggml_view_2d(ctx0, ew, n_embd, n_tokens, ew->nb[2], i*ew->nb[1]));
++            }
++            ggml_build_forward_expand(gf, out);
++            for (int i = n_nodes0; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_tensor * node = ggml_graph_node(gf, i);
++                if (node->view_src == nullptr) {
++                    ggml_backend_sched_set_tensor_backend(sched, node, moe_ep_backend[c]);
++                }
++            }
++            moe_ep_out[c] = out;
++        }
++        return nullptr;
++    }
++
+     // the experts of host-resident layers may be read from the MoE cache
+     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 799b4313a..3d9af5a3e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1055,6 +1055,14 @@ struct llm_graph_context {
+ 
+     // LLAMA_MOE_PROBE=1: build_moe_ffn stops after the expert selection and leaves it in moe_probe_sel (see models/glm-dsa.cpp)
+     mutable bool          moe_probe     = false;
++    // LLAMA_TP_PROMPT (0062): build_moe_ffn runs the router as usual, then card c's half of the experts (a view of the host experts, the
++    // ids read with an offset) on moe_ep_in[c], pinned to moe_ep_backend[c]; the partial sums come back in moe_ep_out, and the router's
++    // nodes end at moe_ep_route_end
++    mutable bool           moe_ep              = false;
++    mutable ggml_tensor *  moe_ep_in[2]        = { nullptr, nullptr };
++    mutable ggml_backend_t moe_ep_backend[2]   = { nullptr, nullptr };
++    mutable ggml_tensor *  moe_ep_out[2]       = { nullptr, nullptr };
++    mutable int            moe_ep_route_end    = 0;
+ 
+     // LLAMA_MOE_SHEXP_OVERLAP=1: called by build_moe_ffn after the device experts and before the CPU part (the shared expert goes here)
+     mutable std::function<void()> moe_overlap_hook;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 12012badd..1dc6a4e55 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -218,6 +218,287 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+     const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
+ 
++    // 0062 LLAMA_TP_PROMPT=1: a prompt batch runs every layer on both cards (docs/20261104-both-cards-prefill-design.md); the cross-card
++    // inputs of that graph are transient (0060), the other graphs keep the scheduler's usual copies
++    static const int tp_min = getenv("LLAMA_TP_PROMPT") != nullptr && atoi(getenv("LLAMA_TP_PROMPT")) != 0 ?
++        (getenv("LLAMA_TP_PROMPT_MIN") != nullptr ? std::max(2, atoi(getenv("LLAMA_TP_PROMPT_MIN"))) : 1024) : 0;
++    const bool tp = tp_min > 0 && model.tp_devs.size() == 2 && n_tokens >= tp_min;
++    ggml_backend_sched_set_transient_inputs(sched, tp);
++    if (tp) {
++        GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
++        ggml_backend_t be[2] = { nullptr, nullptr };
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
++            for (int c = 0; c < 2; ++c) {
++                if (be[c] == nullptr && ggml_backend_get_device(b) == model.tp_devs[c]) {
++                    be[c] = b;
++                }
++            }
++        }
++        GGML_ASSERT(be[0] != nullptr && be[1] != nullptr);
++        // pin the nodes built since n0 (views follow their source)
++        auto pin_from = [&](int n0, int c) {
++            for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_tensor * node = ggml_graph_node(gf, i);
++                if (node->view_src == nullptr) {
++                    ggml_backend_sched_set_tensor_backend(sched, node, be[c]);
++                }
++            }
++        };
++        auto W = [&](ggml_tensor * w, int c) { return model.tp_w(w, c); };
++
++        // the token halves: card 0 the first, card 1 the rest; the cut on a multiple of 64 rows
++        int64_t t_cut = (n_tokens/2) & ~(int64_t) 63;
++        if (t_cut == 0) {
++            t_cut = n_tokens/2;
++        }
++        const int64_t n_tok[2] = { t_cut, n_tokens - t_cut };
++        const int64_t t_off[2] = { 0, t_cut };
++
++        ggml_tensor * inp_embd = build_inp_embd(model.tok_embd);
++        ggml_tensor * inp_pos  = build_inp_pos();
++        llm_graph_input_attn_k_dsa * inp = build_attn_inp_k_dsa();
++        ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++        const auto * mctx_mla = inp->mctx->get_mla();
++        const auto * mctx_lid = inp->mctx->get_lid();
++        ggml_tensor * kq_mask = inp->self_attn_mask_mla.cnv;
++        if (inp->self_attn_mask_lid.cnv->type == kq_mask->type) {
++            kq_mask = inp->self_attn_mask_lid.cnv;
++        }
++        ggml_tensor * lid_mask = inp->self_attn_mask_lid.cnv;
++
++        // the rows of card c's tokens in a [x, n_tokens, ...] tensor (masks keep their 4 dims)
++        auto rows2 = [&](ggml_tensor * t, int c) {
++            return ggml_view_2d(ctx0, t, t->ne[0], n_tok[c], t->nb[1], t_off[c]*t->nb[1]);
++        };
++        auto rows4 = [&](ggml_tensor * t, int c) {
++            return ggml_view_4d(ctx0, t, t->ne[0], n_tok[c], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], t_off[c]*t->nb[1]);
++        };
++        // the non-home card's keys: a copy of the cache view, the batch's rows set over it (indices are cells, all inside the view)
++        auto kv_temp = [&](ggml_tensor * view, ggml_tensor * rows_all, ggml_tensor * idxs) {
++            GGML_ASSERT(view->ne[3] == 1);
++            ggml_tensor * tmp  = ggml_dup(ctx0, view);
++            ggml_tensor * tmp2 = ggml_reshape_2d(ctx0, tmp, view->ne[0]*view->ne[1], view->ne[2]);
++            ggml_tensor * r2   = ggml_reshape_2d(ctx0, rows_all, rows_all->ne[0]*rows_all->ne[1], rows_all->ne[2]);
++            ggml_tensor * w    = ggml_set_rows(ctx0, tmp2, r2, idxs);
++            return ggml_reshape_4d(ctx0, w, view->ne[0], view->ne[1], view->ne[2], view->ne[3]);
++        };
++
++        ggml_tensor * x[2];
++        ggml_tensor * pos[2];
++        ggml_tensor * prev_top_k[2] = { nullptr, nullptr };
++        for (int c = 0; c < 2; ++c) {
++            x[c]   = rows2(inp_embd, c);
++            pos[c] = ggml_view_1d(ctx0, inp_pos, n_tok[c], t_off[c]*ggml_element_size(inp_pos));
++        }
++
++        for (int il = 0; il < n_layer; ++il) {
++            const auto & L = model.layers[il];
++            const int H = model.tp_home(il);
++
++            // the projections of each card's tokens
++            ggml_tensor * Qc[2], * Kc[2];
++            ggml_tensor * IQc[2] = { nullptr, nullptr }, * IKc[2] = { nullptr, nullptr }, * IWc[2] = { nullptr, nullptr };
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                const int64_t nt = n_tok[c];
++                ggml_tensor * cur = build_norm(x[c], W(L.attn_norm, c), NULL, LLM_NORM_RMS, il);
++                ggml_tensor * qr = ggml_mul_mat(ctx0, W(L.wq_a, c), cur);
++                qr = build_norm(qr, W(L.attn_q_a_norm, c), nullptr, LLM_NORM_RMS, il);
++
++                if (hparams.is_indexer_full(il)) {
++                    ggml_tensor * iq = ggml_mul_mat(ctx0, W(L.indexer_attn_q_b, c), qr);
++                    iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer_head, n_indexer_head, nt);
++                    iq = ggml_rope_ext(ctx0, iq, pos[c], nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                       ext_factor, attn_factor, beta_fast, beta_slow);
++                    ggml_tensor * ik = ggml_mul_mat(ctx0, W(L.indexer_attn_k, c), cur);
++                    ik = build_norm(ik, W(L.indexer_k_norm, c), W(L.indexer_k_norm_b, c), LLM_NORM, il);
++                    ik = ggml_reshape_3d(ctx0, ik, n_embd_indexer_head, 1, nt);
++                    ik = ggml_rope_ext(ctx0, ik, pos[c], nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                       ext_factor, attn_factor, beta_fast, beta_slow);
++                    iq = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], iq);
++                    ik = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], ik);
++                    ggml_tensor * iw = ggml_mul_mat(ctx0, W(L.indexer_proj, c), cur);
++                    iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
++                    IQc[c] = iq;
++                    IKc[c] = ik;
++                    IWc[c] = iw;
++                    ggml_build_forward_expand(gf, iq);
++                    ggml_build_forward_expand(gf, ik);
++                    ggml_build_forward_expand(gf, iw);
++                }
++
++                ggml_tensor * q = ggml_mul_mat(ctx0, W(L.wq_b, c), qr);
++                ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, nt, ggml_row_size(q->type, n_embd_head_k),
++                                                    ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
++                ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, nt, ggml_row_size(q->type, n_embd_head_k),
++                                                  ggml_row_size(q->type, n_embd_head_k) * n_head, ggml_row_size(q->type, n_embd_head_qk_nope));
++                ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, W(L.wkv_a_mqa, c), cur);
++                ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, nt,
++                                                     ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
++                ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, nt,
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
++                q_pe = ggml_rope_ext(ctx0, q_pe, pos[c], nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++                k_pe = ggml_rope_ext(ctx0, k_pe, pos[c], nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++                kv_cmpr = build_norm(kv_cmpr, W(L.attn_kv_a_norm, c), nullptr, LLM_NORM_RMS, il);
++
++                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
++                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, W(L.wk_b, c), q_nope);
++                q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
++                Qc[c] = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
++                kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, nt);
++                Kc[c] = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
++                ggml_build_forward_expand(gf, Qc[c]);
++                ggml_build_forward_expand(gf, Kc[c]);
++                pin_from(n0, c);
++            }
++
++            // the keys of the whole batch on both cards, the cache write on the home card, each card's attention over its own queries
++            ggml_tensor * xa[2];
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                ggml_tensor * k_all  = ggml_concat(ctx0, Kc[0], Kc[1], 2);
++                ggml_tensor * ik_all = IKc[0] != nullptr ? ggml_concat(ctx0, IKc[0], IKc[1], 2) : nullptr;
++                ggml_tensor * K  = nullptr;
++                ggml_tensor * IK = nullptr;
++                if (c == H) {
++                    ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, k_all, inp->get_k_idxs_mla(), il));
++                    if (ik_all != nullptr) {
++                        ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik_all, inp->get_k_idxs_lid(), il));
++                    }
++                    K = mctx_mla->get_k(ctx0, il);
++                    if (ik_all != nullptr) {
++                        IK = mctx_lid->get_k(ctx0, il);
++                    }
++                } else {
++                    K = kv_temp(mctx_mla->get_k(ctx0, il), k_all, inp->get_k_idxs_mla());
++                    if (ik_all != nullptr) {
++                        IK = kv_temp(mctx_lid->get_k(ctx0, il), ik_all, inp->get_k_idxs_lid());
++                    }
++                }
++
++                ggml_tensor * top_k = nullptr;
++                if (IQc[c] != nullptr) {
++                    ggml_tensor * sc = ggml_lightning_indexer(ctx0, IQc[c], IK, IWc[c], rows4(lid_mask, c));
++                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
++                    const uint32_t n_top = sc->ne[0] < n_indexer_top_k ? sc->ne[0] : n_indexer_top_k;
++                    top_k = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
++                    prev_top_k[c] = top_k;
++                } else {
++                    GGML_ASSERT(prev_top_k[c] != nullptr && "shared indexer layer must follow a previous full indexer layer");
++                    top_k = prev_top_k[c];
++                }
++                ggml_tensor * mask_c = build_fused_top_k_mask(rows4(kq_mask, c), top_k, il);
++                ggml_tensor * V = ggml_view_4d(ctx0, K, kv_lora_rank, K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3], 0);
++                ggml_tensor * o = build_attn_mha(Qc[c], K, V, nullptr, mask_c, nullptr, nullptr, W(L.wv_b, c), top_k->ne[0], kq_scale, il);
++                o = build_lora_mm(W(L.wo, c), o, W(L.wo_s, c));
++                xa[c] = ggml_add(ctx0, o, x[c]);
++                ggml_build_forward_expand(gf, xa[c]);
++                pin_from(n0, c);
++            }
++
++            if ((uint32_t) il < hparams.n_layer_dense_lead) {
++                // a dense layer: each card its own tokens
++                for (int c = 0; c < 2; ++c) {
++                    const int n0 = ggml_graph_n_nodes(gf);
++                    ggml_tensor * h = build_norm(xa[c], W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
++                    h = build_ffn(h,
++                        W(L.ffn_up, c), NULL, W(L.ffn_up_s, c),
++                        W(L.ffn_gate, c), NULL, W(L.ffn_gate_s, c),
++                        W(L.ffn_down, c), NULL, W(L.ffn_down_s, c),
++                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                    x[c] = ggml_add(ctx0, h, xa[c]);
++                    ggml_build_forward_expand(gf, x[c]);
++                    pin_from(n0, c);
++                }
++                continue;
++            }
++
++            // MoE: every token on both cards (all-gather), the router once on the home card, half of the experts on each card
++            ggml_tensor * hf[2];
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                ggml_tensor * xf = ggml_concat(ctx0, xa[0], xa[1], 1);
++                hf[c] = build_norm(xf, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
++                ggml_build_forward_expand(gf, hf[c]);
++                pin_from(n0, c);
++            }
++            {
++                const int n0 = ggml_graph_n_nodes(gf);
++                moe_ep = true;
++                for (int c = 0; c < 2; ++c) {
++                    moe_ep_in[c]      = hf[c];
++                    moe_ep_backend[c] = be[c];
++                    moe_ep_out[c]     = nullptr;
++                }
++                build_moe_ffn(hf[H],
++                    L.ffn_gate_inp,
++                    L.ffn_up_exps,
++                    L.ffn_gate_exps,
++                    L.ffn_down_exps,
++                    L.ffn_exp_probs_b,
++                    n_expert, n_expert_used,
++                    LLM_FFN_SILU, hparams.expert_weights_norm,
++                    hparams.expert_weights_scale,
++                    (llama_expert_gating_func_type) hparams.expert_gating_func,
++                    il,
++                    nullptr,
++                    L.ffn_gate_up_exps,
++                    L.ffn_up_exps_s,
++                    L.ffn_gate_exps_s,
++                    L.ffn_down_exps_s);
++                moe_ep = false;
++                for (int i = n0; i < moe_ep_route_end; ++i) {
++                    ggml_tensor * node = ggml_graph_node(gf, i);
++                    if (node->view_src == nullptr) {
++                        ggml_backend_sched_set_tensor_backend(sched, node, be[H]);
++                    }
++                }
++                GGML_ASSERT(moe_ep_out[0] != nullptr && moe_ep_out[1] != nullptr);
++            }
++            for (int c = 0; c < 2; ++c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                // reduce-scatter: this card's tokens of both partial sums
++                ggml_tensor * m  = ggml_add(ctx0, rows2(moe_ep_out[c], c), rows2(moe_ep_out[1 - c], c));
++                ggml_tensor * sh = build_ffn(rows2(hf[c], c),
++                    W(L.ffn_up_shexp, c), NULL, W(L.ffn_up_shexp_s, c),
++                    W(L.ffn_gate_shexp, c), NULL, W(L.ffn_gate_shexp_s, c),
++                    W(L.ffn_down_shexp, c), NULL, W(L.ffn_down_shexp_s, c),
++                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                x[c] = ggml_add(ctx0, ggml_add(ctx0, m, sh), xa[c]);
++                ggml_build_forward_expand(gf, x[c]);
++                pin_from(n0, c);
++            }
++        }
++
++        // the final norm, the MTP hidden state and the logits on the output's card
++        const int co = model.dev_output() == model.tp_devs[0] ? 0 : 1;
++        const int n0 = ggml_graph_n_nodes(gf);
++        ggml_tensor * cur = ggml_concat(ctx0, x[0], x[1], 1);
++        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
++        if (crop_before_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++        if (crop_after_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
++        cur = ggml_mul_mat(ctx0, model.output, cur);
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++        ggml_build_forward_expand(gf, cur);
++        pin_from(n0, co);
++        return;
++    }
++
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
+-- 
+2.43.0
+

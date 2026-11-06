@@ -1,0 +1,37 @@
+From c6f367381b49b973b50a2b773e87ae6ad4fb0069 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 12:00:21 -0600
+Subject: [PATCH 136/141] GGML_SCHED_PAIR_GATE_UP=N: pair only MUL_MAT_IDs of N
+ or more tokens (a small batch's selective upload remaps the shared ids)
+
+---
+ ggml/src/ggml-backend.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 01342f976..07d3da296 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1766,7 +1766,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         split->n_inputs = 0;
+         int cur_backend_id = split->backend_id;
+         // 0131 GGML_SCHED_PAIR_GATE_UP=1: the last node placed (view ops aside), to keep an expert gate / up pair in one split
+-        static const bool pair_gate_up = getenv("GGML_SCHED_PAIR_GATE_UP") != nullptr && atoi(getenv("GGML_SCHED_PAIR_GATE_UP")) != 0;
++        // 0132: GGML_SCHED_PAIR_GATE_UP=N pairs only MUL_MAT_IDs of N or more tokens (their ids' second dimension)
++        static const int64_t pair_gate_up = getenv("GGML_SCHED_PAIR_GATE_UP") != nullptr ? std::max(0, atoi(getenv("GGML_SCHED_PAIR_GATE_UP"))) : 0;
+         struct ggml_tensor * prev_node = NULL;
+         for (; i < graph->n_nodes; i++) {
+             struct ggml_tensor * node = graph->nodes[i];
+@@ -1780,7 +1781,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
+ 
+             // 0131: a MUL_MAT_ID reading the input and ids of the MUL_MAT_ID just before it stays in that one's split
+-            const bool pair = pair_gate_up && node->op == GGML_OP_MUL_MAT_ID && prev_node != NULL && prev_node->op == GGML_OP_MUL_MAT_ID &&
++            const bool pair = pair_gate_up > 0 && node->op == GGML_OP_MUL_MAT_ID && node->src[2] != NULL && node->src[2]->ne[1] >= pair_gate_up &&
++                prev_node != NULL && prev_node->op == GGML_OP_MUL_MAT_ID &&
+                 tensor_backend_id(prev_node) == node_backend_id && prev_node->src[1] == node->src[1] && prev_node->src[2] == node->src[2];
+ 
+             // check if we should start a new split based on the sources of the current node
+-- 
+2.43.0
+

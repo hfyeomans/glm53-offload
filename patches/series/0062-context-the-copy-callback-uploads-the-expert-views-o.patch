@@ -1,0 +1,80 @@
+From 71be04893b597db8dd7fd0962f5e4e416757bff3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:45:20 -0600
+Subject: [PATCH 062/141] context: the copy callback uploads the expert views
+ of LLAMA_TP_PROMPT in one copy through the card upload ring (per-backend ring
+ marker)
+
+---
+ src/llama-context.cpp | 33 +++++++++++++++++++++++++++++++++
+ src/llama-context.h   |  3 +++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 67ba2fcd4..8fb676fa0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3084,6 +3084,39 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // 0061 LLAMA_TP_PROMPT: a card's experts in the prompt graph are a view of the host expert tensor (half of them): the whole view goes
++    // up in one copy, through the card's upload ring when there is one
++    if (src->view_src != nullptr && lctx->model.tp_devs.size() == 2) {
++#ifdef GGML_USE_CUDA
++        static const bool tp_ring = getenv("LLAMA_MOE_UPLOAD_RING") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING")) != 0;
++        if (tp_ring && ggml_backend_is_cuda(backend) && ggml_backend_cuda_host_ptr_device_accessible(src->data)) {
++            if (st.tp_ring_slot == 0) {
++                for (const auto & layer : lctx->model.layers) {
++                    size_t b = 0;
++                    for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
++                        b += t ? GGML_PAD(ggml_nbytes(t)/2, 256) : 0;
++                    }
++                    st.tp_ring_slot = std::max(st.tp_ring_slot, b);
++                }
++            }
++            const int32_t il = lctx->moe_cache ? lctx->moe_cache->layer_of_weight(src->view_src) : -1;
++            auto it = st.tp_ring_il.find(backend);
++            const bool first = il < 0 || it == st.tp_ring_il.end() || it->second != il;
++            st.tp_ring_il[backend] = il;
++            void * p = ggml_backend_cuda_upload_ring_gather(backend, first, nullptr, n_expert, expert_size,
++                std::max(st.tp_ring_slot, 3*GGML_PAD(ggml_nbytes(dst), 256)), src->data);
++            if (p != nullptr) {
++                dst->data = p;
++                st.cur_path = 1;
++                return true;
++            }
++        }
++#endif
++        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(dst));
++        st.cur_path = 2;
++        return true;
++    }
++
+ #ifdef GGML_USE_CUDA
+     // LLAMA_MOE_RING_ONLY: the copy has no graph memory, give it a ring slot first (every path below fills dst->data)
+     if (!lctx->expert_placeholders.empty() && ggml_backend_is_cuda(backend)) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a8ac5699f..b2452d158 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -392,6 +392,8 @@ private:
+         // GGML_SCHED_TIMING=1: host time of the callback per path (0 MoE cache copy, 1 gather kernel, 2 per-expert upload,
+         // 3 ids read + synchronize, 4 other), printed and cleared by graph_compute
+         int32_t ring_il = -1; // the layer of the last expert tensor gathered into the upload ring (a change starts a new slot)
++        std::map<ggml_backend_t, int32_t> tp_ring_il; // 0061: the same per backend, for the expert views of LLAMA_TP_PROMPT
++        size_t tp_ring_slot = 0;                      // 0061: the largest half layer of experts, the ring's slot size for those views
+         std::map<ggml_backend_dev_t, size_t> ring_split_max; // 0054: the largest MoE split per device (kept across graphs)
+ 
+         bool    timing = false;
+@@ -403,6 +405,7 @@ private:
+             ids = nullptr;
+             ids_noted = nullptr;
+             ring_il = -1;
++            tp_ring_il.clear();
+             ids_data.clear();
+             used.clear();
+             upload_all = false;
+-- 
+2.43.0
+

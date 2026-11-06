@@ -1,0 +1,45 @@
+From 67b1a0d8c666a13fba07119ec1c91fa5f205854a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:19:24 -0600
+Subject: [PATCH 110/141] layer-major prompt graph: k = min(LLAMA_LM_PIPE,
+ ceil(n / LLAMA_LM_MIN_UB)) balanced ubatches of a multiple of 256 rows (a
+ short prompt is one ubatch, its experts uploaded once)
+
+---
+ src/llama-context.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a5d76ba1e..96f687cb6 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -878,6 +878,10 @@ static uint32_t llama_lm_pipe() {
+     static const uint32_t v = getenv("LLAMA_LM_PIPE") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_PIPE"))) : 6;
+     return v;
+ }
++static uint32_t llama_lm_min_ub() {
++    static const uint32_t v = getenv("LLAMA_LM_MIN_UB") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_MIN_UB"))) : 8192;
++    return v;
++}
+ static uint32_t llama_lm_fallback_ub() {
+     static const uint32_t v = getenv("LLAMA_LM_FALLBACK_UB") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_FALLBACK_UB"))) : 512;
+     return v;
+@@ -2240,11 +2244,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     uint32_t n_ub = lm_on ? std::min(cparams.n_ubatch, llama_lm_fallback_ub()) : cparams.n_ubatch;
+     bool lm_try = false;
+     if (lm_on && balloc->get_n_tokens() > 8) {
++        // 0111: k = min(LLAMA_LM_PIPE, ceil(n / LLAMA_LM_MIN_UB)) balanced ubatches, each a multiple of 256 rows, at most n_ubatch
+         const uint32_t n_all = balloc->get_n_tokens();
+-        const uint32_t k = llama_lm_pipe();
++        const uint32_t k = std::max(1u, std::min(llama_lm_pipe(), (n_all + llama_lm_min_ub() - 1)/llama_lm_min_ub()));
+         uint32_t u = (n_all + k - 1)/k;
+-        u = (u + lm_R - 1)/lm_R*lm_R;
+-        n_ub = std::min(cparams.n_ubatch, std::max(lm_R, u));
++        u = (u + 255)/256*256;
++        n_ub = std::min(cparams.n_ubatch, u);
+         lm_try = true;
+     }
+ 
+-- 
+2.43.0
+

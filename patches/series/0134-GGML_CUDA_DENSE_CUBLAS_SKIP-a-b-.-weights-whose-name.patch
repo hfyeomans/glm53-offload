@@ -1,0 +1,56 @@
+From 48594b9fda0ba20fa1e2d219b2e8db7727548689 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:23:26 -0600
+Subject: [PATCH 134/141] GGML_CUDA_DENSE_CUBLAS_SKIP=a,b,...: weights whose
+ name contains a listed substring keep MMQ under GGML_CUDA_DENSE_CUBLAS
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 182a16e40..f5139434d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2210,6 +2210,29 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
+     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], ncols, nchannels, device);
+ }
+ 
++// 0130 GGML_CUDA_DENSE_CUBLAS_SKIP=a,b,...: weights whose name contains one of the substrings keep MMQ under GGML_CUDA_DENSE_CUBLAS
++static bool ggml_cuda_dense_cublas_skip(const char * name) {
++    static const std::vector<std::string> skip = [] {
++        std::vector<std::string> v;
++        const char * e = getenv("GGML_CUDA_DENSE_CUBLAS_SKIP");
++        std::string s = e != nullptr ? e : "";
++        for (size_t p = 0; p <= s.size(); ) {
++            const size_t q = std::min(s.find(',', p), s.size());
++            if (q > p) {
++                v.push_back(s.substr(p, q - p));
++            }
++            p = q + 1;
++        }
++        return v;
++    }();
++    for (const std::string & k : skip) {
++        if (strstr(name, k.c_str()) != nullptr) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -2260,7 +2283,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     }
+     // 0126 / 0128 GGML_CUDA_DENSE_CUBLAS=N: contiguous quantized weights times N or more columns go to cuBLAS (f16 inputs, f32 compute)
+     if (ggml_is_quantized(src0->type) && ggml_cuda_dense_cublas_min() > 0 && ne11 >= ggml_cuda_dense_cublas_min() &&
+-            ggml_is_contiguously_allocated(src0) && ggml_get_to_fp32_cuda(src0->type) != nullptr) {
++            ggml_is_contiguously_allocated(src0) && ggml_get_to_fp32_cuda(src0->type) != nullptr && !ggml_cuda_dense_cublas_skip(src0->name)) {
+         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+         return;
+     }
+-- 
+2.43.0
+

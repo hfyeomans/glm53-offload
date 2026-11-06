@@ -1,0 +1,63 @@
+From f658fe96fd80886f166ead7ed2ae981669e0ce64 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 16:24:30 -0600
+Subject: [PATCH 040/141] cuda: GGML_CUDA_FUSION_DEBUG=1 logs why a GLU fed by
+ two MUL_MAT_IDs does not fuse (diagnostic)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 39 +++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6e0b8e91c..b820f9065 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4560,6 +4560,45 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fused_node_count  = 5;
+                 break;
+             }
++        } else if ((op == GGML_OP_MUL_MAT_ID && getenv("GGML_CUDA_FUSION_DEBUG") != nullptr && [&]() {
++                // 0039: at a GLU fed by two MUL_MAT_IDs, say why the three do not fuse (first 24 times), then fall through
++                static int n_logged = 0;
++                if (n_logged >= 24 || i + 2 >= cgraph->n_nodes) {
++                    return false;
++                }
++                for (int j = i; j < std::min(cgraph->n_nodes, i + 8); ++j) {
++                    const ggml_tensor * g = cgraph->nodes[j];
++                    if (g->op != GGML_OP_GLU || g->src[0] == nullptr || g->src[1] == nullptr ||
++                            g->src[0]->op != GGML_OP_MUL_MAT_ID || g->src[1]->op != GGML_OP_MUL_MAT_ID) {
++                        continue;
++                    }
++                    if (cgraph->nodes[i] != g->src[0] && cgraph->nodes[i] != g->src[1]) {
++                        return false; // log once per GLU, at its first source
++                    }
++                    int pos0 = -1, pos1 = -1;
++                    for (int k = std::max(0, j - 8); k < j; ++k) {
++                        if (cgraph->nodes[k] == g->src[0]) { pos0 = k - j; }
++                        if (cgraph->nodes[k] == g->src[1]) { pos1 = k - j; }
++                    }
++                    const bool consecutive = j == i + 2;
++                    const bool can_sub = consecutive && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 });
++                    const bool can = consecutive && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {});
++                    const bool smm = ggml_cuda_should_fuse_mul_mat(g->src[1], g->src[0], g);
++                    const int out_nodes[] = { j };
++                    const bool mem = consecutive && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1);
++                    const bool mmvq = ggml_cuda_should_fuse_mul_mat_vec_q(g->src[1]);
++                    GGML_LOG_INFO("fusion debug: GLU %s at node %d: gate at %+d (%s), up at %+d (%s), consecutive %d, subgraph %d, can_fuse %d, "
++                                  "should_fuse_mul_mat %d, memory %d, mmvq %d; gate src0 %s %s ne %lld %lld %lld nb %zu %zu, up src0 %s %s ne %lld %lld %lld nb %zu %zu, "
++                                  "same src1 %d, same ids %d, glu op %d swapped %d\n",
++                        g->name, j, pos0, g->src[0]->name, pos1, g->src[1]->name, consecutive, can_sub, can, smm, mem, mmvq,
++                        g->src[0]->src[0]->name, ggml_type_name(g->src[0]->src[0]->type), (long long) g->src[0]->src[0]->ne[0], (long long) g->src[0]->src[0]->ne[1], (long long) g->src[0]->src[0]->ne[2], g->src[0]->src[0]->nb[1], g->src[0]->src[0]->nb[2],
++                        g->src[1]->src[0]->name, ggml_type_name(g->src[1]->src[0]->type), (long long) g->src[1]->src[0]->ne[0], (long long) g->src[1]->src[0]->ne[1], (long long) g->src[1]->src[0]->ne[2], g->src[1]->src[0]->nb[1], g->src[1]->src[0]->nb[2],
++                        g->src[0]->src[1] == g->src[1]->src[1], g->src[0]->src[2] == g->src[1]->src[2], (int) ggml_get_glu_op(g), (int) ggml_get_op_params_i32(g, 1));
++                    n_logged++;
++                    return false;
++                }
++                return false;
++            }())) {
+         } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
+             ggml_tensor * glu  = cgraph->nodes[i + 2];
+             ggml_tensor * gate = glu->src[0];
+-- 
+2.43.0
+

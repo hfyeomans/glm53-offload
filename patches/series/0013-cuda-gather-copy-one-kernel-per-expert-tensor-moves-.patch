@@ -1,0 +1,224 @@
+From 6c26df90c39a60ff99248dec3253f82ba17dd974 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:48:34 -0600
+Subject: [PATCH 013/141] cuda gather copy: one kernel per expert tensor moves
+ all experts into the device copy
+
+Cached experts come from the MoE cache banks, the rest from the pinned host weights through UVA. Used on twin splits
+and on the pipelined upload-all path; replaces ~300 cudaMemcpyAsync per layer that back-pressured the host issue loop
+(5-10 s of host time per 8K ubatch, measured with GGML_SCHED_TIMING).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/include/ggml-cuda.h        |  5 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 61 +++++++++++++++++++++++++++++++++
+ src/llama-context.cpp           | 28 +++++++++++++++
+ src/llama-moe-cache.cpp         | 24 +++++++++++++
+ src/llama-moe-cache.h           |  3 ++
+ 5 files changed, 121 insertions(+)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index fa5d4da5d..70c7f7e8f 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -26,6 +26,11 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ // scheduler orders its work against the primary backend with copies and events (also ggml_backend_dev_init(dev, "twin"))
+ // k = 0..3 selects one of up to four twins of the device (ggml_backend_dev_init(dev, "twin"), "twin1", ...)
+ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init_twin(int device, int k);
++
++// gather copy: dst[i] = srcs[i] for i < n, each `size` bytes, in one kernel on the backend stream; a source may be device memory of
++// the backend's device or pinned host memory mapped for the device (ggml_backend_cuda_host_ptr_device_accessible)
++GGML_BACKEND_API void ggml_backend_cuda_gather_copy_async(ggml_backend_t backend, void * dst, const void * const * srcs, int64_t n, size_t size);
++GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void * ptr);
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e5cc58efc..4657beec5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6537,6 +6537,67 @@ ggml_backend_t ggml_backend_cuda_init_twin(int device, int k) {
+     return twin;
+ }
+ 
++// gather copy: one kernel moves n experts of `size` bytes from their sources (device banks or mapped pinned host memory) into dst
++#define GGML_CUDA_GATHER_MAX 256
++struct ggml_cuda_gather_table {
++    const void * src[GGML_CUDA_GATHER_MAX];
++};
++
++static __global__ void ggml_cuda_gather_copy_kernel(const ggml_cuda_gather_table table, char * dst, const size_t size, const size_t chunk) {
++    const int e = blockIdx.y;
++    const char * src = (const char *) table.src[e];
++    if (src == nullptr) {
++        return;
++    }
++    const size_t off = (size_t) blockIdx.x*chunk;
++    if (off >= size) {
++        return;
++    }
++    const size_t end = off + chunk < size ? off + chunk : size;
++    char * d = dst + (size_t) e*size;
++    const size_t n16 = (end - off)/16;
++    const int4 * s4 = (const int4 *) (src + off);
++    int4 * d4 = (int4 *) (d + off);
++    for (size_t i = threadIdx.x; i < n16; i += blockDim.x) {
++        d4[i] = s4[i];
++    }
++    if (threadIdx.x == 0) {
++        for (size_t i = off + n16*16; i < end; ++i) {
++            d[i] = src[i];
++        }
++    }
++}
++
++void ggml_backend_cuda_gather_copy_async(ggml_backend_t backend, void * dst, const void * const * srcs, int64_t n, size_t size) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    const size_t chunk = 1024*1024;
++    const unsigned n_chunks = (unsigned) ((size + chunk - 1)/chunk);
++    for (int64_t first = 0; first < n; first += GGML_CUDA_GATHER_MAX) {
++        const int cnt = (int) std::min<int64_t>(GGML_CUDA_GATHER_MAX, n - first);
++        ggml_cuda_gather_table table;
++        for (int i = 0; i < cnt; ++i) {
++            table.src[i] = srcs[first + i];
++        }
++        for (int i = cnt; i < GGML_CUDA_GATHER_MAX; ++i) {
++            table.src[i] = nullptr;
++        }
++        const dim3 grid(n_chunks, cnt);
++        ggml_cuda_gather_copy_kernel<<<grid, 256, 0, cuda_ctx->stream()>>>(table, (char *) dst + (size_t) first*size, size, chunk);
++        CUDA_CHECK(cudaGetLastError());
++    }
++}
++
++bool ggml_backend_cuda_host_ptr_device_accessible(const void * ptr) {
++    cudaPointerAttributes attr;
++    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
++    if (err != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    return attr.type == cudaMemoryTypeHost && attr.devicePointer != nullptr;
++}
++
+ ggml_backend_t ggml_backend_cuda_init(int device) {
+     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 443263b09..45bb82888 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-context.h"
+ 
++#ifdef GGML_USE_CUDA
++#include "ggml-cuda.h"
++#endif
++
+ #include "ggml.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+@@ -2919,12 +2923,33 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // all the experts in one gather kernel: the cached ones from the device banks, the rest from the pinned host weights (UVA)
++    auto gather_all = [&]() -> bool {
++#ifdef GGML_USE_CUDA
++        if (!ggml_backend_is_cuda(backend) || n_expert > 256 || !ggml_backend_cuda_host_ptr_device_accessible(src->data)) {
++            return false;
++        }
++        const void * table[256];
++        for (int64_t e = 0; e < n_expert; ++e) {
++            const void * p = lctx->moe_cache ? lctx->moe_cache->cached_expert(backend, src, e) : nullptr;
++            table[e] = p != nullptr ? p : (const void *) ((const uint8_t *) src->data + e*expert_size);
++        }
++        ggml_backend_cuda_gather_copy_async(backend, dst->data, table, n_expert, expert_size);
++        return true;
++#else
++        return false;
++#endif
++    };
++
+     // on a twin backend the host weights are copied before the other inputs of the split (host_weights_first), so the ids are
+     // not readable here: upload all the experts, the cached ones from the device banks
+     bool is_twin = false;
+     for (const auto & pt : lctx->twins) {
+         is_twin = is_twin || pt.second == backend;
+     }
++    if (is_twin && lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++        return true;
++    }
+     if (is_twin && lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
+         int64_t next = 0;
+         for (int64_t e = 0; e < n_expert; ) {
+@@ -2962,6 +2987,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 st.ids_noted = ids;
+             }
+             // upload all the experts, the cached ones from the device banks: the slot map is host memory, so no wait for the ids
++            if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++                return true;
++            }
+             if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
+                 int64_t next = 0;
+                 for (int64_t e = 0; e < n_expert; ) {
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 23c7da563..b00a117a7 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -724,6 +724,26 @@ struct llama_moe_cache::impl {
+         return n;
+     }
+ 
++    const void * cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e) {
++        const auto it = bindings.find(w);
++        if (it == bindings.end()) {
++            return nullptr;
++        }
++        const binding & b = it->second;
++        const group & g = groups[layers[b.il].ig];
++        if (!llama_moe_cache_same_device(backend, devices[g.id].backend)) {
++            return nullptr;
++        }
++        const int32_t * slots = g.slru.slot_map[b.il];
++        if (slots == nullptr || slots[e] >= g.n_slots) {
++            return nullptr;
++        }
++        const ggml_tensor * bank = g.banks[b.ip];
++        stats_copy.hits  += 1;
++        stats_copy.bytes += bank->nb[2];
++        return (const char *) bank->data + (size_t) slots[e]*bank->nb[2];
++    }
++
+     static const ggml_tensor * base_of(const ggml_tensor * t) {
+         while (t->view_src != nullptr) {
+             t = t->view_src;
+@@ -1109,6 +1129,10 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+ 
++const void * llama_moe_cache::cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e) {
++    return pimpl->cached_expert(backend, w, e);
++}
++
+ int32_t llama_moe_cache::layer_of_weight(const ggml_tensor * w) const {
+     return pimpl->layer_of_weight(w);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 70ee62761..4fa6a7fbd 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -46,6 +46,9 @@ public:
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+ 
++    // the device address of expert e of w in the cache banks of the backend's device, nullptr if not cached (large batches, gather copy)
++    const void * cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e);
++
+     // prompt-informed admission (LLAMA_MOE_CACHE_ADMIT, default 32 experts per layer, 0 = off): the experts selected by large batches
+     // (prompt processing) are counted per layer; the first small batch after them loads the top experts of each layer into the cache,
+     // so generation after a prompt starts with the prompt's hot set instead of the previous generation's
+-- 
+2.43.0
+

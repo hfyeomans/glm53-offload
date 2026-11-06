@@ -1,0 +1,323 @@
+From 6b78a06f251a5d54a7cd75217a13920892fa7f8c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:50:46 -0600
+Subject: [PATCH 001/141] moe cache: prompt-informed admission
+ (LLAMA_MOE_CACHE_ADMIT, default 32)
+
+The experts selected during prompt processing (large batches, which only read the cache) are counted per layer in the
+scheduler copy callback, asynchronously under pipeline parallelism; the first small batch after the prompt admits each
+cached layer's top-K prompt experts through plan() and the upload path, so generation starts with the prompt's hot set
+instead of warming the LRU over ~2,000 tokens.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/llama-context.cpp   |  17 ++++
+ src/llama-context.h     |   2 +
+ src/llama-moe-cache.cpp | 174 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-cache.h   |   8 ++
+ 4 files changed, 201 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index df7802930..977defa02 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2893,6 +2893,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
+         st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
+         if (st.upload_all) {
++            // the ids are not read here (it would stall the graphs in flight); the MoE cache counts them asynchronously for admission
++            if (lctx->moe_cache && ids != st.ids_noted) {
++                const int32_t il = lctx->moe_cache->layer_of_weight(src);
++                if (il >= 0) {
++                    lctx->moe_cache->note_prompt_ids_async(backend, il, ids);
++                }
++                st.ids_noted = ids;
++            }
+             return false;
+         }
+     }
+@@ -2914,6 +2922,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         st.ids = ids;
+     }
+ 
++    // the experts of a large batch are counted for the admission into the MoE cache, once per layer
++    if (lctx->moe_cache && ids != st.ids_noted) {
++        const int32_t il = lctx->moe_cache->layer_of_weight(src);
++        if (il >= 0) {
++            lctx->moe_cache->note_prompt_ids(il, st.ids_data.data(), ids->ne[0], ids->ne[1], ids->nb[0], ids->nb[1]);
++        }
++        st.ids_noted = ids;
++    }
++
+     // group consecutive experts and copy them together
+     for (int64_t first = 0; first < n_expert; ) {
+         if (!st.used[first]) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index dd469862c..7036ec4f0 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -375,6 +375,7 @@ private:
+     // state of sched_copy_experts, reset before each graph compute
+     struct copy_experts_info {
+         const ggml_tensor *  ids = nullptr;
++        const ggml_tensor *  ids_noted = nullptr; // the ids counted by the MoE cache for admission, once per layer
+         std::vector<int32_t> ids_data;
+         std::vector<bool>    used;
+ 
+@@ -387,6 +388,7 @@ private:
+ 
+         void reset() {
+             ids = nullptr;
++            ids_noted = nullptr;
+             ids_data.clear();
+             used.clear();
+             upload_all = false;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 8e29a5c91..03881217f 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -272,6 +272,7 @@ struct llama_moe_cache::impl {
+         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
+         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
++        std::vector<uint32_t> hist;         // prompt-informed admission: selections per expert in large batches
+     };
+ 
+     struct binding {
+@@ -332,6 +333,21 @@ struct llama_moe_cache::impl {
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+ 
++    // prompt-informed admission
++    struct pending_ids {
++        int32_t il;
++        size_t  pos;      // offset in pending_buf, in int32_t
++        int64_t ne0, ne1;
++        size_t  nb0, nb1; // strides in bytes, as read
++    };
++    int32_t admit_k        = 32;
++    bool    prompt_pending = false;
++    std::vector<pending_ids> pending;
++    ggml_backend_buffer_ptr  pending_buf; // pinned host ring for the asynchronous reads
++    size_t pending_cap = 0;               // in int32_t
++    size_t pending_pos = 0;
++    struct { size_t prompts = 0, layers = 0, uploaded = 0, bytes = 0; double ms = 0.0; } stats_admit;
++
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+     ggml_backend_buffer_ptr buf_host;
+@@ -433,6 +449,9 @@ struct llama_moe_cache::impl {
+ 
+         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
+         cpu_share_q = (uint32_t) std::lround(cpu_share*65536.0f);
++        if (const char * s = getenv("LLAMA_MOE_CACHE_ADMIT"); s != nullptr && *s != '\0') {
++            admit_k = atoi(s);
++        }
+         if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
+             trace = fopen(path, "wb");
+             if (trace == nullptr) {
+@@ -717,6 +736,10 @@ struct llama_moe_cache::impl {
+ 
+         GGML_ASSERT(backend == devices[g.id].backend);
+ 
++        if (prompt_pending) {
++            admit();
++        }
++
+         // the get_rows that looks up the slots of the selected experts
+         const int n_nodes = ggml_graph_n_nodes(graph);
+         const ggml_tensor * lookup = nullptr;
+@@ -836,6 +859,141 @@ struct llama_moe_cache::impl {
+         return true;
+     }
+ 
++    int32_t layer_of_weight(const ggml_tensor * w) const {
++        const auto it = bindings.find(w);
++        return it != bindings.end() ? it->second.il : -1;
++    }
++
++    void count_ids(layer & l, const int32_t * data, int64_t ne0, int64_t ne1, size_t nb0, size_t nb1) {
++        const int32_t n_expert = groups[l.ig].ref[0]->ne[2];
++        if (l.hist.empty()) {
++            l.hist.assign(n_expert, 0);
++        }
++        for (int64_t i1 = 0; i1 < ne1; ++i1) {
++            for (int64_t i0 = 0; i0 < ne0; ++i0) {
++                const int32_t id = data[i1*nb1/sizeof(int32_t) + i0*nb0/sizeof(int32_t)];
++                if (id >= 0 && id < n_expert) {
++                    l.hist[id]++;
++                }
++            }
++        }
++    }
++
++    void note_prompt_ids(int32_t il, const int32_t * data, int64_t ne0, int64_t ne1, size_t nb0, size_t nb1) {
++        if (admit_k <= 0 || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
++            return;
++        }
++        count_ids(layers[il], data, ne0, ne1, nb0, nb1);
++        prompt_pending = true;
++    }
++
++    // count the ids read asynchronously, after the devices are done with the graphs that produced them
++    void flush_pending() {
++        if (pending.empty()) {
++            return;
++        }
++        for (device & d : devices) {
++            if (d.buf) {
++                ggml_backend_synchronize(d.backend);
++            }
++        }
++        const int32_t * base = (const int32_t *) ggml_backend_buffer_get_base(pending_buf.get());
++        for (const pending_ids & p : pending) {
++            count_ids(layers[p.il], base + p.pos, p.ne0, p.ne1, p.nb0, p.nb1);
++        }
++        pending.clear();
++        pending_pos = 0;
++    }
++
++    void note_prompt_ids_async(ggml_backend_t backend, int32_t il, const ggml_tensor * ids) {
++        if (admit_k <= 0 || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
++            return;
++        }
++        const size_t n = (ggml_nbytes(ids) + sizeof(int32_t) - 1)/sizeof(int32_t);
++        if (!pending_buf) {
++            pending_cap = (size_t) 256*1024*1024/sizeof(int32_t);
++            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
++            pending_buf.reset(ggml_backend_buft_alloc_buffer(buft ? buft : ggml_backend_cpu_buffer_type(), pending_cap*sizeof(int32_t)));
++            GGML_ASSERT(pending_buf);
++        }
++        if (n > pending_cap) {
++            return;
++        }
++        if (pending_pos + n > pending_cap) {
++            flush_pending(); // the ring wraps: synchronize and count what is in it
++        }
++        int32_t * base = (int32_t *) ggml_backend_buffer_get_base(pending_buf.get());
++        ggml_backend_tensor_get_async(backend, ids, base + pending_pos, 0, ggml_nbytes(ids));
++        pending.push_back({ il, pending_pos, ids->ne[0], ids->ne[1], ids->nb[0], ids->nb[1] });
++        pending_pos += GGML_PAD(n, 16);
++        prompt_pending = true;
++    }
++
++    // the first small batch after a prompt: load the top experts of each layer selected during the prompt
++    void admit() {
++        prompt_pending = false;
++        flush_pending();
++        const int64_t t0 = ggml_time_us();
++        size_t n_layers = 0;
++        size_t n_up     = 0;
++        size_t bytes    = 0;
++        std::vector<int32_t> top;
++        for (size_t il = 0; il < layers.size(); ++il) {
++            layer & l = layers[il];
++            if (l.ig < 0 || l.hist.empty()) {
++                continue;
++            }
++            group & g = groups[l.ig];
++            top.clear();
++            for (int32_t e = 0; e < (int32_t) l.hist.size(); ++e) {
++                if (l.hist[e] > 0) {
++                    top.push_back(e);
++                }
++            }
++            const size_t k = std::min<size_t>(std::min<size_t>((size_t) admit_k, top.size()), (size_t) g.n_slots);
++            std::partial_sort(top.begin(), top.begin() + k, top.end(), [&](int32_t a, int32_t b) { return l.hist[a] > l.hist[b]; });
++            top.resize(k);
++            std::fill(l.hist.begin(), l.hist.end(), 0);
++            if (k == 0) {
++                continue;
++            }
++            size_t n_hit = 0;
++            if (!g.slru.plan(il, top.data(), top.size(), 1, 0, [](size_t) { return (size_t) 0; }, rng, fills, cpu, n_hit)) {
++                continue;
++            }
++            ggml_backend_t backend = devices[g.id].backend;
++            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                const ggml_tensor * w    = l.experts[ip];
++                ggml_tensor       * bank = g.banks[ip];
++                const size_t expert_size = w->nb[2];
++                for (size_t i = 0; i < fills.size();) {
++                    size_t n = 1;
++                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                        n++;
++                    }
++                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                    bytes += n*expert_size;
++                    i += n;
++                }
++            }
++            n_layers++;
++            n_up += fills.size();
++        }
++        for (device & d : devices) {
++            if (d.buf) {
++                ggml_backend_synchronize(d.backend);
++            }
++        }
++        const double ms = (ggml_time_us() - t0)/1000.0;
++        stats_admit.prompts++;
++        stats_admit.layers   += n_layers;
++        stats_admit.uploaded += n_up;
++        stats_admit.bytes    += bytes;
++        stats_admit.ms       += ms;
++        LLAMA_LOG_INFO("llama_moe_cache: admitted the prompt's top %d experts of %zu layers: %zu uploaded, %.1f MiB, %.1f ms\n",
++            admit_k, n_layers, n_up, bytes/1024.0/1024.0, ms);
++    }
++
+     void log_stats() const {
+         auto log = [](const char * name, const stats & st) {
+             const size_t n = st.hits + st.misses;
+@@ -850,6 +1008,10 @@ struct llama_moe_cache::impl {
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
++        if (stats_admit.prompts > 0) {
++            LLAMA_LOG_INFO("llama_moe_cache: admission: %zu prompts, %zu layers, %zu experts uploaded, %.2f MiB, %.1f ms\n",
++                stats_admit.prompts, stats_admit.layers, stats_admit.uploaded, stats_admit.bytes/1024.0/1024.0, stats_admit.ms);
++        }
+     }
+ };
+ 
+@@ -895,6 +1057,18 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+ 
++int32_t llama_moe_cache::layer_of_weight(const ggml_tensor * w) const {
++    return pimpl->layer_of_weight(w);
++}
++
++void llama_moe_cache::note_prompt_ids(int32_t il, const int32_t * data, int64_t ne0, int64_t ne1, size_t nb0, size_t nb1) {
++    pimpl->note_prompt_ids(il, data, ne0, ne1, nb0, nb1);
++}
++
++void llama_moe_cache::note_prompt_ids_async(ggml_backend_t backend, int32_t il, const ggml_tensor * ids) {
++    pimpl->note_prompt_ids_async(backend, il, ids);
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 75dfde434..70ee62761 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -46,6 +46,14 @@ public:
+     // returns the number of experts copied, 0 if expert e is not in the cache
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
+ 
++    // prompt-informed admission (LLAMA_MOE_CACHE_ADMIT, default 32 experts per layer, 0 = off): the experts selected by large batches
++    // (prompt processing) are counted per layer; the first small batch after them loads the top experts of each layer into the cache,
++    // so generation after a prompt starts with the prompt's hot set instead of the previous generation's
++    int32_t layer_of_weight(const ggml_tensor * w) const;
++    void note_prompt_ids(int32_t il, const int32_t * data, int64_t ne0, int64_t ne1, size_t nb0, size_t nb1);
++    // for graphs in flight: the ids are read asynchronously into a host buffer of the cache and counted at admission
++    void note_prompt_ids_async(ggml_backend_t backend, int32_t il, const ggml_tensor * ids);
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+ private:
+-- 
+2.43.0
+

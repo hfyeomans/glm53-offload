@@ -1,0 +1,132 @@
+From 174ff9e591c3404e9751fed95bc8587ad71c6a20 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:45:20 -0600
+Subject: [PATCH 061/141] sched: ggml_backend_sched_set_transient_inputs makes
+ the inputs copied from another GPU transient (allocated per split, the source
+ stream waits for the destination first)
+
+---
+ ggml/include/ggml-backend.h |  3 +++
+ ggml/src/ggml-backend.cpp   | 50 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 67b736f3f..4a64dfc80 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -356,6 +356,9 @@ extern "C" {
+     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+ 
+     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
++    // the inputs that splits copy from another GPU are allocated and freed like intermediates, not kept for the whole graph in every
++    // pipeline copy (for graphs that cross between GPUs many times); applies to the graphs allocated after the call
++    GGML_API void                 ggml_backend_sched_set_transient_inputs(ggml_backend_sched_t sched, bool transient);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+ 
+     // Split graph without allocating it
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c84f3cb6c..1b877c2b6 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1223,6 +1223,8 @@ struct ggml_backend_sched {
+     int next_copy;
+     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+     ggml_backend_event_t input_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES]; // user inputs uploaded from the host copy
++    bool transient_inputs;                                          // 0060: cross-GPU inputs are not kept for the whole graph
++    ggml_backend_event_t transient_events[GGML_SCHED_MAX_BACKENDS]; // 0060: the destination's progress, waited on before such a copy
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -1264,6 +1266,21 @@ struct ggml_backend_sched {
+ #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
+ #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+ 
++// 0060: a GPU backend, and whether a split input is a transient copy (from another GPU, ggml_backend_sched_set_transient_inputs)
++static bool ggml_backend_sched_backend_is_gpu(ggml_backend_t b) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(b);
++    return dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
++}
++
++static bool ggml_backend_sched_input_is_transient(ggml_backend_sched_t sched, struct ggml_tensor * input, int split_backend_id) {
++    if (!sched->transient_inputs) {
++        return false;
++    }
++    const int input_backend_id = sched->hv_tensor_backend_ids[ggml_hash_find_or_insert(&sched->hash_set, input)];
++    return input_backend_id >= 0 && input_backend_id != split_backend_id &&
++        ggml_backend_sched_backend_is_gpu(sched->backends[input_backend_id]) && ggml_backend_sched_backend_is_gpu(sched->backends[split_backend_id]);
++}
++
+ // views of the inputs from the user (e.g. reshaped inputs) can be split inputs too
+ static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
+     return (t->flags & GGML_TENSOR_FLAG_INPUT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_INPUT));
+@@ -2025,6 +2042,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                 if (ggml_backend_sched_is_host_weight(input)) {
+                     continue; // not kept for the whole graph, the allocator reuses its memory after the split
+                 }
++                if (ggml_backend_sched_input_is_transient(sched, input, backend_id)) {
++                    continue; // 0060: likewise
++                }
+                 size_t id = hash_id(input);
+                 for (int c = 0; c < sched->n_copies; c++) {
+                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+@@ -2223,6 +2243,21 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         return;
+     }
+ 
++    // 0060: a transient copy may land in memory the destination's earlier work still reads; the copy runs on the source stream, so that
++    // stream first waits for everything issued on the destination so far
++    if (ggml_backend_sched_input_is_transient(sched, input, split_backend_id)) {
++        ggml_backend_event_t & ev = sched->transient_events[split_backend_id];
++        if (ev == NULL) {
++            ev = ggml_backend_event_new(ggml_backend_get_device(split_backend));
++        }
++        if (ev != NULL) {
++            ggml_backend_event_record(ev, split_backend);
++            ggml_backend_event_wait(input_backend, ev);
++        } else {
++            ggml_backend_synchronize(split_backend);
++        }
++    }
++
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+@@ -2309,7 +2344,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        // 0060: not between two GPUs with transient inputs, their buffers are distinct
++        const bool gpu_switch = sched->transient_inputs && prev_backend_id >= 0 &&
++            ggml_backend_sched_backend_is_gpu(sched->backends[prev_backend_id]) && ggml_backend_sched_backend_is_gpu(split_backend);
++        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !gpu_switch) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -2499,6 +2537,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ }
+ 
+ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
++    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
++        if (sched != NULL && sched->transient_events[b] != NULL) {
++            ggml_backend_event_free(sched->transient_events[b]); // 0060
++        }
++    }
+     if (sched == NULL) {
+         return;
+     }
+@@ -2702,6 +2745,11 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
+     return size;
+ }
+ 
++void ggml_backend_sched_set_transient_inputs(ggml_backend_sched_t sched, bool transient) {
++    GGML_ASSERT(sched);
++    sched->transient_inputs = transient;
++}
++
+ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
+     GGML_ASSERT(sched);
+     int backend_index = ggml_backend_sched_backend_id(sched, backend);
+-- 
+2.43.0
+

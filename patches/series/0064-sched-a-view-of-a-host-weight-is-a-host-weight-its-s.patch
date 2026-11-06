@@ -1,0 +1,112 @@
+From 1dff35533905a5d314d2fdde5dc1352be3e39627 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:56:43 -0600
+Subject: [PATCH 064/141] sched: a view of a host weight is a host weight (its
+ source buffer), and the copy callback uploads the TP expert views before the
+ first-node test
+
+---
+ ggml/src/ggml-backend.cpp | 16 +++++++++++++---
+ src/llama-context.cpp     | 35 +++++++++++++++++++----------------
+ 2 files changed, 32 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1b877c2b6..d56b1af66 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1288,9 +1288,11 @@ static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
+ 
+ // weights in host memory, uploaded to the backend of the split that uses them (op offload)
+ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+-    return t->buffer != NULL &&
+-        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-        ggml_backend_buffer_is_host(t->buffer);
++    // 0063: a view of a weight has no buffer until the allocator initializes it, after the graph is split; its source has one
++    ggml_backend_buffer_t buf = t->buffer != NULL ? t->buffer : t->view_src != NULL ? t->view_src->buffer : NULL;
++    return buf != NULL &&
++        ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++        ggml_backend_buffer_is_host(buf);
+ }
+ 
+ static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
+@@ -2273,6 +2275,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
+         ggml_sched_copy_account(4, tc0);
++        // 0063: GGML_SCHED_TIMING names the first synchronous copies
++        static int n_sync_logged = 0;
++        if (ggml_backend_sched_timing_enabled() && n_sync_logged < 12) {
++            n_sync_logged++;
++            GGML_LOG_INFO("sched sync copy: %s (%s, %s view of %s) %s -> %s, %.1f MiB\n", input->name, ggml_op_desc(input),
++                input->view_src ? "a" : "not a", input->view_src ? input->view_src->name : "-", ggml_backend_name(input_backend),
++                ggml_backend_name(split_backend), ggml_nbytes(input)/1024.0/1024.0);
++        }
+     }
+ }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 729424d3e..c475820fd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3041,8 +3041,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         return true;
+     }
+ 
+-    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer) ||
+-        ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++    // 0063: a view takes its source's buffer (the expert views of LLAMA_TP_PROMPT)
++    ggml_backend_buffer_t src_buf = src->buffer != nullptr ? src->buffer : src->view_src != nullptr ? src->view_src->buffer : nullptr;
++    if (src_buf == nullptr || !ggml_backend_buffer_is_host(src_buf) ||
++        ggml_backend_buffer_get_usage(src_buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+         return false;
+     }
+ 
+@@ -3072,23 +3074,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         return mx;
+     };
+ 
+-    // the ids must be computed before the split starts, so only the first node of the split is considered
+-    if (ggml_graph_n_nodes(graph) == 0) {
+-        return false;
+-    }
+-    const ggml_tensor * node = ggml_graph_node(graph, 0);
+-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+-        return false;
+-    }
+-
+-    const ggml_tensor * ids = node->src[2];
+-    if (ggml_nelements(ids) == 0) {
+-        return true;
+-    }
+-
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // 0063: before the first-node test below, the whole-view upload reads no ids
+     // 0061 LLAMA_TP_PROMPT: a card's experts in the prompt graph are a view of the host expert tensor (half of them): the whole view goes
+     // up in one copy, through the card's upload ring when there is one
+     if (src->view_src != nullptr && lctx->model.tp_devs.size() == 2) {
+@@ -3122,6 +3111,20 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         return true;
+     }
+ 
++    // the ids must be computed before the split starts, so only the first node of the split is considered
++    if (ggml_graph_n_nodes(graph) == 0) {
++        return false;
++    }
++    const ggml_tensor * node = ggml_graph_node(graph, 0);
++    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
++        return false;
++    }
++
++    const ggml_tensor * ids = node->src[2];
++    if (ggml_nelements(ids) == 0) {
++        return true;
++    }
++
+ #ifdef GGML_USE_CUDA
+     // LLAMA_MOE_RING_ONLY: the copy has no graph memory, give it a ring slot first (every path below fills dst->data)
+     if (!lctx->expert_placeholders.empty() && ggml_backend_is_cuda(backend)) {
+-- 
+2.43.0
+

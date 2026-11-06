@@ -1,0 +1,60 @@
+From d6dc1146237c0ad56bbf591d59a2f81f83a19cf5 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:53:52 -0600
+Subject: [PATCH 073/141] TP expert views: the MoE cache counts the prompt
+ routing ids for admission, once per layer
+
+---
+ src/llama-context.cpp | 15 +++++++++++++++
+ src/llama-context.h   |  2 ++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1d66dc110..a13e37dc2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3084,6 +3084,21 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     // 0061 LLAMA_TP_PROMPT: a card's experts in the prompt graph are a view of the host expert tensor (half of them): the whole view goes
+     // up in one copy, through the card's upload ring when there is one
+     if (src->view_src != nullptr && lctx->model.tp_devs.size() == 2) {
++        // 0072: the MoE cache counts the prompt's routing for admission, as on the layer-split path (once per layer: both cards carry
++        // the same ids, read on this card's stream behind their copy)
++        if (lctx->moe_cache) {
++            const int32_t il_n = lctx->moe_cache->layer_of_weight(src->view_src);
++            if (il_n >= 0 && il_n != st.tp_noted_il) {
++                for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++                    const ggml_tensor * node = ggml_graph_node(graph, i);
++                    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst) {
++                        lctx->moe_cache->note_prompt_ids_async(backend, il_n, node->src[2]);
++                        st.tp_noted_il = il_n;
++                        break;
++                    }
++                }
++            }
++        }
+ #ifdef GGML_USE_CUDA
+         static const bool tp_ring = getenv("LLAMA_MOE_UPLOAD_RING") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING")) != 0;
+         if (tp_ring && ggml_backend_is_cuda(backend) && ggml_backend_cuda_host_ptr_device_accessible(src->data)) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b2452d158..6ac7d0725 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -394,6 +394,7 @@ private:
+         int32_t ring_il = -1; // the layer of the last expert tensor gathered into the upload ring (a change starts a new slot)
+         std::map<ggml_backend_t, int32_t> tp_ring_il; // 0061: the same per backend, for the expert views of LLAMA_TP_PROMPT
+         size_t tp_ring_slot = 0;                      // 0061: the largest half layer of experts, the ring's slot size for those views
++        int32_t tp_noted_il = -1;                     // 0072: the last layer whose prompt ids the MoE cache was given
+         std::map<ggml_backend_dev_t, size_t> ring_split_max; // 0054: the largest MoE split per device (kept across graphs)
+ 
+         bool    timing = false;
+@@ -406,6 +407,7 @@ private:
+             ids_noted = nullptr;
+             ring_il = -1;
+             tp_ring_il.clear();
++            tp_noted_il = -1;
+             ids_data.clear();
+             used.clear();
+             upload_all = false;
+-- 
+2.43.0
+

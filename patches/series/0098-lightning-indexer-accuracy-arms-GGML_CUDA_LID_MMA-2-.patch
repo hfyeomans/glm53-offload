@@ -1,0 +1,86 @@
+From ea5b93ecba523a72f526d3f9b54ac9c0cb3d04cc Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:34:39 -0600
+Subject: [PATCH 098/141] lightning indexer accuracy arms: GGML_CUDA_LID_MMA=2
+ (fresh accumulator per 16-dim step, f32 adds) and GGML_CUDA_LID_VEC=1 (the
+ f32 vector kernel)
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 33 ++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index f17469f4c..fe3ee1379 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -593,6 +593,7 @@ static __device__ __forceinline__ uint32_t lid_pack_h2(const float2 v) {
+     return *(const uint32_t *) &h;
+ }
+ 
++template <bool SPLIT_ACC>
+ __launch_bounds__(LID_MMA_QPB*WARP_SIZE, 2)
+ static __global__ void lightning_indexer_kernel_mma(
+         const float * __restrict__ Q, const half * __restrict__ K16, const float * __restrict__ W, const half * __restrict__ M,
+@@ -684,8 +685,20 @@ static __global__ void lightning_indexer_kernel_mma(
+                     const int key = 32*ht + 8*j + lane/4;
+                     const uint32_t b0 = kt[(key*LID_MMA_KSTR + 16*s + 2*(lane % 4))/2];
+                     const uint32_t b1 = kt[(key*LID_MMA_KSTR + 16*s + 2*(lane % 4) + 8)/2];
+-                    lid_mma_16816(c[0][j], a[0][s], b0, b1);
+-                    lid_mma_16816(c[1][j], a[1][s], b0, b1);
++                    if constexpr (SPLIT_ACC) {
++                        // 0099: each 16-dim step from zero, the steps added in f32 (the wmma kernel's order)
++                        float p0[4] = {}, p1[4] = {};
++                        lid_mma_16816(p0, a[0][s], b0, b1);
++                        lid_mma_16816(p1, a[1][s], b0, b1);
++#pragma unroll
++                        for (int e = 0; e < 4; ++e) {
++                            c[0][j][e] += p0[e];
++                            c[1][j][e] += p1[e];
++                        }
++                    } else {
++                        lid_mma_16816(c[0][j], a[0][s], b0, b1);
++                        lid_mma_16816(c[1][j], a[1][s], b0, b1);
++                    }
+                 }
+             }
+             // sum_h w_h relu(.) over this thread's 4 head rows, then over the 8 row groups (lanes with the same lane % 4)
+@@ -799,7 +812,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+     // 0096 GGML_CUDA_LID_MMA=1: 32 heads x 128 on Ampere+ NVIDIA as a tensor-core tile
+-    static const bool lid_mma = getenv("GGML_CUDA_LID_MMA") != nullptr && atoi(getenv("GGML_CUDA_LID_MMA")) != 0;
++    static const int  lid_mma_mode = getenv("GGML_CUDA_LID_MMA") != nullptr ? atoi(getenv("GGML_CUDA_LID_MMA")) : 0;
++    static const bool lid_mma = lid_mma_mode != 0;
+     if (lid_mma && n_embd == 128 && n_head == 32 && GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc) &&
+             nbq0 == sizeof(float) && nbw0 == sizeof(float) && n_kv % 2 == 0 && nbm1 % 4 == 0 && nb1 % 8 == 0 &&
+             (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q4_1 ||
+@@ -819,8 +833,13 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+         }
+         const dim3 block(WARP_SIZE, LID_MMA_QPB, 1);
+         const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + LID_MMA_KPB - 1)/LID_MMA_KPB), (unsigned) n_stream);
+-        lightning_indexer_kernel_mma<<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-            nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++        if (lid_mma_mode == 2) {
++            lightning_indexer_kernel_mma<true><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++        } else {
++            lightning_indexer_kernel_mma<false><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++        }
+         return;
+     }
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -868,7 +887,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+         }
+     } else if (n_embd == 128 && n_head == 32) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
++        // 0099 GGML_CUDA_LID_VEC=1: the f32 vector kernel, a reference
++        static const bool lid_vec = getenv("GGML_CUDA_LID_VEC") != nullptr && atoi(getenv("GGML_CUDA_LID_VEC")) != 0;
++        if (!lid_vec && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+             // use wmma kernel
+             constexpr int K_VECS_PER_BLOCK = 32;
+             constexpr int WARPS_PER_BLOCK = 8;
+-- 
+2.43.0
+

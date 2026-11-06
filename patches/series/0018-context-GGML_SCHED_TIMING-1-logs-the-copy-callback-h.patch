@@ -1,0 +1,111 @@
+From 8e3fe2205f248cbb45cee34ec6dc6ef7c6181ffe Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:51:27 -0600
+Subject: [PATCH 018/141] context: GGML_SCHED_TIMING=1 logs the copy callback
+ host time per path (cache copy, gather, upload, ids read + sync) per batched
+ graph
+
+---
+ src/llama-context.cpp | 30 ++++++++++++++++++++++++++++++
+ src/llama-context.h   |  7 +++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ce730b1d9..a9c1e4eaa 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2898,7 +2898,19 @@ ggml_status llama_context::graph_compute(
+     copy_experts.prev_in_flight = copy_experts.in_flight;
+     copy_experts.in_flight      = true;
+ 
++    static const bool copy_timing = getenv("GGML_SCHED_TIMING") != nullptr && atoi(getenv("GGML_SCHED_TIMING")) > 0;
++    copy_experts.timing = copy_timing;
++
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++
++    if (copy_timing && batched) {
++        auto & st = copy_experts;
++        LLAMA_LOG_INFO("copy experts: cache %.1f ms (%d), gather %.1f ms (%d), upload %.1f ms (%d), ids sync %.1f ms (%d), other %.1f ms (%d), upload_all %d, prev_in_flight %d\n",
++            st.t_path[0]/1000.0, st.n_path[0], st.t_path[1]/1000.0, st.n_path[1], st.t_path[2]/1000.0, st.n_path[2],
++            st.t_path[3]/1000.0, st.n_path[3], st.t_path[4]/1000.0, st.n_path[4], (int) st.upload_all, (int) st.prev_in_flight);
++        memset(st.t_path, 0, sizeof(st.t_path));
++        memset(st.n_path, 0, sizeof(st.n_path));
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+@@ -2911,8 +2923,22 @@ ggml_status llama_context::graph_compute(
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+     auto * lctx = static_cast<llama_context *>(user_data);
+ 
++    // GGML_SCHED_TIMING=1: the host time of this call goes to the path set before its return (see copy_experts_info)
++    struct path_timer {
++        copy_experts_info & st;
++        int64_t t0;
++        ~path_timer() {
++            if (t0 != 0) {
++                st.t_path[st.cur_path] += ggml_time_us() - t0;
++                st.n_path[st.cur_path] += 1;
++            }
++        }
++    } path_timer_{lctx->copy_experts, lctx->copy_experts.timing ? ggml_time_us() : 0};
++    lctx->copy_experts.cur_path = 4;
++
+     // the slot maps of the MoE cache and the inputs of its CPU part
+     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
++        lctx->copy_experts.cur_path = 0;
+         return true;
+     }
+ 
+@@ -2965,6 +2991,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         is_twin = is_twin || pt.second == backend;
+     }
+     if (is_twin && lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++        st.cur_path = 1;
+         return true;
+     }
+     if (is_twin && lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
+@@ -3008,6 +3035,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             }
+             // upload all the experts, the cached ones from the device banks: the slot map is host memory, so no wait for the ids
+             if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++                st.cur_path = 1;
+                 return true;
+             }
+             if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
+@@ -3027,12 +3055,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 if (next < n_expert) {
+                     ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
+                 }
++                st.cur_path = 2;
+                 return true;
+             }
+             return false;
+         }
+     }
+ 
++    st.cur_path = 3;
+     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 3657ef764..e7ddb1498 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -386,6 +386,13 @@ private:
+         bool prev_in_flight = false;
+         bool in_flight      = false;
+ 
++        // GGML_SCHED_TIMING=1: host time of the callback per path (0 MoE cache copy, 1 gather kernel, 2 per-expert upload,
++        // 3 ids read + synchronize, 4 other), printed and cleared by graph_compute
++        bool    timing = false;
++        int     cur_path = 4;
++        int64_t t_path[5] = {};
++        int     n_path[5] = {};
++
+         void reset() {
+             ids = nullptr;
+             ids_noted = nullptr;
+-- 
+2.43.0
+

@@ -1,0 +1,229 @@
+From 711eab0b06089400328596e445e793209a1b62da Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 19:43:29 -0600
+Subject: [PATCH 046/141] moe-cache: LLAMA_MOE_ASYNC_FILL_TOKENS=n fills small
+ batches of up to n tokens asynchronously (zero slots chosen per token) and
+ makes a layer wait only for its own earlier side fills
+
+---
+ ggml/include/ggml-cuda.h        |  2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  8 +++
+ src/llama-moe-cache.cpp         | 97 ++++++++++++++++++++++++++++-----
+ 3 files changed, 93 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 5f4e93791..521e38510 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -43,6 +43,8 @@ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t back
+ // for every side upload issued since the last wait
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_async(ggml_backend_t backend, void * dst, const void * src, size_t bytes);
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend);
++// records the event behind the side uploads issued so far (0045), for a wait on just those
++GGML_BACKEND_API void ggml_backend_cuda_side_upload_record(ggml_backend_t backend, ggml_backend_event_t event);
+ 
+ // upload ring without the gather: reserve `bytes` in the current slot (`first_of_split` starts the next slot) and return its device
+ // address, the main stream ordered after the ring stream; copy_commit fills it from the host on the ring stream and makes the main
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 46a427c00..60800a4d1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7141,6 +7141,14 @@ void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend) {
+     r.side_pending = false;
+ }
+ 
++void ggml_backend_cuda_side_upload_record(ggml_backend_t backend, ggml_backend_event_t event) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    ggml_cuda_upload_ring_init(r);
++    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event->context, r.stream));
++}
++
+ void * ggml_backend_cuda_upload_ring_reserve(ggml_backend_t backend, bool first_of_split, size_t bytes, size_t split_bytes) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     const int dev = cuda_ctx->device;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 3b4001a12..6f7064fad 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -296,6 +296,8 @@ struct llama_moe_cache::impl {
+         std::vector<int32_t> last_ids;      // the experts selected at the last small-batch lookup (LLAMA_MOE_PROBE)
+         ggml_tensor * pred = nullptr;       // LLAMA_MOE_PREFETCH: the graph's prediction of this layer's experts, per graph build
+         std::vector<std::pair<int32_t, int32_t>> pending_fills; // LLAMA_MOE_ASYNC_FILL: (expert, slot) uploaded on the side stream
++        ggml_backend_event_t fill_ev = nullptr; // LLAMA_MOE_ASYNC_FILL_TOKENS: recorded on the side stream behind the layer's last fills there
++        bool fill_ev_pending = false;           // the layer's next hits wait for fill_ev
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
+@@ -379,6 +381,12 @@ struct llama_moe_cache::impl {
+         static const bool v = getenv("LLAMA_MOE_ASYNC_FILL") != nullptr && atoi(getenv("LLAMA_MOE_ASYNC_FILL")) != 0;
+         return v;
+     }
++    // LLAMA_MOE_ASYNC_FILL_TOKENS=n (0045): asynchronous fills for small batches of up to n tokens, and a layer's hits wait for its own
++    // earlier fills by an event (0: one token, and the hits wait for every side upload)
++    static int32_t async_fill_tokens() {
++        static const int32_t v = getenv("LLAMA_MOE_ASYNC_FILL_TOKENS") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_ASYNC_FILL_TOKENS"))) : 0;
++        return v;
++    }
+     static float route_bias_value() {
+         static const float v = getenv("LLAMA_MOE_ROUTE_BIAS") != nullptr ? (float) atof(getenv("LLAMA_MOE_ROUTE_BIAS")) : 0.0f;
+         return v;
+@@ -439,6 +447,7 @@ struct llama_moe_cache::impl {
+     }
+     std::unordered_map<ggml_backend_t, ggml_backend_event_t> ev_ids; // one per backend: an event belongs to its device
+     std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
++    std::vector<uint8_t> fill_async; // per fill of the last plan: uploaded on the side stream (0045)
+ 
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+@@ -1117,6 +1126,11 @@ struct llama_moe_cache::impl {
+             }
+             l.pending_fills.clear();
+         }
++        if (l.fill_ev_pending) {
++            // LLAMA_MOE_ASYNC_FILL_TOKENS: the hits of this layer read the slots filled at its last lookup
++            ggml_backend_event_wait(backend, l.fill_ev);
++            l.fill_ev_pending = false;
++        }
+ 
+         if (trace != nullptr) {
+             write_trace(il, it_cpu != cpu_parts.end() ? it_cpu->second.n_used : n_expert_used);
+@@ -1149,24 +1163,68 @@ struct llama_moe_cache::impl {
+         // slot reads zeros, and their uploads go on the side stream; the slots are published at the next lookup of the layer
+         bool async_fill = false;
+ #ifdef GGML_USE_CUDA
+-        async_fill = async_fill_enabled() && has_cpu && ids.size() == (size_t) n_expert_used && !fills.empty() && ggml_backend_is_cuda(backend);
++        {
++            // one token, or with LLAMA_MOE_ASYNC_FILL_TOKENS up to that many (the MTP verify)
++            const size_t n_tok_af = has_cpu ? ids.size() / (size_t) it_cpu->second.n_used : 0;
++            async_fill = async_fill_enabled() && has_cpu && !fills.empty() && ggml_backend_is_cuda(backend) &&
++                (ids.size() == (size_t) n_expert_used || (async_fill_tokens() > 0 && n_tok_af <= (size_t) async_fill_tokens()));
++        }
+         if (async_fill_enabled() && !async_fill && !fills.empty() && ggml_backend_is_cuda(backend)) {
+             // a main-stream fill must not race an older side upload into the same slot
+             ggml_backend_cuda_side_upload_wait(backend);
+         }
+ #endif
++        // a fill computed on the CPU reads a zero slot that no token of the batch uses twice (the planner's rule for its CPU misses);
++        // one that finds none left is uploaded on the main stream and computed on the device
++        fill_async.assign(fills.size(), 0);
++        size_t n_async = 0;
+         if (async_fill) {
+             int32_t * cpu_map = (int32_t *) l.cpu_map->data;
+             int32_t * slots_af = g.slru.slot_map[il];
+-            int32_t z = (int32_t) cpu.size();
+-            for (const auto & f : fills) {
+-                GGML_ASSERT(z < n_zero);
+-                slots_af[f.expert] = g.slru.n_slots + z++;
+-                cpu_map[f.expert] = f.expert;
+-                l.cpu_experts.push_back(f.expert);
+-                l.pending_fills.push_back({ f.expert, f.slot });
++            const int32_t n_used_af = it_cpu->second.n_used;
++            const size_t  n_tok_af  = ids.size() / (size_t) n_used_af;
++            std::vector<uint64_t> & tz = g.slru.token_zero;
++            if (cpu.empty() || tz.size() != n_tok_af) {
++                tz.assign(n_tok_af, 0); // left from an earlier batch: the planner sets them only for its CPU misses
+             }
+-            win_async += fills.size();
++            for (size_t i = 0; i < fills.size(); ++i) {
++                const int32_t e = fills[i].expert;
++                uint64_t used = 0;
++                for (size_t it = 0; it < n_tok_af; ++it) {
++                    for (int32_t k = 0; k < n_used_af; ++k) {
++                        if (ids[it*n_used_af + k] == e) {
++                            used |= tz[it];
++                        }
++                    }
++                }
++                int32_t z = 0;
++                while (z < n_zero && (used >> z & 1)) {
++                    z++;
++                }
++                if (z >= n_zero) {
++                    continue;
++                }
++                for (size_t it = 0; it < n_tok_af; ++it) {
++                    for (int32_t k = 0; k < n_used_af; ++k) {
++                        if (ids[it*n_used_af + k] == e) {
++                            tz[it] |= 1ull << z;
++                        }
++                    }
++                }
++                fill_async[i] = 1;
++                n_async++;
++                slots_af[e] = g.slru.n_slots + z;
++                cpu_map[e] = e;
++                l.cpu_experts.push_back(e);
++                l.pending_fills.push_back({ e, fills[i].slot });
++            }
++            win_async += n_async;
++#ifdef GGML_USE_CUDA
++            if (n_async < fills.size()) {
++                // a main-stream fill must not race an older side upload into the same slot
++                ggml_backend_cuda_side_upload_wait(backend);
++            }
++#endif
+         }
+ 
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+@@ -1177,11 +1235,11 @@ struct llama_moe_cache::impl {
+             const size_t expert_size = w->nb[2];
+             for (size_t i = 0; i < fills.size();) {
+                 size_t n = 1;
+-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                while (i + n < fills.size() && fill_async[i + n] == fill_async[i] && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+ #ifdef GGML_USE_CUDA
+-                if (async_fill) {
++                if (fill_async[i]) {
+                     ggml_backend_cuda_side_upload_async(backend, (uint8_t *) bank->data + fills[i].slot*expert_size,
+                         (const uint8_t *) w->data + fills[i].expert*expert_size, n*expert_size);
+                 } else
+@@ -1194,6 +1252,17 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++#ifdef GGML_USE_CUDA
++        if (n_async > 0 && async_fill_tokens() > 0) {
++            if (l.fill_ev == nullptr) {
++                l.fill_ev = ggml_backend_event_new(ggml_backend_get_device(backend));
++                GGML_ASSERT(l.fill_ev != nullptr);
++            }
++            ggml_backend_cuda_side_upload_record(backend, l.fill_ev);
++            l.fill_ev_pending = true;
++        }
++#endif
++
+         // LLAMA_MOE_ROUTE_BIAS: the selection bias of this layer for the next token, d for the cached experts (the pending fills included)
+         if (l.route_bias != nullptr) {
+             const float d = route_bias_value();
+@@ -1216,13 +1285,13 @@ struct llama_moe_cache::impl {
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+         st.misses += fills.size() + cpu.size();
+-        st.cpu    += cpu.size() + (async_fill ? fills.size() : 0);
++        st.cpu    += cpu.size() + n_async;
+         st.bytes  += bytes;
+ 
+         if (log_every > 0 && ids.size() <= (size_t) 8*n_expert_used) {
+             win.hits   += n_hit;
+             win.misses += fills.size() + cpu.size();
+-            win.cpu    += cpu.size() + (async_fill ? fills.size() : 0);
++            win.cpu    += cpu.size() + n_async;
+             win.bytes  += bytes;
+             if (il_first < 0 || il < il_first) {
+                 il_first = il;
+@@ -1243,7 +1312,7 @@ struct llama_moe_cache::impl {
+ #ifdef GGML_USE_CUDA
+         // the hits of this layer wait for the side uploads issued for it (the prefetch of the previous layer, the asynchronous fills of
+         // the last token published above)
+-        if ((prefetch_enabled() || async_fill_enabled()) && ggml_backend_is_cuda(backend)) {
++        if ((prefetch_enabled() || (async_fill_enabled() && async_fill_tokens() == 0)) && ggml_backend_is_cuda(backend)) {
+             ggml_backend_cuda_side_upload_wait(backend);
+         }
+ #endif
+-- 
+2.43.0
+

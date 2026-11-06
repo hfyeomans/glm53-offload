@@ -1,0 +1,59 @@
+From 67eb13525fb9db22624cb8e4fc6ecced124114ce Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:54:34 -0600
+Subject: [PATCH 112/141] layer-major prompt graph: the expert copy callback
+ uploads whole layers for it (its FFN blocks share one copy; the selective
+ path read only the first block routing), and decode takes it only for batches
+ of LLAMA_LM_MIN_TOKENS (2048) or more
+
+---
+ src/llama-context.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 96f687cb6..32e8fbcb3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -878,6 +878,10 @@ static uint32_t llama_lm_pipe() {
+     static const uint32_t v = getenv("LLAMA_LM_PIPE") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_PIPE"))) : 6;
+     return v;
+ }
++static uint32_t llama_lm_min_tokens() {
++    static const uint32_t v = getenv("LLAMA_LM_MIN_TOKENS") != nullptr ? (uint32_t) std::max(9, atoi(getenv("LLAMA_LM_MIN_TOKENS"))) : 2048;
++    return v;
++}
+ static uint32_t llama_lm_min_ub() {
+     static const uint32_t v = getenv("LLAMA_LM_MIN_UB") != nullptr ? (uint32_t) std::max(1, atoi(getenv("LLAMA_LM_MIN_UB"))) : 8192;
+     return v;
+@@ -2243,7 +2247,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     const uint32_t lm_R = llama_lm_rows();
+     uint32_t n_ub = lm_on ? std::min(cparams.n_ubatch, llama_lm_fallback_ub()) : cparams.n_ubatch;
+     bool lm_try = false;
+-    if (lm_on && balloc->get_n_tokens() > 8) {
++    // 0113: only a batch of LLAMA_LM_MIN_TOKENS or more (default 2048); a shorter one keeps the usual graph and its selective upload
++    if (lm_on && balloc->get_n_tokens() >= llama_lm_min_tokens()) {
+         // 0111: k = min(LLAMA_LM_PIPE, ceil(n / LLAMA_LM_MIN_UB)) balanced ubatches, each a multiple of 256 rows, at most n_ubatch
+         const uint32_t n_all = balloc->get_n_tokens();
+         const uint32_t k = std::max(1u, std::min(llama_lm_pipe(), (n_all + llama_lm_min_ub() - 1)/llama_lm_min_ub()));
+@@ -3479,13 +3484,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     // with pipeline parallelism, reading the ids would stall the graphs in flight, so upload all the experts of a large batch:
+     // 16 ids per expert while a previous graph runs, else a full batch with 64 ids per expert (the graph may be alone)
+     // the flag stays for the rest of the graph, e.g. for the last layer on the output rows
+-    if (lctx->cparams.pipeline_parallel) {
++    // 0113: a layer-major graph (cparams.lm_rows > 0) always uploads the whole layer: its FFN blocks share one copy, and the selective path
++    // below would upload only the experts of the first block's routing
++    if (lctx->cparams.pipeline_parallel || lctx->cparams.lm_rows > 0) {
+         const int64_t n_ids      = ggml_nelements(ids);
+         const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
+         // 64 ids per expert is enough for the upload whether or not the ubatch is full: a partial first ubatch (a prompt shorter than
+         // n_ubatch) otherwise reads its ids per layer with a synchronize each (LLAMA_MOE_UPLOAD_ALL_FULL_ONLY=1 restores the old rule)
+         static const bool full_only = getenv("LLAMA_MOE_UPLOAD_ALL_FULL_ONLY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_ALL_FULL_ONLY")) != 0;
+-        st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : (full_batch || !full_only) && n_ids >= 64*n_expert);
++        st.upload_all = st.upload_all || lctx->cparams.lm_rows > 0 ||
++            (st.prev_in_flight ? n_ids >= 16*n_expert : (full_batch || !full_only) && n_ids >= 64*n_expert);
+         if (st.upload_all) {
+             // the ids are not read here (it would stall the graphs in flight); the MoE cache counts them asynchronously for admission
+             if (lctx->moe_cache && ids != st.ids_noted) {
+-- 
+2.43.0
+

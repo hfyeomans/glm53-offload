@@ -1,0 +1,159 @@
+From e27a251cff860b23e28dca0d1a2961caf8eed871 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 16:59:24 -0600
+Subject: [PATCH 122/141] GGML_GALLOCR_PEAK=MiB (diagnostic): the graph
+ allocator names the tensors live at each buffer high-water mark
+
+---
+ ggml/src/ggml-alloc.c | 91 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 6d641dc14..b37c99749 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -130,8 +130,26 @@ struct ggml_dyn_tallocr {
+         struct buffer_address addr;
+     } allocated_tensors[1024];
+ #endif
++
++    // 0122 GGML_GALLOCR_PEAK=MiB: the tensors live now, and at the high-water mark
++    struct gallocr_live { const struct ggml_tensor * t; struct buffer_address addr; size_t size; } * live, * peak;
++    int n_live, n_peak, cap;
++    size_t peak_end;
++    int peak_chunk;
+ };
+ 
++static size_t gallocr_peak_mib(void) {
++    static long v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_GALLOCR_PEAK");
++        v = e != NULL ? atol(e) : 0;
++        if (v < 0) {
++            v = 0;
++        }
++    }
++    return (size_t) v;
++}
++
+ static void ggml_dyn_tallocr_insert_block(struct tallocr_chunk * chunk, size_t offset, size_t size) {
+     GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS && "out of free blocks");
+     // insert the new block in the correct position to keep the array sorted by address (to make merging blocks faster)
+@@ -301,6 +319,23 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
+     }
+ #endif
+ 
++    if (gallocr_peak_mib() > 0 && tensor != NULL) { // 0122
++        if (alloc->live == NULL) {
++            alloc->cap  = 16384;
++            alloc->live = (struct gallocr_live *) calloc(alloc->cap, sizeof(*alloc->live));
++            alloc->peak = (struct gallocr_live *) calloc(alloc->cap, sizeof(*alloc->peak));
++        }
++        if (alloc->live != NULL && alloc->n_live < alloc->cap) {
++            alloc->live[alloc->n_live++] = (struct gallocr_live) { tensor, addr, size };
++        }
++        if (alloc->live != NULL && addr.offset + size > chunk->max_size) {
++            memcpy(alloc->peak, alloc->live, alloc->n_live*sizeof(*alloc->live));
++            alloc->n_peak     = alloc->n_live;
++            alloc->peak_end   = addr.offset + size;
++            alloc->peak_chunk = addr.chunk;
++        }
++    }
++
+     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
+ 
+     return addr;
+@@ -355,6 +390,9 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
+         alloc->chunks[i] = NULL;
+     }
+     alloc->n_chunks = 0;
++    alloc->n_live   = 0; // 0122
++    alloc->n_peak   = 0;
++    alloc->peak_end = 0;
+ 
+ #ifdef GGML_ALLOCATOR_DEBUG
+     for (int i = 0; i < 1024; i++) {
+@@ -374,6 +412,7 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
+ #ifdef GGML_ALLOCATOR_DEBUG
+         /*.allocated_tensors = */ {{0}},
+ #endif
++        /*.live = */ NULL, /*.peak = */ NULL, /*.n_live = */ 0, /*.n_peak = */ 0, /*.cap = */ 0, /*.peak_end = */ 0, /*.peak_chunk = */ 0,
+     };
+ 
+     ggml_dyn_tallocr_reset(alloc);
+@@ -385,6 +424,8 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
+     for (int i = 0; i < alloc->n_chunks; ++i) {
+         free(alloc->chunks[i]);
+     }
++    free(alloc->live); // 0122
++    free(alloc->peak);
+     free(alloc);
+ }
+ 
+@@ -721,6 +762,14 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
+ #ifdef GGML_ALLOCATOR_DEBUG
+     remove_allocated_tensor(alloc, hn->addr, node);
+ #endif
++    if (alloc->live != NULL) { // 0122
++        for (int i = alloc->n_live - 1; i >= 0; --i) {
++            if (alloc->live[i].addr.chunk == hn->addr.chunk && alloc->live[i].addr.offset == hn->addr.offset) {
++                alloc->live[i] = alloc->live[--alloc->n_live];
++                break;
++            }
++        }
++    }
+ 
+     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
+     hn->allocated = false;
+@@ -960,6 +1009,48 @@ static bool ggml_gallocr_reserve_n_impl(
+         }
+     }
+ 
++    // 0122 GGML_GALLOCR_PEAK=MiB: the tensors live at each buffer's high-water mark, largest first
++    if (gallocr_peak_mib() > 0) {
++        const size_t min_bytes = gallocr_peak_mib()*1024*1024;
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            struct ggml_dyn_tallocr * a = galloc->buf_tallocs[i];
++            bool dup = false;
++            for (int j = 0; j < i; j++) {
++                dup = dup || galloc->buf_tallocs[j] == a;
++            }
++            if (dup || a->peak == NULL || a->peak_end < ((size_t) 1 << 30)) {
++                continue;
++            }
++            for (int x = 1; x < a->n_peak; x++) { // insertion sort, largest first
++                struct gallocr_live v = a->peak[x];
++                int y = x - 1;
++                while (y >= 0 && a->peak[y].size < v.size) {
++                    a->peak[y + 1] = a->peak[y];
++                    y--;
++                }
++                a->peak[y + 1] = v;
++            }
++            size_t listed = 0, rest = 0;
++            int n_rest = 0;
++            GGML_LOG_INFO("gallocr peak: %s chunk %d at %.1f MiB, %d tensors live, %d nodes in the graph:\n",
++                ggml_backend_buft_name(galloc->bufts[i]), a->peak_chunk, a->peak_end/1024.0/1024.0, a->n_peak, graph->n_nodes);
++            for (int x = 0; x < a->n_peak; x++) {
++                const struct ggml_tensor * t = a->peak[x].t;
++                if (a->peak[x].size >= min_bytes && x < 40) {
++                    GGML_LOG_INFO("gallocr peak:   %8.1f MiB at %8.1f  %-28s %-14s [%lld, %lld, %lld, %lld] %s\n", a->peak[x].size/1024.0/1024.0,
++                        a->peak[x].addr.offset/1024.0/1024.0, t->name, ggml_op_desc(t), (long long) t->ne[0], (long long) t->ne[1],
++                        (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
++                    listed += a->peak[x].size;
++                } else {
++                    rest += a->peak[x].size;
++                    n_rest++;
++                }
++            }
++            GGML_LOG_INFO("gallocr peak:   listed %.1f MiB, %d more %.1f MiB, fragmentation/alignment %.1f MiB\n", listed/1024.0/1024.0,
++                n_rest, rest/1024.0/1024.0, (a->peak_end - (double) listed - (double) rest)/1024.0/1024.0);
++        }
++    }
++
+     return true;
+ }
+ 
+-- 
+2.43.0
+

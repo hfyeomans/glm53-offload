@@ -1,0 +1,72 @@
+From 57cc7356fdc51ef4ee04a693ac7b9f900766bf6f Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 15:31:22 -0600
+Subject: [PATCH 038/141] cuda mmvq: LLAMA_MMVQ_MOE_RPB=2|4|8 selects the rows
+ per block of the multi-token MoE matvec kernel at runtime (default 2)
+
+---
+ ggml/src/ggml-cuda/mmvq.cu | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 1a9cf55cb..c8f46a636 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1075,8 +1075,22 @@ static void mul_mat_vec_q_switch_fusion(
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+ }
+ 
+-template <ggml_type type>
+-static void mul_mat_vec_q_moe_launch(
++// LLAMA_MMVQ_MOE_RPB=2|4|8: rows per block of the multi-token MoE kernel (0037; default 2 = upstream)
++static int ggml_cuda_mmvq_moe_rpb() {
++    static const int rpb = [] {
++        const char * s = getenv("LLAMA_MMVQ_MOE_RPB");
++        const int v = s ? atoi(s) : 2;
++        const int r = (v == 4 || v == 8) ? v : 2;
++        if (s) {
++            GGML_LOG_INFO("%s: multi-token MoE matvec at %d rows per block\n", __func__, r);
++        }
++        return r;
++    }();
++    return rpb;
++}
++
++template <ggml_type type, int rows_per_block>
++static void mul_mat_vec_q_moe_launch_rpb(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+@@ -1084,7 +1098,6 @@ static void mul_mat_vec_q_moe_launch(
+         const uint32_t ncols_dst, const uint32_t ids_stride,
+         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+ 
+-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
+     const dim3 block_dims(warp_size, ncols_dst);
+@@ -1108,6 +1121,21 @@ static void mul_mat_vec_q_moe_launch(
+     }
+ }
+ 
++template <ggml_type type>
++static void mul_mat_vec_q_moe_launch(
++        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
++        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
++        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
++        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
++        const uint32_t ncols_dst, const uint32_t ids_stride,
++        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
++    switch (ggml_cuda_mmvq_moe_rpb()) {
++        case 4:  mul_mat_vec_q_moe_launch_rpb<type, 4>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream); break;
++        case 8:  mul_mat_vec_q_moe_launch_rpb<type, 8>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream); break;
++        default: mul_mat_vec_q_moe_launch_rpb<type, 2>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream); break;
++    }
++}
++
+ template <ggml_type type>
+ static void mul_mat_vec_q_switch_ncols_dst(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+-- 
+2.43.0
+

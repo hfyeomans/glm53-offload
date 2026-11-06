@@ -1,0 +1,49 @@
+From 048ed6610ab7c7bd115796a09c8dbf9b17c2172b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:17:45 -0600
+Subject: [PATCH 109/141] glm-dsa: publish layer inputs (t_layer_inp) for a
+ speculative draft that reads target hidden states (DFlash); the both-cards
+ prompt graph concatenates its token halves for a requested layer only
+
+---
+ src/models/glm-dsa.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index edd024fdc..cffa60a34 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -327,6 +327,14 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             const auto & L = model.layers[il];
+             const int H = model.tp_home(il);
+ 
++            // 0109: a layer input a speculative draft reads (DFlash target features): both token halves, on the layer's home card
++            if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                res->t_layer_inp[il] = ggml_concat(ctx0, x[0], x[1], 1);
++                ggml_build_forward_expand(gf, res->t_layer_inp[il]);
++                pin_from(n0, H);
++            }
++
+             // the projections of each card's tokens
+             ggml_tensor * Qc[2], * Kc[2];
+             ggml_tensor * IQc[2] = { nullptr, nullptr }, * IKc[2] = { nullptr, nullptr }, * IWc[2] = { nullptr, nullptr };
+@@ -638,6 +646,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             const auto & L = model.layers[il];
+             ggml_tensor * Z    = z_of(il);
+             ggml_tensor * x_sa = x;
++            res->t_layer_inp[il] = x; // 0109
+ 
+             ggml_tensor * cur = build_norm(x, L.attn_norm, NULL, LLM_NORM_RMS, il);
+             ggml_tensor * qr  = ggml_mul_mat(ctx0, L.wq_a, cur);
+@@ -816,6 +825,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     }
+     for (int il = 0; il < n_layer; ++il) {
+         ggml_tensor * inpSA = inpL;
++        res->t_layer_inp[il] = inpL; // 0109: the layer input a speculative draft may read (DFlash target features)
+         if (moe_probe_enabled() && n_tokens == 1) {
+             moe_probe_inputs.push_back(inpSA);
+         }
+-- 
+2.43.0
+

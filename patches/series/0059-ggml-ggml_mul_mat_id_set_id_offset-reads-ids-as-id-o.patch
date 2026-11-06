@@ -1,0 +1,356 @@
+From 814d77719bdce8d259b37e892d5536639f4b5438 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:32:21 -0600
+Subject: [PATCH 059/141] ggml: ggml_mul_mat_id_set_id_offset reads ids as id -
+ offset and skips the ones outside [0, n_as) (zero rows); CUDA supports it in
+ mmq / mmf (expert parallelism)
+
+---
+ ggml/include/ggml.h             |  4 +++
+ ggml/src/ggml-cpu/ggml-cpu.c    |  8 ++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu |  5 ++-
+ ggml/src/ggml-cuda/mmf.cu       |  9 ++++-
+ ggml/src/ggml-cuda/mmid.cu      | 37 ++++++++++++--------
+ ggml/src/ggml-cuda/mmid.cuh     |  3 +-
+ ggml/src/ggml-cuda/mmq.cu       | 11 +++++-
+ ggml/src/ggml-cuda/quantize.cu  |  3 ++
+ ggml/src/ggml.c                 |  6 ++++
+ tests/test-backend-ops.cpp      | 60 +++++++++++++++++++++++++++++++++
+ 10 files changed, 127 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 568251d2c..f85b7b0ed 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1526,6 +1526,10 @@ extern "C" {
+             struct ggml_tensor  * b,
+             struct ggml_tensor  * ids);
+ 
++    // the ids of a MUL_MAT_ID are read as id - offset; an id outside [0, n_as) after it is skipped like -1 (its row of the result is zero),
++    // so a backend handed every expert's id computes only the ones of its own range (expert parallelism); CUDA zeroes the result first
++    GGML_API void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset);
++
+     // A: m columns, n rows,
+     // B: p columns, n rows,
+     // result is m columns, p rows
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 190e58ca8..a454cad36 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1667,9 +1667,15 @@ static void ggml_compute_forward_mul_mat_id(
+         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+ 
+         // group rows by src0 matrix
++        // 0058: with an id offset, an id outside [0, n_as) after it is skipped like -1
++        const int32_t id_off   = ggml_get_op_params_i32(dst, 6);
++        const bool    id_range = ggml_get_op_params_i32(dst, 7) != 0;
+         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+             for (int id = 0; id < n_ids; ++id) {
+-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
++                int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]) - id_off;
++                if (id_range && (i02 < 0 || i02 >= n_as)) {
++                    i02 = -1;
++                }
+ 
+                 assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 80ec5a26c..1a0165c3d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2291,9 +2291,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+ 
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
++    // 0058: the id offset (and the skipped ids it implies) is handled by the mmq and mmf paths only
++    const bool id_range = ggml_get_op_params_i32(dst, 7) != 0;
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++        if (ne2 <= MMVQ_MAX_BATCH_SIZE && !id_range) {
+             if (ggml_is_quantized(src0->type)) {
+                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                 if (ne2 <= mmvq_mmid_max) {
+@@ -2321,6 +2323,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
+     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
++    GGML_ASSERT(!id_range && "MUL_MAT_ID with an id offset needs the mmq or mmf path");
+     cudaStream_t stream = ctx.stream();
+ 
+     GGML_ASSERT(nb12 % nb11 == 0);
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 646a5899c..1d73133ad 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -84,8 +84,15 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
+ 
+         GGML_ASSERT(sis1 > 0);
+ 
++        // 0058: see mmq.cu
++        const int  id_offset = ggml_get_op_params_i32(dst, 6);
++        if (ggml_get_op_params_i32(dst, 7) != 0) {
++            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
++            CUDA_CHECK(cudaMemsetAsync(ids_src_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
++        }
+         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
+-            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream());
++            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream(),
++            id_offset);
+         CUDA_CHECK(cudaGetLastError());
+ 
+         ids_info.ids_src_compact   = ids_src_compact_dev.get();
+diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
+index 12ae14ce9..c186a8539 100644
+--- a/ggml/src/ggml-cuda/mmid.cu
++++ b/ggml/src/ggml-cuda/mmid.cu
+@@ -19,6 +19,12 @@ struct mm_ids_helper_store {
+ };
+ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+ 
++// 0058: an id outside [0, n_experts) after the offset (-1 included) is skipped: INT_MAX, as the padding, belongs to no expert
++static __device__ __forceinline__ int mm_ids_remap(const int id, const int id_offset, const int n_experts) {
++    const int e = id - id_offset;
++    return e >= 0 && e < n_experts ? e : INT_MAX;
++}
++
+ // the generic path passes 0, which needs no padding since it never groups lanes by token
+ template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
+ template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
+@@ -32,7 +38,8 @@ template <int n_expert_used_template>
+ __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
++        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
++        const int id_offset) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+     const int expert = blockIdx.x;
+@@ -48,7 +55,7 @@ static __global__ void mm_ids_helper(
+         for (int it = 0; it < n_tokens; ++it) {
+             int iex_used = -1; // The index at which the expert is used, if any.
+             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+-                const int expert_used = ids[it*si1 + iex];
++                const int expert_used = mm_ids_remap(ids[it*si1 + iex], id_offset, gridDim.x);
+                 nex_prev += expert_used < expert;
+                 if (expert_used == expert) {
+                     iex_used = iex;
+@@ -73,7 +80,7 @@ static __global__ void mm_ids_helper(
+ 
+             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
+             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+-                ids[it*si1 + iex] : INT_MAX;
++                mm_ids_remap(ids[it*si1 + iex], id_offset, gridDim.x) : INT_MAX;
+             const int iex_used = expert_used == expert ? iex : -1;
+             nex_prev += expert_used < expert;
+ 
+@@ -130,7 +137,8 @@ static __global__ void mm_ids_helper(
+ template <int n_expert_used_template>
+ static void launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
++        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream,
++        const int id_offset) {
+     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
+     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+ 
+@@ -144,36 +152,37 @@ static void launch_mm_ids_helper(
+     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+     GGML_ASSERT(nbytes_shared <= smpbo);
+     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse, id_offset);
+ }
+ 
+ void ggml_cuda_launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
++        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream,
++        const int id_offset) {
+     switch (n_expert_used) {
+         case  2:
+-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case  4:
+-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case  6:
+-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case  8:
+-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case 10:
+-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case 16:
+-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         case 32:
+-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+         default:
+-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
++            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream, id_offset);
+             break;
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/mmid.cuh b/ggml/src/ggml-cuda/mmid.cuh
+index 74c2db433..7dc9b0bdb 100644
+--- a/ggml/src/ggml-cuda/mmid.cuh
++++ b/ggml/src/ggml-cuda/mmid.cuh
+@@ -2,4 +2,5 @@
+ 
+ void ggml_cuda_launch_mm_ids_helper(
+         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
+-        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
++        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream,
++        int id_offset = 0);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 49e0ce905..35d2af0d3 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -316,13 +316,22 @@ void ggml_cuda_mul_mat_q(
+     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+ 
++    // 0058: with an id offset, ids may fall outside this backend's experts: their result rows are zero, and the id maps are pre-filled so
++    // the rows no expert owns are safe (the inverse map's -1 is skipped by the scatter, the forward map's 0 is a valid row)
++    const int  id_offset = ggml_get_op_params_i32(dst, 6);
++    const bool id_range  = ggml_get_op_params_i32(dst, 7) != 0;
++    if (id_range) {
++        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
++        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
++    }
++    GGML_ASSERT(!id_range || !use_native_fp4);
+     {
+         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+         const int si1  = ids->nb[1] / ggml_element_size(ids);
+         const int sis1 = nb12 / nb11;
+ 
+         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
++            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, id_offset);
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index ea089a8c6..f8254f204 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -526,6 +526,9 @@ static __global__ void quantize_mmq_q8_1(
+         int64_t ib;
+         if constexpr (scatter) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // 0058: a slot no expert of this backend owns
++            }
+             ib = k_block*ne1 + i;
+         } else {
+             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3d60c44e5..9e69dd204 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3477,6 +3477,12 @@ struct ggml_tensor * ggml_mul_mat_id(
+     return result;
+ }
+ 
++void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset) {
++    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
++    ggml_set_op_params_i32(a, 6, offset); // slot 0 is the precision (ggml_mul_mat_set_prec)
++    ggml_set_op_params_i32(a, 7, 1);      // ids may fall outside the range: the result is zeroed first
++}
++
+ // ggml_out_prod
+ 
+ static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c57940fac..3a51056a2 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5727,6 +5727,56 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// 0058: MUL_MAT_ID over a range of the experts (expert parallelism): ids drawn from 2*n_mats experts, read with an offset, the ids outside
++// [offset, offset + n_mats) skipped (their rows zero)
++struct test_mul_mat_id_range : public test_case {
++    const ggml_type type_a;
++    const int n_mats;
++    const int n_used;
++    const bool bcast;
++    const int64_t m, n, k;
++    const int32_t offset;
++
++    std::string vars() override {
++        return VARS_TO_STR8(type_a, n_mats, n_used, bcast, m, n, k, offset);
++    }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_mul_mat_id_range(ggml_type type_a, int n_mats, int n_used, bool bcast, int64_t m, int64_t n, int64_t k, int32_t offset)
++        : type_a(type_a), n_mats(n_mats), n_used(n_used), bcast(bcast), m(m), n(n), k(k), offset(offset) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
++        ggml_set_name(as, "as");
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
++        ggml_set_name(ids, "ids");
++        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, bcast ? 1 : n_used, n);
++        ggml_set_name(b, "b");
++        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
++        ggml_mul_mat_id_set_id_offset(out, offset);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        std::default_random_engine rng(4321);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type != GGML_TYPE_I32) {
++                init_tensor_uniform(t);
++                continue;
++            }
++            for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                std::vector<int32_t> all(2*n_mats);
++                for (int i = 0; i < 2*n_mats; i++) {
++                    all[i] = i;
++                }
++                std::shuffle(all.begin(), all.end(), rng);  // distinct experts per token, half of them outside the range
++                ggml_backend_tensor_set(t, all.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
++            }
++        }
++    }
++};
++
+ // MUL_MAT_ID with expert ids repeated within a token's row
+ struct test_mul_mat_id_dup : public test_mul_mat_id {
+     using test_mul_mat_id::test_mul_mat_id;
+@@ -11268,6 +11318,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+ 
++    // 0058: a backend's half of 256 experts (GLM-5.3's shapes, trimmed), at prompt and small batch sizes, both halves
++    for (ggml_type t : { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0 }) {
++        for (int32_t off : { 0, 16 }) {
++            for (int64_t n : { 64, 512, 1024 }) {
++                test_cases.emplace_back(new test_mul_mat_id_range(t, 16, 8, true,  512, n, 768, off));
++                test_cases.emplace_back(new test_mul_mat_id_range(t, 16, 8, false, 768, n, 512, off));
++            }
++        }
++    }
++
+ #if 0
+     // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.
+     // kernel_mul_mm dst offset of the last batch is past INT32_MAX: rows 0-31 use full tiles, rows 32-39 use edge tiles.
+-- 
+2.43.0
+

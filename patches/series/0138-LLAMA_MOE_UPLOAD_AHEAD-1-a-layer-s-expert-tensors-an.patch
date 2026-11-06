@@ -1,0 +1,304 @@
+From 83df23f8feba963088f269c479af23169e472390 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:34:26 -0600
+Subject: [PATCH 138/141] LLAMA_MOE_UPLOAD_AHEAD=1: a layer's expert tensors
+ and the next layer's go up at the layer's first expert split, an event per
+ tensor, slots freed when their last reader has been issued
+
+---
+ ggml/include/ggml-cuda.h        |   7 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 154 ++++++++++++++++++++++++++++++++
+ src/llama-context.cpp           |  55 ++++++++++++
+ src/llama-context.h             |   6 ++
+ 4 files changed, 222 insertions(+)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 49cb48332..ffba7447f 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -42,6 +42,13 @@ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t back
+ // GGML_CUDA_RING_MIXED=1, runs of them consecutive in memory go up by the copy engine, the other entries by the gather kernel; null
+ // entries are skipped)
+ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather_span(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_lo, const void * host_hi);
++// 0134 LLAMA_MOE_UPLOAD_AHEAD: gathers into a given slot with an event per tensor and no wait of the main stream; ahead_free marks a slot's
++// last reader issued (slot < 0: every slot), ahead_gather fills tensor idx of a slot (idx 0 starts the slot and waits for its free mark),
++// ahead_wait makes the main stream wait for tensor idx of a slot
++GGML_BACKEND_API int    ggml_backend_cuda_upload_ring_slots(void);
++GGML_BACKEND_API void   ggml_backend_cuda_upload_ring_ahead_free(ggml_backend_t backend, int slot);
++GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_ahead_gather(ggml_backend_t backend, int slot, int idx, const void * const * srcs, int64_t n, size_t size, size_t slot_bytes, const void * host_lo, const void * host_hi);
++GGML_BACKEND_API void   ggml_backend_cuda_upload_ring_ahead_wait(ggml_backend_t backend, int slot, int idx);
+ // 0090: host-to-device copies into the caller's memory on the device's upload ring stream, after the gathers issued so far (the main stream
+ // does not wait for them; a later gather on the same stream reads them in order); false when the device has no ring yet
+ GGML_BACKEND_API bool ggml_backend_cuda_upload_ring_prefetch(ggml_backend_t backend, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t n);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f5139434d..781d234ee 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7192,6 +7192,17 @@ static int ggml_cuda_ring_slots(void) {
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
+ static ggml_cuda_upload_ring g_cuda_weight_ring[GGML_CUDA_MAX_DEVICES]; // 0078: host-memory weights (LLAMA_TP_SHADOW_HOST)
+ 
++// 0134 LLAMA_MOE_UPLOAD_AHEAD: the upload ring's slots filled a layer ahead, see ggml_backend_cuda_upload_ring_ahead_gather
++struct ggml_cuda_ring_ahead {
++    bool        init        = false;
++    bool        dirty       = false;  // ahead gathers issued since the old path's last slot: its reuse event does not cover them
++    cudaEvent_t ev_free[4]  = {};     // the main stream when the slot's last reader had been issued
++    cudaEvent_t ev_t[4][4]  = {};     // the gather of tensor idx of the slot
++    cudaEvent_t ev_switch   = nullptr;
++    size_t      used[4]     = {};     // bump pointer per slot
++};
++static ggml_cuda_ring_ahead g_cuda_ring_ahead[GGML_CUDA_MAX_DEVICES];
++
+ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all, const void * host_hi = nullptr) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     const int dev = cuda_ctx->device;
+@@ -7206,6 +7217,12 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     }
+     cudaStream_t main_stream = cuda_ctx->stream();
+     if (first_of_split) {
++        // 0134: after ahead gathers, the slots' last readers are not in ev_main: the upload waits for the main stream's progress now
++        if (rings == g_cuda_upload_ring && g_cuda_ring_ahead[dev].dirty) {
++            CUDA_CHECK(cudaEventRecord(g_cuda_ring_ahead[dev].ev_switch, main_stream));
++            CUDA_CHECK(cudaStreamWaitEvent(r.stream, g_cuda_ring_ahead[dev].ev_switch, 0));
++            g_cuda_ring_ahead[dev].dirty = false;
++        }
+         r.k += 1;
+         r.used = 0;
+         const int s = (int) (r.k % ggml_cuda_ring_slots());
+@@ -7347,6 +7364,143 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     return dst;
+ }
+ 
++// 0134 LLAMA_MOE_UPLOAD_AHEAD
++int ggml_backend_cuda_upload_ring_slots(void) {
++    return ggml_cuda_ring_slots();
++}
++
++static void ggml_cuda_ring_ahead_init(int dev, ggml_cuda_upload_ring & r, ggml_cuda_ring_ahead & a, cudaStream_t main_stream) {
++    if (r.stream == nullptr) {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
++        for (int i = 0; i < 4; ++i) {
++            CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_main[i], cudaEventDisableTiming));
++        }
++        CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_upload, cudaEventDisableTiming));
++    }
++    if (!a.init) {
++        for (int i = 0; i < 4; ++i) {
++            CUDA_CHECK(cudaEventCreateWithFlags(&a.ev_free[i], cudaEventDisableTiming));
++            CUDA_CHECK(cudaEventRecord(a.ev_free[i], main_stream));
++            for (int j = 0; j < 4; ++j) {
++                CUDA_CHECK(cudaEventCreateWithFlags(&a.ev_t[i][j], cudaEventDisableTiming));
++            }
++        }
++        CUDA_CHECK(cudaEventCreateWithFlags(&a.ev_switch, cudaEventDisableTiming));
++        a.init = true;
++        GGML_LOG_INFO("%s: device %d: LLAMA_MOE_UPLOAD_AHEAD, %d slots\n", __func__, dev, ggml_cuda_ring_slots());
++    }
++}
++
++void ggml_backend_cuda_upload_ring_ahead_free(ggml_backend_t backend, int slot) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const int dev = cuda_ctx->device;
++    ggml_cuda_set_device(dev);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[dev];
++    ggml_cuda_ring_ahead  & a = g_cuda_ring_ahead[dev];
++    ggml_cuda_ring_ahead_init(dev, r, a, cuda_ctx->stream());
++    for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
++        if (slot < 0 || i == slot) {
++            CUDA_CHECK(cudaEventRecord(a.ev_free[i], cuda_ctx->stream()));
++        }
++    }
++}
++
++void * ggml_backend_cuda_upload_ring_ahead_gather(ggml_backend_t backend, int slot, int idx, const void * const * srcs, int64_t n, size_t size, size_t slot_bytes, const void * host_lo, const void * host_hi) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const int dev = cuda_ctx->device;
++    ggml_cuda_set_device(dev);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[dev];
++    ggml_cuda_ring_ahead  & a = g_cuda_ring_ahead[dev];
++    GGML_ASSERT(slot >= 0 && slot < ggml_cuda_ring_slots() && idx >= 0 && idx < 4 && n <= GGML_CUDA_GATHER_MAX);
++    ggml_cuda_ring_ahead_init(dev, r, a, cuda_ctx->stream());
++    if (r.slot_bytes < slot_bytes) {
++        // the slots are sized once (a layer of experts); a growth synchronizes the device
++        CUDA_CHECK(cudaDeviceSynchronize());
++        for (int i = 0; i < 4; ++i) {
++            if (r.slot[i] != nullptr) {
++                CUDA_CHECK(cudaFree(r.slot[i]));
++                r.slot[i] = nullptr;
++            }
++        }
++        for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
++            CUDA_CHECK(cudaMalloc(&r.slot[i], slot_bytes));
++        }
++        r.slot_bytes = slot_bytes;
++        GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), slot_bytes/1024.0/1024.0);
++    }
++    if (idx == 0) {
++        a.used[slot] = 0;
++        CUDA_CHECK(cudaStreamWaitEvent(r.stream, a.ev_free[slot], 0));
++    }
++    const size_t bytes = (size_t) n*size;
++    GGML_ASSERT(a.used[slot] + bytes <= r.slot_bytes);
++    char * dst = (char *) r.slot[slot] + a.used[slot];
++    a.used[slot] += GGML_PAD(bytes, 256);
++
++    // as the ring's mixed copy (0082 / 0083 / 0107): the host runs in one batched copy, the experts elsewhere (device banks) by the gather kernel
++    const char * h_lo = (const char *) host_lo;
++    const char * h_hi = (const char *) host_hi;
++    auto is_host = [&](const void * p) { return p != nullptr && (const char *) p >= h_lo && (const char *) p < h_hi; };
++    ggml_cuda_gather_table table;
++    bool any_dev = false;
++    for (int64_t e = 0; e < GGML_CUDA_GATHER_MAX; ++e) {
++        table.src[e] = nullptr;
++    }
++#if CUDART_VERSION >= 12080
++    void       * run_dst[GGML_CUDA_GATHER_MAX];
++    const void * run_src[GGML_CUDA_GATHER_MAX];
++    size_t       run_len[GGML_CUDA_GATHER_MAX];
++    size_t       n_runs = 0;
++#endif
++    for (int64_t e = 0; e < n; ) {
++        if (is_host(srcs[e])) {
++            int64_t e1 = e + 1;
++            while (e1 < n && is_host(srcs[e1]) && srcs[e1] == (const char *) srcs[e1 - 1] + size) {
++                e1++;
++            }
++#if CUDART_VERSION >= 12080
++            run_dst[n_runs] = dst + (size_t) e*size;
++            run_src[n_runs] = srcs[e];
++            run_len[n_runs] = (size_t) (e1 - e)*size;
++            n_runs++;
++#else
++            CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e*size, srcs[e], (size_t) (e1 - e)*size, cudaMemcpyHostToDevice, r.stream));
++#endif
++            e = e1;
++        } else {
++            table.src[e] = srcs[e];
++            any_dev = any_dev || srcs[e] != nullptr;
++            e++;
++        }
++    }
++#if CUDART_VERSION >= 12080
++    if (n_runs > 0) {
++        cudaMemcpyAttributes attr = {};
++        attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
++        size_t attr_idx = 0;
++        CUDA_CHECK(cudaMemcpyBatchAsync(run_dst, run_src, run_len, n_runs, &attr, &attr_idx, 1, r.stream));
++    }
++#endif
++    if (any_dev) {
++        const size_t chunk = 1024*1024;
++        const dim3 grid((unsigned) ((size + chunk - 1)/chunk), (unsigned) n);
++        ggml_cuda_gather_copy_kernel<<<grid, 256, 0, r.stream>>>(table, dst, size, chunk);
++        CUDA_CHECK(cudaGetLastError());
++    }
++    CUDA_CHECK(cudaEventRecord(a.ev_t[slot][idx], r.stream));
++    a.dirty = true;
++    return dst;
++}
++
++void ggml_backend_cuda_upload_ring_ahead_wait(ggml_backend_t backend, int slot, int idx) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const int dev = cuda_ctx->device;
++    ggml_cuda_set_device(dev);
++    ggml_cuda_ring_ahead & a = g_cuda_ring_ahead[dev];
++    GGML_ASSERT(a.init && slot >= 0 && slot < 4 && idx >= 0 && idx < 4);
++    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), a.ev_t[slot][idx], 0));
++}
++
+ void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
+     return ggml_cuda_ring_gather_impl(g_cuda_upload_ring, backend, first_of_split, srcs, n, size, split_bytes, host_all);
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3bb57447d..6ececbf43 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3462,6 +3462,61 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                     split_bytes += t ? GGML_PAD(ggml_nbytes(t), 256) : 0;
+                 }
++                // 0134 LLAMA_MOE_UPLOAD_AHEAD=1: at the layer's first expert split its three tensors (if not up yet) and the next layer's go
++                // up, each with its own event; this split waits only for its own tensor
++                static const bool upload_ahead = getenv("LLAMA_MOE_UPLOAD_AHEAD") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_AHEAD")) != 0;
++                bool table_whole = true;
++                for (int64_t e = 0; e < n_expert && table_whole; ++e) {
++                    table_whole = table[e] != nullptr;
++                }
++                if (upload_ahead && ids->ne[1] > 4096 && table_whole) {
++                    const int nsl = ggml_backend_cuda_upload_ring_slots();
++                    const size_t slot_bytes = std::max(split_bytes, ring_split_max(backend));
++                    auto host_experts = [&](const ggml_tensor * t) {
++                        return t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) && t->ne[2] <= 256 &&
++                               lctx->moe_cache->layer_of_weight(t) >= 0 && ggml_backend_cuda_host_ptr_device_accessible(t->data);
++                    };
++                    // in graph order: up, gate, down (build_moe_ffn)
++                    auto gather_layer = [&](int32_t l) {
++                        const auto & ly = lctx->model.layers[l];
++                        const ggml_tensor * ts[3] = { ly.ffn_up_exps, ly.ffn_gate_exps, ly.ffn_down_exps };
++                        for (int k = 0; k < 3; ++k) {
++                            if (!host_experts(ts[k])) {
++                                return;
++                            }
++                        }
++                        for (int k = 0; k < 3; ++k) {
++                            const ggml_tensor * t  = ts[k];
++                            const int64_t       ne = t->ne[2];
++                            const size_t        es = t->nb[2];
++                            const void * tb[256];
++                            for (int64_t e = 0; e < ne; ++e) {
++                                const void * pc = lctx->moe_cache->cached_expert(backend, t, e);
++                                tb[e] = pc != nullptr ? pc : (const void *) ((const uint8_t *) t->data + e*es);
++                            }
++                            void * p = ggml_backend_cuda_upload_ring_ahead_gather(backend, l % nsl, k, tb, ne, es, slot_bytes,
++                                t->data, (const uint8_t *) t->data + ggml_nbytes(t));
++                            st.ahead[t] = { p, l % nsl, k };
++                        }
++                    };
++                    if (il != st.ahead_il) {
++                        // every reader of the previous layer (and of the previous graph, at this graph's first) has been issued
++                        ggml_backend_cuda_upload_ring_ahead_free(backend, st.ahead_il < 0 ? -1 : st.ahead_il % nsl);
++                        if (st.ahead.find(src) == st.ahead.end()) {
++                            gather_layer(il);
++                        }
++                        if (il + 1 < (int32_t) lctx->model.layers.size()) {
++                            gather_layer(il + 1);
++                        }
++                        st.ahead_il = il;
++                    }
++                    const auto ia = st.ahead.find(src);
++                    if (ia != st.ahead.end()) {
++                        dst->data = ia->second.p;
++                        ggml_backend_cuda_upload_ring_ahead_wait(backend, ia->second.slot, ia->second.idx);
++                        return true;
++                    }
++                }
+                 const bool first = il != st.ring_il;
+                 st.ring_il = il;
+                 // LLAMA_MOE_UPLOAD_RING_MEMCPY=1: the whole tensor from the host by the copy engine, the device cache unused
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b9397bf36..735e8b70d 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -397,6 +397,10 @@ private:
+         int32_t tp_noted_il = -1;                     // 0072: the last layer whose prompt ids the MoE cache was given
+         std::map<ggml_backend_t, int32_t> tp_wring_il; // 0078: the layer in each card's weight ring slot
+         std::map<ggml_backend_dev_t, size_t> ring_split_max; // 0054: the largest MoE split per device (kept across graphs)
++        // 0134 LLAMA_MOE_UPLOAD_AHEAD: the last layer whose first expert split was seen in this graph, and the tensors already gathered
++        struct ahead_copy { void * p; int slot; int idx; };
++        int32_t ahead_il = -1;
++        std::map<const ggml_tensor *, ahead_copy> ahead;
+ 
+         bool    timing = false;
+         int     cur_path = 4;
+@@ -407,6 +411,8 @@ private:
+             ids = nullptr;
+             ids_noted = nullptr;
+             ring_il = -1;
++            ahead_il = -1; // 0134
++            ahead.clear();
+             tp_ring_il.clear();
+             tp_noted_il = -1;
+             tp_wring_il.clear();
+-- 
+2.43.0
+

@@ -1,0 +1,470 @@
+From 048a28b7bc84a6f1f8d1e1cf1d8b3e2369955057 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 02:44:48 -0600
+Subject: [PATCH 106/141] both-cards prompt graph: the expert split follows the
+ MoE cache (LLAMA_TP_EP_CACHE=1): the home card takes its cached experts and a
+ share of the uncached ones so both cards upload about the same bytes a layer;
+ per-card id tables, fixed-size views filled by position; the ring mixed path
+ takes host entries anywhere in the host tensor
+
+---
+ ggml/include/ggml-cuda.h        |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  29 +++--
+ src/llama-context.cpp           |  26 ++++-
+ src/llama-graph.cpp             |  25 +++--
+ src/llama-moe-cache.cpp         | 188 ++++++++++++++++++++++++++++++++
+ src/llama-moe-cache.h           |  11 ++
+ src/models/glm-dsa.cpp          |  16 +++
+ 7 files changed, 281 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index e8d7cd78c..49cb48332 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -38,6 +38,10 @@ GGML_BACKEND_API bool ggml_backend_cuda_host_ptr_device_accessible(const void *
+ // `host_all`, when given, is the contiguous host copy of all n experts: the slot is then filled with one cudaMemcpyAsync (the copy
+ // engine) instead of the gather kernel, and `srcs` is ignored
+ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all);
++// 0107: as above with a table, the entries inside [host_lo, host_hi) taken as pinned host memory wherever they sit in srcs (with
++// GGML_CUDA_RING_MIXED=1, runs of them consecutive in memory go up by the copy engine, the other entries by the gather kernel; null
++// entries are skipped)
++GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather_span(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_lo, const void * host_hi);
+ // 0090: host-to-device copies into the caller's memory on the device's upload ring stream, after the gathers issued so far (the main stream
+ // does not wait for them; a later gather on the same stream reads them in order); false when the device has no ring yet
+ GGML_BACKEND_API bool ggml_backend_cuda_upload_ring_prefetch(ggml_backend_t backend, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t n);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f50d8b15b..ba7c7700c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7096,7 +7096,7 @@ static int ggml_cuda_ring_slots(void) {
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
+ static ggml_cuda_upload_ring g_cuda_weight_ring[GGML_CUDA_MAX_DEVICES]; // 0078: host-memory weights (LLAMA_TP_SHADOW_HOST)
+ 
+-static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all) {
++static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_all, const void * host_hi = nullptr) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     const int dev = cuda_ctx->device;
+     ggml_cuda_set_device(dev);
+@@ -7144,6 +7144,12 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     char * dst = (char *) r.slot[s] + r.used;
+     r.used += GGML_PAD(bytes, 256);
+ 
++    // 0107: a table entry inside [host_all, host_hi) is pinned host memory (by default the n experts from host_all, where the callers put
++    // expert e at host_all + e*size)
++    const char * h_lo = (const char *) host_all;
++    const char * h_hi = host_hi != nullptr ? (const char *) host_hi : h_lo != nullptr ? h_lo + (size_t) n*size : nullptr;
++    auto is_host = [&](const void * p) { return p != nullptr && h_lo != nullptr && (const char *) p >= h_lo && (const char *) p < h_hi; };
++
+     // 0082 GGML_CUDA_RING_MIXED=1: given both the table and the host tensor, the copy engine copies a run of host entries in one
+     // host-to-device transfer and a cached expert (an entry elsewhere, a device bank) device-to-device, so the cache saves PCIe bytes
+     static const bool ring_mixed = getenv("GGML_CUDA_RING_MIXED") != nullptr && atoi(getenv("GGML_CUDA_RING_MIXED")) != 0;
+@@ -7151,8 +7157,7 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     // 0083: in two calls -- the host runs in one batched copy, the cached experts by one gather kernel (one call per copy filled the
+     // copy queue and blocked the host)
+     if (host_all != nullptr && srcs != nullptr && ring_mixed && n <= GGML_CUDA_GATHER_MAX) {
+-        const char * hb = (const char *) host_all;
+-        void       * run_dst[GGML_CUDA_GATHER_MAX];
++        void       * run_dst[GGML_CUDA_GATHER_MAX]; // 0107: the runs of host entries by is_host
+         const void * run_src[GGML_CUDA_GATHER_MAX];
+         size_t       run_len[GGML_CUDA_GATHER_MAX];
+         size_t       n_runs  = 0;
+@@ -7162,13 +7167,13 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+             table.src[e] = nullptr;
+         }
+         for (int64_t e = 0; e < n; ) {
+-            if (srcs[e] == hb + (size_t) e*size) {
++            if (is_host(srcs[e])) {
+                 int64_t e1 = e + 1;
+-                while (e1 < n && srcs[e1] == hb + (size_t) e1*size) {
++                while (e1 < n && is_host(srcs[e1]) && srcs[e1] == (const char *) srcs[e1 - 1] + size) {
+                     e1++;
+                 }
+                 run_dst[n_runs] = dst + (size_t) e*size;
+-                run_src[n_runs] = hb + (size_t) e*size;
++                run_src[n_runs] = srcs[e];
+                 run_len[n_runs] = (size_t) (e1 - e)*size;
+                 n_runs++;
+                 e = e1;
+@@ -7196,15 +7201,14 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     }
+ #endif // CUDART_VERSION >= 12080
+     if (host_all != nullptr && srcs != nullptr && ring_mixed) {
+-        const char * hb = (const char *) host_all;
+         int64_t e = 0;
+         while (e < n) {
+-            if (srcs[e] == hb + (size_t) e*size) {
++            if (is_host(srcs[e])) {
+                 int64_t e1 = e + 1;
+-                while (e1 < n && srcs[e1] == hb + (size_t) e1*size) {
++                while (e1 < n && is_host(srcs[e1]) && srcs[e1] == (const char *) srcs[e1 - 1] + size) {
+                     e1++;
+                 }
+-                CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e*size, hb + (size_t) e*size, (size_t) (e1 - e)*size, cudaMemcpyHostToDevice, r.stream));
++                CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) e*size, srcs[e], (size_t) (e1 - e)*size, cudaMemcpyHostToDevice, r.stream));
+                 e = e1;
+             } else if (srcs[e] == nullptr) {
+                 e++; // 0085: an expert the batch does not upload
+@@ -7251,6 +7255,11 @@ void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t backend, bool first_o
+     return ggml_cuda_ring_gather_impl(g_cuda_upload_ring, backend, first_of_split, srcs, n, size, split_bytes, host_all);
+ }
+ 
++void * ggml_backend_cuda_upload_ring_gather_span(ggml_backend_t backend, bool first_of_split, const void * const * srcs, int64_t n, size_t size, size_t split_bytes, const void * host_lo, const void * host_hi) {
++    GGML_ASSERT(srcs != nullptr && host_lo != nullptr && host_hi != nullptr);
++    return ggml_cuda_ring_gather_impl(g_cuda_upload_ring, backend, first_of_split, srcs, n, size, split_bytes, host_lo, host_hi);
++}
++
+ void * ggml_backend_cuda_weight_ring_upload(ggml_backend_t backend, bool first_of_layer, size_t bytes, size_t slot_bytes, const void * host) {
+     return ggml_cuda_ring_gather_impl(g_cuda_weight_ring, backend, first_of_layer, nullptr, 1, bytes, slot_bytes, host);
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c8fa1511d..591d9e693 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3127,7 +3127,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     if (src->view_src != nullptr && lctx->model.tp_devs.size() == 2) {
+         // 0072: the MoE cache counts the prompt's routing for admission, as on the layer-split path (once per layer: both cards carry
+         // the same ids, read on this card's stream behind their copy)
+-        if (lctx->moe_cache) {
++        // (0107: not with the cache's split, whose ids are positions)
++        if (lctx->moe_cache && lctx->moe_cache->ep_card(backend) < 0) {
+             const int32_t il_n = lctx->moe_cache->layer_of_weight(src->view_src);
+             if (il_n >= 0 && il_n != st.tp_noted_il) {
+                 for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+@@ -3160,6 +3161,29 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             // hold the layer finds none), the rest from the host
+             static const bool ring_mixed = getenv("GGML_CUDA_RING_MIXED") != nullptr && atoi(getenv("GGML_CUDA_RING_MIXED")) != 0;
+             const void * table[256];
++            // 0107 LLAMA_TP_EP_CACHE: the view holds the plan's experts by position, the cached ones from the card's banks, the rest from
++            // the host tensor (anywhere in it: the span form); the positions past the plan's experts are not uploaded
++            const int ep_c = lctx->moe_cache ? lctx->moe_cache->ep_card(backend) : -1;
++            const std::vector<int32_t> * ep_src = ep_c >= 0 && il >= 0 ? lctx->moe_cache->ep_src(il, ep_c) : nullptr;
++            if (ep_src != nullptr) {
++                GGML_ASSERT(n_expert <= 256 && (int64_t) ep_src->size() <= n_expert);
++                const uint8_t * host0 = (const uint8_t *) src->view_src->data;
++                for (int64_t e = 0; e < n_expert; ++e) {
++                    if (e >= (int64_t) ep_src->size()) {
++                        table[e] = nullptr;
++                        continue;
++                    }
++                    const int32_t x  = (*ep_src)[e];
++                    const void *  pc = lctx->moe_cache->cached_expert(backend, src->view_src, x);
++                    table[e] = pc != nullptr ? pc : (const void *) (host0 + (size_t) x*expert_size);
++                }
++                void * p = ggml_backend_cuda_upload_ring_gather_span(backend, first, table, n_expert, expert_size,
++                    std::max({ st.tp_ring_slot, 3*GGML_PAD(ggml_nbytes(dst), 256), ring_split_max(backend) }), host0, host0 + ggml_nbytes(src->view_src));
++                GGML_ASSERT(p != nullptr && "LLAMA_TP_EP_CACHE: the upload ring is unavailable");
++                dst->data = p;
++                st.cur_path = 1;
++                return true;
++            }
+             const bool use_table = ring_mixed && lctx->moe_cache && n_expert <= 256;
+             if (use_table) {
+                 const int64_t e0 = (int64_t) (((const uint8_t *) src->data - (const uint8_t *) src->view_src->data)/expert_size);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 347230a45..d8ba6f635 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2400,18 +2400,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         for (int k = 0; k < 2; ++k) {
+             const int c = k == 0 ? moe_ep_first : 1 - moe_ep_first; // 0068: the card without the router first
+             const int n_nodes0 = ggml_graph_n_nodes(gf);
++            // 0107 LLAMA_TP_EP_CACHE: card c's experts as the cache's plan chose them, a view filled by position, the router's ids mapped
++            // to the positions (-1 for the other card's); else the fixed half
++            ggml_tensor * ep_tab = moe_cache != nullptr ? moe_cache->ep_ids(il, c) : nullptr;
++            const int64_t n_view = ep_tab != nullptr ? moe_cache->ep_view_n(il, c) : n_half;
++            const int32_t id_off = ep_tab != nullptr ? 0 : (int32_t) (c*n_half);
+             auto half = [&](ggml_tensor * w) {
+-                return ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], n_half, w->nb[1], w->nb[2], c*n_half*w->nb[2]);
++                return ggml_view_3d(ctx0, w, w->ne[0], w->ne[1], n_view, w->nb[1], w->nb[2], ep_tab != nullptr ? 0 : c*n_half*w->nb[2]);
+             };
++            ggml_tensor * ids_c = selected_experts;
++            if (ep_tab != nullptr) {
++                ggml_tensor * sel = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
++                ids_c = ggml_get_rows(ctx0, ep_tab, ggml_reshape_1d(ctx0, sel, ggml_nelements(sel))); // [1, n_expert_used*n_tokens]
++                ids_c = ggml_reshape_2d(ctx0, ids_c, n_expert_used, n_tokens);
++            }
+             ggml_tensor * x = ggml_reshape_3d(ctx0, moe_ep_in[c], n_embd, 1, n_tokens);
+             // 0074: up and gate only feed this card's down projection, which reads its own experts' rows: no zero fill
+             // (LLAMA_TP_MMID_UNDEF=0 restores it)
+             static const bool mmid_undef = getenv("LLAMA_TP_MMID_UNDEF") == nullptr || atoi(getenv("LLAMA_TP_MMID_UNDEF")) != 0;
+             auto set_range = mmid_undef ? ggml_mul_mat_id_set_id_offset_undef : ggml_mul_mat_id_set_id_offset;
+-            ggml_tensor * up = ggml_mul_mat_id(ctx0, half(up_exps), x, selected_experts);
+-            set_range(up, (int32_t) (c*n_half));
+-            ggml_tensor * gate = ggml_mul_mat_id(ctx0, half(gate_exps), x, selected_experts);
+-            set_range(gate, (int32_t) (c*n_half));
++            ggml_tensor * up = ggml_mul_mat_id(ctx0, half(up_exps), x, ids_c);
++            set_range(up, id_off);
++            ggml_tensor * gate = ggml_mul_mat_id(ctx0, half(gate_exps), x, ids_c);
++            set_range(gate, id_off);
+             ggml_tensor * act = nullptr;
+             const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+             if (limit > 1e-6f) {
+@@ -2422,8 +2433,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             } else {
+                 act = ggml_swiglu_split(ctx0, gate, up);
+             }
+-            ggml_tensor * down = ggml_mul_mat_id(ctx0, half(down_exps), act, selected_experts);
+-            ggml_mul_mat_id_set_id_offset(down, (int32_t) (c*n_half));
++            ggml_tensor * down = ggml_mul_mat_id(ctx0, half(down_exps), act, ids_c);
++            ggml_mul_mat_id_set_id_offset(down, id_off);
+             ggml_tensor * ew  = ggml_mul(ctx0, down, weights);
+             ggml_tensor * out = ggml_view_2d(ctx0, ew, n_embd, n_tokens, ew->nb[2], 0);
+             for (int64_t i = 1; i < n_expert_used; ++i) {
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index a7955cf14..4e4aac70a 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1291,6 +1291,162 @@ struct llama_moe_cache::impl {
+         return (const char *) bank->data + (size_t) slots[e]*bank->nb[2];
+     }
+ 
++    // 0107 LLAMA_TP_EP_CACHE=1: the both-cards graph's expert split (see llama_moe_cache::ep_plan)
++    struct ep_layer {
++        ggml_tensor * ids[2] = { nullptr, nullptr }; // I32 [1, n_expert] on card c: expert -> position in card c's view, -1 elsewhere
++        std::vector<int32_t> src[2];                 // card c's view: position -> expert
++        std::vector<int32_t> host[2];                // what ids[c] holds
++        int home = -1;
++    };
++    struct ep_state {
++        bool tried = false;
++        bool on    = false;
++        ggml_backend_t be[2] = { nullptr, nullptr };
++        int64_t n_view_home  = 0; // a card's view on its home layers
++        int64_t n_view_other = 0; // on the other card's
++        ggml_context_ptr ctx[2];
++        ggml_backend_buffer_ptr buf[2];
++        std::vector<ep_layer> layers;
++        uint64_t n_plans = 0;
++    } ep;
++
++    static bool ep_enabled() {
++        static const bool v = getenv("LLAMA_TP_EP_CACHE") != nullptr && atoi(getenv("LLAMA_TP_EP_CACHE")) != 0;
++        return v;
++    }
++
++    bool ep_init(const ggml_backend_t be[2]) {
++        ep.tried = true;
++        int64_t n_expert = 0;
++        size_t  n_t      = 0;
++        for (const layer & l : layers) {
++            if (l.ig >= 0 && !l.experts.empty()) {
++                n_expert = std::max(n_expert, l.experts[0]->ne[2]);
++                n_t++;
++            }
++        }
++        static const bool ring = getenv("LLAMA_MOE_UPLOAD_RING") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING")) != 0;
++        if (n_t == 0 || n_expert > 256 || n_expert % 2 != 0 || !ring || be[0] == nullptr || be[1] == nullptr) {
++            LLAMA_LOG_WARN("%s: LLAMA_TP_EP_CACHE needs cached MoE layers of up to 256 experts and LLAMA_MOE_UPLOAD_RING=1, not used\n", __func__);
++            return false;
++        }
++        // the views are sized once: the graph's shapes do not change between builds (the reserve holds)
++        const char * hv = getenv("LLAMA_TP_EP_HOME");
++        ep.n_view_home  = std::min(n_expert, std::max(n_expert/2, hv != nullptr ? (int64_t) atoi(hv) : n_expert*13/16));
++        ep.n_view_other = n_expert/2;
++        ep.layers.assign(layers.size(), ep_layer());
++        for (int c = 0; c < 2; ++c) {
++            ep.be[c] = be[c];
++            ggml_init_params params = { n_t*ggml_tensor_overhead(), nullptr, true };
++            ep.ctx[c].reset(ggml_init(params));
++            for (size_t il = 0; il < layers.size(); ++il) {
++                const layer & l = layers[il];
++                if (l.ig < 0 || l.experts.empty()) {
++                    continue;
++                }
++                ep.layers[il].ids[c] = ggml_new_tensor_2d(ep.ctx[c].get(), GGML_TYPE_I32, 1, l.experts[0]->ne[2]);
++                ggml_format_name(ep.layers[il].ids[c], "moe_cache.ep_ids-%d-%zu", c, il);
++            }
++            ep.buf[c] = llama_memory_bufs::alloc_buf(ep.ctx[c].get(), ggml_backend_get_default_buffer_type(be[c]), false, "TP EP tables");
++            GGML_ASSERT(ep.buf[c]);
++            // as weights: the MUL_MAT_IDs' lookups read them on their card, nothing is copied
++            ggml_backend_buffer_set_usage(ep.buf[c].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        }
++        ep.on = true;
++        LLAMA_LOG_INFO("%s: LLAMA_TP_EP_CACHE: %zu MoE layers, a card's view %lld experts on its home layers, %lld on the other card's\n",
++            __func__, n_t, (long long) ep.n_view_home, (long long) ep.n_view_other);
++        return true;
++    }
++
++    bool ep_plan(const ggml_backend_t be[2], const std::vector<int> & home, const std::vector<size_t> & w_bytes) {
++        if (!ep_enabled() || (ep.tried && !ep.on)) {
++            return false;
++        }
++        if (!ep.tried && !ep_init(be)) {
++            return false;
++        }
++        GGML_ASSERT(llama_moe_cache_same_device(be[0], ep.be[0]) && llama_moe_cache_same_device(be[1], ep.be[1]));
++        static const int shift = getenv("LLAMA_TP_EP_SHIFT") != nullptr ? atoi(getenv("LLAMA_TP_EP_SHIFT")) : 0;
++        ep.n_plans++;
++        double up[2] = { 0.0, 0.0 }, local[2] = { 0.0, 0.0 }, worst = 0.0, worst_fixed = 0.0;
++        int n_layers = 0;
++        std::vector<int32_t> cached, uncached;
++        bool synced[2] = { false, false };
++        for (size_t il = 0; il < layers.size(); ++il) {
++            const layer & l = layers[il];
++            ep_layer & el = ep.layers[il];
++            if (el.ids[0] == nullptr || il >= home.size() || (home[il] != 0 && home[il] != 1)) {
++                continue;
++            }
++            const int H = home[il];
++            const int O = 1 - H;
++            el.home = H;
++            const int64_t n = l.experts[0]->ne[2];
++            size_t S = 0;
++            for (const ggml_tensor * t : l.experts) {
++                S += t->nb[2];
++            }
++            // the experts the home card's cache holds (none if the layer is cached on the other card)
++            const group & g = groups[l.ig];
++            const int32_t * slots = il < g.slru.slot_map.size() ? g.slru.slot_map[il] : nullptr;
++            const bool on_home = llama_moe_cache_same_device(devices[g.id].backend, be[H]);
++            cached.clear();
++            uncached.clear();
++            for (int64_t e = 0; e < n; ++e) {
++                (on_home && slots != nullptr && slots[e] < g.n_slots ? cached : uncached).push_back((int32_t) e);
++            }
++            const int64_t nc = (int64_t) cached.size();
++            const int64_t nu = (int64_t) uncached.size();
++            const double  W  = il < w_bytes.size() ? (double) w_bytes[il] : 0.0; // the other card's weight-ring upload of the layer
++            // the home card's share of the uncached: x*S = (nu - x)*S + W
++            int64_t x = (int64_t) std::llround((nu*(double) S + W)/(2.0*S)) + shift;
++            x = std::min(nu, std::max<int64_t>(0, x));
++            const int64_t nh  = std::min(ep.n_view_home, std::max(n - ep.n_view_other, nc + x));
++            const int64_t nhc = std::min(nc, nh); // the cached ones the home card computes
++            const int64_t nhu = nh - nhc;         // and the uncached ones
++            el.src[H].clear();
++            el.src[O].clear();
++            el.src[H].insert(el.src[H].end(), cached.begin(), cached.begin() + nhc);
++            el.src[H].insert(el.src[H].end(), uncached.begin(), uncached.begin() + nhu);
++            el.src[O].insert(el.src[O].end(), cached.begin() + nhc, cached.end());
++            el.src[O].insert(el.src[O].end(), uncached.begin() + nhu, uncached.end());
++            std::sort(el.src[O].begin(), el.src[O].end()); // all from the host: runs consecutive in memory
++            GGML_ASSERT((int64_t) el.src[H].size() <= ep.n_view_home && (int64_t) el.src[O].size() <= ep.n_view_other);
++            for (int c = 0; c < 2; ++c) {
++                std::vector<int32_t> t(n, -1);
++                for (size_t p = 0; p < el.src[c].size(); ++p) {
++                    t[el.src[c][p]] = (int32_t) p;
++                }
++                if (t != el.host[c]) {
++                    if (!synced[c]) {
++                        ggml_backend_synchronize(be[c]); // a graph in flight may read the old table
++                        synced[c] = true;
++                    }
++                    ggml_backend_tensor_set(el.ids[c], t.data(), 0, n*sizeof(int32_t));
++                    el.host[c] = std::move(t);
++                }
++            }
++            const double uh = (double) nhu*S, uo = (double) (n - nh)*S + W;
++            up[H] += uh; up[O] += uo; local[H] += (double) nhc*S;
++            worst += std::max(uh, uo);
++            // the fixed halves: card c experts [c*n/2, (c + 1)*n/2), the home card's half from its banks where cached
++            int64_t hu = 0;
++            for (int64_t e = H*(n/2); e < (H + 1)*(n/2); ++e) {
++                hu += on_home && slots != nullptr && slots[e] < g.n_slots ? 0 : 1;
++            }
++            worst_fixed += std::max((double) hu*S, (double) (n/2)*S + W);
++            n_layers++;
++        }
++        static const uint64_t log_every = getenv("LLAMA_MOE_CACHE_LOG_EVERY") != nullptr ? std::max(1, atoi(getenv("LLAMA_MOE_CACHE_LOG_EVERY"))) : 64;
++        if (ep.n_plans <= 4 || ep.n_plans % log_every == 0) {
++            const double GB = 1e9;
++            LLAMA_LOG_INFO("%s: LLAMA_TP_EP_CACHE plan %llu: %d layers: card 0 uploads %.1f GB (%.1f GB from its cache), card 1 %.1f GB (%.1f GB); "
++                "the larger card's upload a layer sums to %.1f GB (the fixed halves: %.1f GB)\n", __func__, (unsigned long long) ep.n_plans, n_layers,
++                up[0]/GB, local[0]/GB, up[1]/GB, local[1]/GB, worst/GB, worst_fixed/GB);
++        }
++        return true;
++    }
++
+     static const ggml_tensor * base_of(const ggml_tensor * t) {
+         while (t->view_src != nullptr) {
+             t = t->view_src;
+@@ -2640,6 +2796,38 @@ const void * llama_moe_cache::cached_expert(ggml_backend_t backend, const ggml_t
+     return pimpl->cached_expert(backend, w, e);
+ }
+ 
++bool llama_moe_cache::ep_plan(const ggml_backend_t be[2], const std::vector<int> & home, const std::vector<size_t> & w_bytes) {
++    return pimpl->ep_plan(be, home, w_bytes);
++}
++
++ggml_tensor * llama_moe_cache::ep_ids(int32_t il, int c) const {
++    const auto & ep = pimpl->ep;
++    return ep.on && il >= 0 && il < (int32_t) ep.layers.size() && (c == 0 || c == 1) && ep.layers[il].home >= 0 ? ep.layers[il].ids[c] : nullptr;
++}
++
++int64_t llama_moe_cache::ep_view_n(int32_t il, int c) const {
++    const auto & ep = pimpl->ep;
++    GGML_ASSERT(ep_ids(il, c) != nullptr);
++    return ep.layers[il].home == c ? ep.n_view_home : ep.n_view_other;
++}
++
++const std::vector<int32_t> * llama_moe_cache::ep_src(int32_t il, int c) const {
++    return ep_ids(il, c) != nullptr ? &pimpl->ep.layers[il].src[c] : nullptr;
++}
++
++int llama_moe_cache::ep_card(ggml_backend_t backend) const {
++    const auto & ep = pimpl->ep;
++    if (!ep.on) {
++        return -1;
++    }
++    for (int c = 0; c < 2; ++c) {
++        if (llama_moe_cache_same_device(backend, ep.be[c])) {
++            return c;
++        }
++    }
++    return -1;
++}
++
+ int32_t llama_moe_cache::layer_of_weight(const ggml_tensor * w) const {
+     return pimpl->layer_of_weight(w);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index cf392ba78..e295ac6a0 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -68,6 +68,17 @@ public:
+     // the device address of expert e of w in the cache banks of the backend's device, nullptr if not cached (large batches, gather copy)
+     const void * cached_expert(ggml_backend_t backend, const ggml_tensor * w, int64_t e);
+ 
++    // 0107 LLAMA_TP_EP_CACHE=1: the expert split of LLAMA_TP_PROMPT's both-cards graph follows the cache.  ep_plan, before each build of
++    // that graph (be: its two cards, home: each layer's card, w_bytes: the weight copies a layer's other card uploads): per MoE layer the
++    // home card takes the experts its cache holds and a share of the uncached ones sized so both cards upload about the same bytes; card
++    // c's experts are a view of ep_view_n experts filled by position from ep_src, and the router's ids reach its MUL_MAT_IDs through
++    // ep_ids (I32 [1, n_expert] on card c: expert -> position, -1 for the other card's); nullptr / -1 when off
++    bool          ep_plan(const ggml_backend_t be[2], const std::vector<int> & home, const std::vector<size_t> & w_bytes);
++    ggml_tensor * ep_ids(int32_t il, int c) const;
++    int64_t       ep_view_n(int32_t il, int c) const;
++    const std::vector<int32_t> * ep_src(int32_t il, int c) const;
++    int           ep_card(ggml_backend_t backend) const; // 0 or 1 for the plan's cards, -1 otherwise or when off
++
+     // prompt-informed admission (LLAMA_MOE_CACHE_ADMIT, default 32 experts per layer, 0 = off): the experts selected by large batches
+     // (prompt processing) are counted per layer; the first small batch after them loads the top experts of each layer into the cache,
+     // so generation after a prompt starts with the prompt's hot set instead of the previous generation's
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index b3d9ba5d5..bf02594e9 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -289,6 +289,22 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             return ggml_reshape_4d(ctx0, w, view->ne[0], view->ne[1], view->ne[2], view->ne[3]);
+         };
+ 
++        // 0107 LLAMA_TP_EP_CACHE=1: this graph's expert split planned from the cache (a layer's weight copies in host memory go up to
++        // its other card and count toward that card's share)
++        if (moe_cache != nullptr) {
++            std::vector<int>    home(n_layer);
++            std::vector<size_t> w_bytes(n_layer, 0);
++            for (int il = 0; il < n_layer; ++il) {
++                home[il] = model.tp_home(il);
++            }
++            for (const auto & kv : model.tp_shadow_il) {
++                if (kv.second >= 0 && kv.second < n_layer) {
++                    w_bytes[kv.second] += ggml_nbytes(kv.first);
++                }
++            }
++            moe_cache->ep_plan(be, home, w_bytes);
++        }
++
+         ggml_tensor * x[2];
+         ggml_tensor * pos[2];
+         ggml_tensor * prev_top_k[2] = { nullptr, nullptr };
+-- 
+2.43.0
+

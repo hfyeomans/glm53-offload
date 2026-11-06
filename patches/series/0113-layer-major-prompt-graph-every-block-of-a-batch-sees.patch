@@ -1,0 +1,84 @@
+From 9cbda09f046c2e0ff69d8a273b0ac6d6d3e3eed0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 12:08:17 -0600
+Subject: [PATCH 113/141] layer-major prompt graph: every block of a batch sees
+ the keys to the batch end (cparams.lm_kv_end), one size for all its ubatches,
+ so consecutive ubatches fit the allocator plan instead of re-planning (and
+ synchronizing) each time; the staircase is wider by a batch
+
+---
+ src/llama-context.cpp  | 11 ++++++++++-
+ src/llama-cparams.h    |  1 +
+ src/models/glm-dsa.cpp |  8 +++++---
+ 3 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 32e8fbcb3..719a6f271 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -904,7 +904,7 @@ void llama_context::lm_z_init() {
+     const uint32_t R  = llama_lm_rows();
+     const int64_t  Rp = GGML_PAD((int64_t) R, 8);
+     const int64_t  S  = GGML_PAD((int64_t) cparams.n_ctx, 8);
+-    const int64_t  W  = S + Rp + 512;
++    const int64_t  W  = S + Rp + 512 + GGML_PAD((int64_t) std::min(cparams.n_batch, cparams.n_ctx), 8); // 0114: keys to the batch's end
+     const int64_t  H  = Rp + 8;
+     std::vector<ggml_backend_dev_t> devs;
+     for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+@@ -2331,6 +2331,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     cparams.tp_batch_single = balloc->get_n_tokens() <= cparams.n_ubatch;
+     cparams.lm_rows    = lm_try ? lm_R : 0; // 0108
+     cparams.lm_reserve = false;
++    // 0114: the batch's key extent, one value for all its ubatches
++    cparams.lm_kv_end = 0;
++    if (lm_try) {
++        llama_pos p_end = -1;
++        for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
++            p_end = std::max(p_end, balloc->seq_pos_max((llama_seq_id) s));
++        }
++        cparams.lm_kv_end = p_end >= 0 ? (uint32_t) GGML_PAD((int64_t) p_end + 1, 256) : 0;
++    }
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 6c2877a8b..e8ae505be 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -55,6 +55,7 @@ struct llama_cparams {
+     // usual graph; set by decode() and sched_reserve()); lm_reserve: a reserve graph, every block sized for the whole cache
+     uint32_t lm_rows    = 0;
+     bool     lm_reserve = false;
++    uint32_t lm_kv_end  = 0; // 0114: the keys every block of the batch sees (pad256 of its last position + 1)
+     bool auto_ftkm;
+     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+     bool auto_fkvr;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 77cc31af2..f55ab2790 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -601,8 +601,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         };
+         ggml_tensor * Z0 = lm_z->front().second;
+         const int64_t Rp = GGML_PAD(R, 8);
+-        const int64_t S  = Z0->ne[0] - Rp - 512;
+-        GGML_ASSERT(S > 0 && Z0->ne[1] >= Rp + 8);
++        const int64_t S  = GGML_PAD((int64_t) cparams.n_ctx, 8); // 0114: the staircase is wider by a batch
++        GGML_ASSERT(S > 0 && S + Rp + 512 <= Z0->ne[0] && Z0->ne[1] >= Rp + 8);
+ 
+         // the attention blocks: rows [r0, r0 + nr), keys [0, n_kv), the staircase view at column c, row d
+         struct lm_block { int64_t r0, nr, n_kv, c, d; };
+@@ -617,7 +617,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             if (!cparams.lm_reserve) {
+                 const int64_t p0   = ubatch.pos[b.r0];
+                 const int64_t base = S - p0;
+-                b.n_kv = std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
++                // 0114: the batch's key extent for every block (the usual graph's n_kv is one value for a batch): keys that grew with p0
++                // outgrew the allocator's plan each ubatch, and re-planning synchronizes every backend
++                b.n_kv = std::min<int64_t>(n_kv, cparams.lm_kv_end > 0 ? (int64_t) cparams.lm_kv_end : GGML_PAD(p0 + b.nr, 256));
+                 b.c    = GGML_PAD(base, 8);
+                 b.d    = b.c - base;
+                 GGML_ASSERT(base >= 1 && b.c + b.n_kv <= Z0->ne[0] && b.d + b.nr <= Z0->ne[1]);
+-- 
+2.43.0
+

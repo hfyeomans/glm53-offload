@@ -1,0 +1,40 @@
+From cd630094e37da1c7bf20a5a2aa4c7f6f3869626c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:17:11 -0600
+Subject: [PATCH 033/141] LLAMA_MOE_ROUTE_PROTECT=R: the R best experts by the
+ unbiased score stay selected under cache-aware routing
+
+---
+ src/llama-graph.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 49bc68417..214c690cc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2280,8 +2280,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (moe_cache != nullptr) {
+         ggml_tensor * route_bias = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
+         if (route_bias != nullptr) {
++            // LLAMA_MOE_ROUTE_PROTECT=R: the R best experts by the unbiased score stay selected, the bias only steers the rest
++            static const int route_protect = getenv("LLAMA_MOE_ROUTE_PROTECT") != nullptr ? atoi(getenv("LLAMA_MOE_ROUTE_PROTECT")) : 0;
++            ggml_tensor * keep = nullptr;
++            if (route_protect > 0 && route_protect < n_expert_used) {
++                keep = ggml_argsort_top_k(ctx0, selection_probs, route_protect); // [R, n_tokens]
++                cb(keep, "ffn_moe_route_keep", il);
++            }
+             selection_probs = ggml_add(ctx0, selection_probs, route_bias);
+             cb(selection_probs, "ffn_moe_probs_cache_bias", il);
++            if (keep != nullptr) {
++                ggml_tensor * sp3  = ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens);
++                ggml_tensor * rows = ggml_scale_bias(ctx0, ggml_get_rows(ctx0, sp3, keep), 1.0f, 1e4f); // the kept rows lifted above any score
++                sp3 = ggml_set_rows(ctx0, sp3, rows, keep);
++                selection_probs = ggml_reshape_2d(ctx0, sp3, n_expert, n_tokens);
++                cb(selection_probs, "ffn_moe_probs_cache_bias_kept", il);
++            }
+         }
+     }
+ 
+-- 
+2.43.0
+

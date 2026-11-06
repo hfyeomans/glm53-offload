@@ -1,0 +1,55 @@
+From 38603ff1f29e6155dba3271ac8404ce1313c697f Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 16:06:32 -0600
+Subject: [PATCH 091/141] moe prompt verify (LLAMA_MOE_PROMPT_VERIFY=1): the
+ gathered slot against the host weights, staged and uploaded experts
+
+---
+ src/llama-context.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f7961d45b..c8fa1511d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3324,6 +3324,37 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+             }
+             // upload all the experts, the cached ones from the device banks: the slot map is host memory, so no wait for the ids
+             if (lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0 && gather_all()) {
++                // 0092 LLAMA_MOE_PROMPT_VERIFY=1: the gathered slot against the host weights, the staged experts and 4 uploaded ones
++                static const bool verify = getenv("LLAMA_MOE_PROMPT_VERIFY") != nullptr && atoi(getenv("LLAMA_MOE_PROMPT_VERIFY")) != 0;
++                if (verify && dst->data != nullptr) {
++                    static int64_t n_staged = 0, n_staged_bad = 0, n_up = 0, n_up_bad = 0, n_t = 0;
++                    static std::vector<uint8_t> buf;
++                    ggml_backend_synchronize(backend);
++                    int n_up_t = 0;
++                    for (int64_t e = 0; e < n_expert; ++e) {
++                        const bool staged = lctx->moe_cache->prompt_staged(src, e) != nullptr;
++                        const bool skip   = lctx->moe_cache->prompt_skip(src, e);
++                        const bool cached = lctx->moe_cache->cached_expert(backend, src, e) != nullptr;
++                        if (skip || (!staged && (cached || n_up_t >= 4))) {
++                            continue;
++                        }
++                        buf.resize(expert_size);
++                        ggml_backend_tensor_get(dst, buf.data(), (size_t) e*expert_size, expert_size);
++                        const bool bad = memcmp(buf.data(), (const uint8_t *) src->data + (size_t) e*expert_size, expert_size) != 0;
++                        if (staged) {
++                            n_staged++;
++                            n_staged_bad += bad;
++                        } else {
++                            n_up++;
++                            n_up_bad += bad;
++                            n_up_t++;
++                        }
++                    }
++                    if (++n_t % 225 == 0) {
++                        LLAMA_LOG_INFO("moe prompt verify: %lld tensors: staged experts %lld checked, %lld differ; uploaded %lld checked, %lld differ\n",
++                            (long long) n_t, (long long) n_staged, (long long) n_staged_bad, (long long) n_up, (long long) n_up_bad);
++                    }
++                }
+                 lctx->moe_cache->prompt_after_gather(backend, src); // 0090: the next layer's prefetch, behind this layer's uploads
+                 st.cur_path = 1;
+                 return true;
+-- 
+2.43.0
+

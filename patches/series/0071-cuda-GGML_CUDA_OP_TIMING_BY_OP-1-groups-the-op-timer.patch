@@ -1,0 +1,30 @@
+From 305e1b8d840b0d75ce185716536c51889b48795b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:21:05 -0600
+Subject: [PATCH 071/141] cuda: GGML_CUDA_OP_TIMING_BY_OP=1 groups the op timer
+ by op and weight type only
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1a0165c3d..01352fc69 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4989,7 +4989,11 @@ static void ggml_cuda_op_timing_end(ggml_backend_cuda_context * cuda_ctx, int sl
+     if (dash != std::string::npos && dash + 1 < name.size() && name.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
+         name.resize(dash);
+     }
+-    key += name;
++    // 0070 GGML_CUDA_OP_TIMING_BY_OP=1: one row per op and weight type, whatever the node is called
++    static const bool by_op = getenv("GGML_CUDA_OP_TIMING_BY_OP") != nullptr && atoi(getenv("GGML_CUDA_OP_TIMING_BY_OP")) != 0;
++    if (!by_op) {
++        key += name;
++    }
+     auto it = t.ids.find(key);
+     if (it == t.ids.end()) {
+         it = t.ids.emplace(key, (int) t.names.size()).first;
+-- 
+2.43.0
+

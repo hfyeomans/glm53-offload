@@ -1,0 +1,41 @@
+From 1afa79d13bad5897e56147969bbaf57d026a1712 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:06:17 -0600
+Subject: [PATCH 123/141] GGML_GALLOCR_PEAK: also why a node of 1 GiB or more
+ is not in place over its parent
+
+---
+ ggml/src/ggml-alloc.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b37c99749..c7d8a9d57 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -735,6 +735,23 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+                 }
+             }
+         }
++        // 0123 GGML_GALLOCR_PEAK: why a node of 1 GiB or more is not in place over a parent of its size
++        if (gallocr_peak_mib() > 0 && ggml_op_can_inplace(node->op) && ggml_nbytes(node) >= ((size_t) 1 << 30)) {
++            for (int i = 0; i < GGML_MAX_SRC; i++) {
++                struct ggml_tensor * parent = node->src[i];
++                if (parent == NULL || ggml_nbytes(parent) != ggml_nbytes(node)) {
++                    continue;
++                }
++                struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
++                static int n_said = 0;
++                if (n_said++ < 8) {
++                    GGML_LOG_INFO("gallocr inplace: %s (%s) not over src%d %s (%s): own %d output %d same layout %d children %d views %d view %d\n",
++                        node->name, ggml_op_desc(node), i, parent->name, ggml_op_desc(parent), (int) ggml_gallocr_is_own(galloc, parent),
++                        (int) ((parent->flags & GGML_TENSOR_FLAG_OUTPUT) != 0), (int) ggml_are_same_layout(node, parent), p_hn->n_children,
++                        p_hn->n_views, (int) ggml_impl_is_view(parent));
++                }
++            }
++        }
+         // allocate tensor from the buffer
+         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
+         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
+-- 
+2.43.0
+

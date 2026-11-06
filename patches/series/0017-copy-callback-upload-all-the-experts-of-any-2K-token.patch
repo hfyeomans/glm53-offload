@@ -1,0 +1,30 @@
+From 284cbc3fca9880639cc12338686cad25afce5f7c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:51:27 -0600
+Subject: [PATCH 017/141] copy callback: upload all the experts of any 2K+
+ token ubatch under pipeline parallelism, full or not
+ (LLAMA_MOE_UPLOAD_ALL_FULL_ONLY=1 restores the old rule)
+
+---
+ src/llama-context.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 54b61d0c9..ce730b1d9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2993,7 +2993,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     if (lctx->cparams.pipeline_parallel) {
+         const int64_t n_ids      = ggml_nelements(ids);
+         const bool    full_batch = ids->ne[1] >= (int64_t) std::min(lctx->cparams.n_ctx, lctx->cparams.n_ubatch);
+-        st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : full_batch && n_ids >= 64*n_expert);
++        // 64 ids per expert is enough for the upload whether or not the ubatch is full: a partial first ubatch (a prompt shorter than
++        // n_ubatch) otherwise reads its ids per layer with a synchronize each (LLAMA_MOE_UPLOAD_ALL_FULL_ONLY=1 restores the old rule)
++        static const bool full_only = getenv("LLAMA_MOE_UPLOAD_ALL_FULL_ONLY") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_ALL_FULL_ONLY")) != 0;
++        st.upload_all = st.upload_all || (st.prev_in_flight ? n_ids >= 16*n_expert : (full_batch || !full_only) && n_ids >= 64*n_expert);
+         if (st.upload_all) {
+             // the ids are not read here (it would stall the graphs in flight); the MoE cache counts them asynchronously for admission
+             if (lctx->moe_cache && ids != st.ids_noted) {
+-- 
+2.43.0
+

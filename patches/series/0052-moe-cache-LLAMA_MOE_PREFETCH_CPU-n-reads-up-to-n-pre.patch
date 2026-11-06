@@ -1,0 +1,124 @@
+From dc0d424da98cb7b720fd66736386db3a98d9adfe Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 22:19:14 -0600
+Subject: [PATCH 052/141] moe-cache: LLAMA_MOE_PREFETCH_CPU=n reads up to n
+ predicted misses into the caches of the cores that will compute them before
+ the plan waits for the ids
+
+---
+ src/llama-moe-cache.cpp | 67 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 9b72b7a1a..ef1a70bdc 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -470,11 +470,20 @@ struct llama_moe_cache::impl {
+     std::vector<int32_t> pq_sel;    // [n_tok][n_expert_used] the predicted experts
+     std::vector<uint8_t> pq_miss;   // [n_expert] predicted and absent from the slot map when predicted
+     int32_t              pq_il = -1; // the layer pq_sel predicts
++    // LLAMA_MOE_PREFETCH_CPU=n (0051): up to n predicted misses read into the computing cores' caches before the plan
++    static int32_t prefetch_cpu_max() {
++        static const int32_t v = getenv("LLAMA_MOE_PREFETCH_CPU") != nullptr ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_CPU"))) : 0;
++        return v;
++    }
++    std::vector<int32_t> pq_pf;      // the experts to prefetch
++    std::vector<uint8_t> pq_pf_mark; // [n_expert]
++    int                  pq_mode = 0; // the op: 0 predicts, 1 prefetches
++    uint64_t             pq_sink = 0;
+     ggml_backend_ptr     pq_cpu;
+     ggml_context_ptr     pq_ctx;
+     ggml_cgraph *        pq_gf = nullptr;
+     struct pq_stats {
+-        double n = 0, sel = 0, sel_hit = 0, miss = 0, miss_hit = 0, pred_miss = 0, t_pred = 0;
++        double n = 0, sel = 0, sel_hit = 0, miss = 0, miss_hit = 0, pred_miss = 0, t_pred = 0, pf = 0, pf_hit = 0, t_pf = 0;
+         std::vector<float> win;
+     } pqs;
+ 
+@@ -482,6 +491,25 @@ struct llama_moe_cache::impl {
+         GGML_UNUSED(dst);
+         GGML_UNUSED(a);
+         impl * self = (impl *) ud;
++        if (self->pq_mode == 1) {
++            // thread ith reads the rows of each expert matrix that MUL_MAT_ID's static split gives thread ith
++            uint64_t s = 0;
++            for (const ggml_tensor * w : self->layers[self->pq_il].experts) {
++                const int64_t nr = w->ne[1];
++                const int64_t dr = (nr + nth - 1)/nth;
++                const int64_t r0 = std::min<int64_t>(dr*ith, nr), r1 = std::min<int64_t>(r0 + dr, nr);
++                for (const int32_t e : self->pq_pf) {
++                    const uint8_t * base = (const uint8_t *) w->data + (size_t) e*w->nb[2];
++                    for (const uint8_t * q = base + r0*w->nb[1]; q < base + r1*w->nb[1]; q += 64) {
++                        s += *(const volatile uint64_t *) q;
++                    }
++                }
++            }
++            if (s == 0x5555) {
++                self->pq_sink += s; // keeps the reads
++            }
++            return;
++        }
+         const pred_layer & p = self->pq[self->pq_il];
+         const int64_t ne = self->pq_n_embd, nx = self->pq_n_expert, nt = self->pq_n_tok;
+         for (int64_t e = ith*nx/nth; e < (ith + 1)*nx/nth; ++e) {
+@@ -541,6 +569,35 @@ struct llama_moe_cache::impl {
+             }
+         }
+         pqs.t_pred += ggml_time_us() - t0;
++
++        // LLAMA_MOE_PREFETCH_CPU (0051): the predicted misses with the highest scores, read by the cores that will compute them
++        pq_pf.clear();
++        pq_pf_mark.assign(nx, 0);
++        if (prefetch_cpu_max() > 0) {
++            std::vector<std::pair<float, int32_t>> best;
++            for (int64_t e = 0; e < nx; ++e) {
++                if (!pq_miss[e]) {
++                    continue;
++                }
++                float s = -1e30f;
++                for (int64_t t = 0; t < pq_n_tok; ++t) {
++                    s = std::max(s, pq_logits[t*nx + e]);
++                }
++                best.push_back({ s, (int32_t) e });
++            }
++            std::sort(best.begin(), best.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
++            for (size_t i = 0; i < best.size() && (int32_t) i < prefetch_cpu_max(); ++i) {
++                pq_pf.push_back(best[i].second);
++                pq_pf_mark[best[i].second] = 1;
++            }
++            if (!pq_pf.empty()) {
++                const int64_t t1 = ggml_time_us();
++                pq_mode = 1;
++                ggml_backend_graph_compute(pq_cpu.get(), pq_gf);
++                pq_mode = 0;
++                pqs.t_pf += ggml_time_us() - t1;
++            }
++        }
+     }
+ 
+     // after the plan of il: score the prediction, keep il's FFN input for il+1
+@@ -562,6 +619,10 @@ struct llama_moe_cache::impl {
+                 pqs.miss      += fill_mark[e];
+                 pqs.miss_hit  += fill_mark[e] && pq_miss[e];
+                 pqs.pred_miss += pq_miss[e];
++                if (!pq_pf_mark.empty()) {
++                    pqs.pf     += pq_pf_mark[e];
++                    pqs.pf_hit += pq_pf_mark[e] && fill_mark[e];
++                }
+             }
+             pqs.n += 1;
+             pqs.win.push_back((float) (t_ids - t_ready));
+@@ -573,6 +634,10 @@ struct llama_moe_cache::impl {
+                     pqs.n, n_expert_used, 100.0*pqs.sel_hit/std::max(1.0, pqs.sel), pqs.miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.miss),
+                     pqs.pred_miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.pred_miss), pqs.t_pred/pqs.n,
+                     (double) w[w.size()/2], (double) w[w.size()/4], (double) w[w.size()*3/4]);
++                if (pqs.pf > 0) {
++                    LLAMA_LOG_INFO("llama_moe_cache: prefetch: %.2f experts per layer read ahead in %.1f us, %.1f %% of them computed on the CPU\n",
++                        pqs.pf/pqs.n, pqs.t_pf/pqs.n, 100.0*pqs.pf_hit/pqs.pf);
++                }
+                 pqs = pq_stats();
+             }
+         }
+-- 
+2.43.0
+

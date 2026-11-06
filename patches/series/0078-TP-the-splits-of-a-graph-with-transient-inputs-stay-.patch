@@ -1,0 +1,65 @@
+From 4633e1d787e1a7ed2dc3b3a567f382761fcb5432 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 08:17:33 -0600
+Subject: [PATCH 078/141] TP: the splits of a graph with transient inputs stay
+ out of the CUDA graph cache (GGML_TP_CUDA_GRAPHS=1 keeps them)
+
+---
+ ggml/src/ggml-backend.cpp       |  3 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 11 +++++++----
+ ggml/src/ggml-impl.h            |  3 +++
+ 3 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d6a4e1abc..4cff5fe3e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1939,6 +1939,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+     for (int i = 0; i < sched->n_splits; i++) {
+         struct ggml_backend_sched_split * split = &sched->splits[i];
+         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
++        // 0079: the splits of a graph with transient inputs (LLAMA_TP_PROMPT) stay out of the backend's graph cache
++        static const bool tp_backend_graphs = getenv("GGML_TP_CUDA_GRAPHS") != NULL && atoi(getenv("GGML_TP_CUDA_GRAPHS")) != 0;
++        split->graph.no_backend_graph = sched->transient_inputs && !tp_backend_graphs;
+ 
+         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4de95e9e6..4d73204f7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5436,10 +5436,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+-
+-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    // 0079: a graph marked no_backend_graph (the splits of LLAMA_TP_PROMPT's graph) neither uses nor creates a graph cache entry
++    ggml_cuda_graph * graph = nullptr;
++    if (!cgraph->no_backend_graph) {
++        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
++        graph = cuda_ctx->cuda_graph(graph_key);
++    }
++    if (graph != nullptr && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 4dc55e78e..77ff443de 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -356,6 +356,9 @@ struct ggml_cgraph {
+     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
+     // a value of 0 means it is not set and should be ignored
+     uint64_t uid;
++
++    // 0079: the backend runs this graph without its graph cache (CUDA graphs): neither looked up nor created
++    bool no_backend_graph;
+ };
+ 
+ // returns a slice of cgraph with nodes [i0, i1)
+-- 
+2.43.0
+

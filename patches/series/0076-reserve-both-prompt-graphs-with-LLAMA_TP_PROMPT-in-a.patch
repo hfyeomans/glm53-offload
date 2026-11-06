@@ -1,0 +1,55 @@
+From 62be70df94e8e3b508fdb78b98bc24cb47c7f82e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 07:20:14 -0600
+Subject: [PATCH 076/141] reserve both prompt graphs with LLAMA_TP_PROMPT; in a
+ graph with transient inputs a host weight does not start a new split
+
+---
+ ggml/src/ggml-backend.cpp | 3 ++-
+ src/llama-context.cpp     | 9 +++++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ca81a6a2f..d6a4e1abc 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1781,7 +1781,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     }
+                     // check if a weight is on a different and incompatible backend
+                     // by starting a new split, the memory of the previously offloaded weights can be reused
+-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                    // (0076: not in a graph with transient inputs, whose host weights are a layer's worth at a time)
++                    if (!sched->transient_inputs && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                         int src_backend_id = tensor_backend_id(src);
+                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                             need_new_split = true;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a13e37dc2..82b629603 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -904,6 +904,7 @@ void llama_context::sched_reserve() {
+ 
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
++        cparams.tp_batch_single = false; // 0075: the layer-split prompt graph (the both-cards one is reserved at the end)
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                 model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+         if (!gf) {
+@@ -963,6 +964,14 @@ void llama_context::sched_reserve() {
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute pp buffers");
+         }
++
++        // 0075 LLAMA_TP_PROMPT: the both-cards prompt graph too (single-ubatch batches), so neither prompt graph grows the buffers later
++        if (model.tp_devs.size() == 2) {
++            cparams.tp_batch_single = true;
++            if (!graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc())) {
++                throw std::runtime_error("failed to allocate compute pp buffers (both-cards prompt graph)");
++            }
++        }
+     }
+ 
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+-- 
+2.43.0
+

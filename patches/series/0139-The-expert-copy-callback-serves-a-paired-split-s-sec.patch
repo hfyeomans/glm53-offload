@@ -1,0 +1,39 @@
+From 2fad675a8f1e28f07fe71dfc508cfcb19ed819b3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:50:17 -0600
+Subject: [PATCH 139/141] The expert copy callback serves a paired split's
+ second MUL_MAT_ID (same ids as the first), not only node 0
+
+---
+ src/llama-context.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6ececbf43..93b27e4e3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3397,7 +3397,20 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     }
+     const ggml_tensor * node = ggml_graph_node(graph, 0);
+     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+-        return false;
++        // 0135: the second MUL_MAT_ID of a gate / up pair (0131) reads the same ids as the split's first node
++        const ggml_tensor * n0 = node;
++        node = nullptr;
++        if (n0->op == GGML_OP_MUL_MAT_ID) {
++            for (int i = 1; i < std::min(8, ggml_graph_n_nodes(graph)) && node == nullptr; ++i) {
++                const ggml_tensor * ni = ggml_graph_node(graph, i);
++                if (ni->op == GGML_OP_MUL_MAT_ID && ni->src[0] == dst && ni->src[2] == n0->src[2]) {
++                    node = ni;
++                }
++            }
++        }
++        if (node == nullptr) {
++            return false;
++        }
+     }
+ 
+     const ggml_tensor * ids = node->src[2];
+-- 
+2.43.0
+

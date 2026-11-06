@@ -1,0 +1,70 @@
+From 30533d17d0de28639fafee70c242af84da337558 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 18:12:45 -0600
+Subject: [PATCH 044/141] context: LLAMA_BACKEND_SAMPLER_KEEP_RESERVE=1 keeps
+ the scheduler reserve when a backend sampler chain of the same length
+ replaces the last one or a sampler is cleared
+
+---
+ src/llama-context.cpp | 16 ++++++++++++++--
+ src/llama-context.h   |  3 +++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e50c4529d..83718c41e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1547,6 +1547,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         sampler->iface->backend_apply &&
+         llama_sampler_chain_n(sampler) > 0;
+ 
++    // LLAMA_BACKEND_SAMPLER_KEEP_RESERVE (0043): a chain of the same length as the sequence's last one keeps the reserve
++    static const bool keep_reserve = getenv("LLAMA_BACKEND_SAMPLER_KEEP_RESERVE") != nullptr && atoi(getenv("LLAMA_BACKEND_SAMPLER_KEEP_RESERVE")) != 0;
++
+     if (sampler && can_offload) {
+         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+ 
+@@ -1554,7 +1557,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+         sampling.samplers[seq_id] = sampler;
+ 
+-        sched_need_reserve = true;
++        const int  n_chain    = llama_sampler_chain_n(sampler);
++        const auto last       = sampling.chain_len_last.find(seq_id);
++        const bool same_shape = keep_reserve && last != sampling.chain_len_last.end() && last->second == n_chain;
++        sampling.chain_len_last[seq_id] = n_chain;
++
++        if (!same_shape) {
++            sched_need_reserve = true;
++        }
+ 
+         return true;
+     }
+@@ -1573,7 +1583,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+     sampling.samplers.erase(seq_id);
+ 
+-    sched_need_reserve = true;
++    if (!keep_reserve) {
++        sched_need_reserve = true;
++    }
+ 
+     return true;
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a95c7dd9e..9bf76ae6d 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -330,6 +330,9 @@ private:
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
+ 
++        // 0043: length of the last backend chain set per sequence (LLAMA_BACKEND_SAMPLER_KEEP_RESERVE)
++        std::map<llama_seq_id, int> chain_len_last;
++
+         buffer_view<float>       logits     = {nullptr, 0};
+         buffer_view<llama_token> sampled    = {nullptr, 0};
+         buffer_view<float>       probs      = {nullptr, 0};
+-- 
+2.43.0
+

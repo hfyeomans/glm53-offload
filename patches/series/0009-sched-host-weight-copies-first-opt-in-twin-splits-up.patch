@@ -1,0 +1,143 @@
+From afea04ea8ea194f949baabb9e262d4ffd39cdebd Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:16:46 -0600
+Subject: [PATCH 009/141] sched: host-weight copies first (opt-in); twin splits
+ upload everything and serve prompts of 1024+ tokens
+
+The copy of a split non-host input makes the split backend stream wait on the producer event before the host-weight
+uploads are enqueued, so a twin upload started only after the previous layer attention: serialized again (N=2: +8-14 %).
+ggml_backend_sched_set_host_weights_first enqueues the uploads first; the twin callback never reads the ids.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/include/ggml-backend.h |  3 +++
+ ggml/src/ggml-backend.cpp   | 23 ++++++++++++++---------
+ src/llama-context.cpp       | 29 +++++++++++++++++++++++++++++
+ src/llama-graph.cpp         |  2 +-
+ 4 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 0fce05b9a..ffa010c90 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -377,6 +377,9 @@ extern "C" {
+ 
+     // Set a callback to be called when the inputs of a split are being copied
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
++    // enqueue the copies of a split's weights in host memory before the copies of its other inputs, so they start before the split
++    // waits for inputs computed by other backends (the copy callback must then not read those inputs)
++    GGML_API void                 ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, bool enable);
+ 
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index cb0426a81..1e80bd7a7 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1229,6 +1229,7 @@ struct ggml_backend_sched {
+ 
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
++    bool host_weights_first = false; // see ggml_backend_sched_set_host_weights_first
+ 
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+@@ -2211,15 +2212,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         // copy the input tensors to the split backend
+-        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+-            if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+-            }
+-        }
+-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+-            if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++        // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split, unless the
++        // user wants them first: their copies then start before the split backend waits for inputs computed by other backends
++        for (int pass = 0; pass < 2; pass++) {
++            const bool host_pass = sched->host_weights_first ? pass == 0 : pass == 1;
++            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
++                if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) == host_pass) {
++                    ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                }
+             }
+         }
+ 
+@@ -2376,6 +2376,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     free(sched);
+ }
+ 
++void ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, bool enable) {
++    GGML_ASSERT(sched);
++    sched->host_weights_first = enable;
++}
++
+ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     // reset state for the next run
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c8bf8d93a..121aafb9b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -801,6 +801,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    if (!twins.empty()) {
++        ggml_backend_sched_set_host_weights_first(sched.get(), true); // a twin's uploads start before it waits for the primary
++    }
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
+@@ -2912,6 +2915,32 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++    // on a twin backend the host weights are copied before the other inputs of the split (host_weights_first), so the ids are
++    // not readable here: upload all the experts, the cached ones from the device banks
++    bool is_twin = false;
++    for (const auto & pt : lctx->twins) {
++        is_twin = is_twin || pt.second == backend;
++    }
++    if (is_twin && lctx->moe_cache && lctx->moe_cache->layer_of_weight(src) >= 0) {
++        int64_t next = 0;
++        for (int64_t e = 0; e < n_expert; ) {
++            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, n_expert - 1);
++            if (n == 0) {
++                e++;
++                continue;
++            }
++            if (next < e) {
++                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
++            }
++            e   += n;
++            next = e;
++        }
++        if (next < n_expert) {
++            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
++        }
++        return true;
++    }
++
+     // with pipeline parallelism, reading the ids would stall the graphs in flight, so upload all the experts of a large batch:
+     // 16 ids per expert while a previous graph runs, else a full batch with 64 ids per expert (the graph may be alone)
+     // the flag stays for the rest of the graph, e.g. for the last layer on the output rows
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ced42c70a..98fd58184 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2552,7 +2552,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // so the scheduler copies this layer's experts while the primary backend computes the previous layer
+     ggml_backend_t twin = nullptr;
+     const int n_nodes_twin = ggml_graph_n_nodes(gf);
+-    if (twins != nullptr && slots == nullptr && moe_cache != nullptr && il >= 0 && n_tokens > 32 &&
++    if (twins != nullptr && slots == nullptr && moe_cache != nullptr && il >= 0 && n_tokens >= 1024 &&
+         moe_cache->get_experts(up_exps != nullptr ? up_exps : gate_up_exps) != nullptr) {
+         // the twins of the layer's device, in order; layer il rotates over them so consecutive layers upload on different streams
+         ggml_backend_t primary = moe_cache->backend(il);
+-- 
+2.43.0
+

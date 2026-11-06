@@ -1,0 +1,78 @@
+From cbb44e9701a0a5f8060dc24e07c5b6580fdc202b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:35:09 -0600
+Subject: [PATCH 011/141] sched: GGML_SCHED_TIMING=1 logs the host issue time
+ per graph (copies, compute launches)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f1e0939c7..15a164b19 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2186,10 +2186,19 @@ static void ggml_backend_sched_upload_user_inputs(ggml_backend_sched_t sched) {
+     }
+ }
+ 
++static bool ggml_backend_sched_timing_enabled(void) {
++    static const bool enabled = getenv("GGML_SCHED_TIMING") != NULL && atoi(getenv("GGML_SCHED_TIMING")) > 0;
++    return enabled;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
++    const bool timing = ggml_backend_sched_timing_enabled();
++    const int64_t t_start = timing ? ggml_time_us() : 0;
++    int64_t t_copies = 0, t_compute = 0, n_copy_inputs = 0, n_host_weights = 0;
++
+     int prev_backend_id = -1;
+ 
+     if (sched->n_copies > 1) {
+@@ -2214,17 +2223,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // copy the input tensors to the split backend
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split, unless the
+         // user wants them first: their copies then start before the split backend waits for inputs computed by other backends
++        const int64_t t0 = timing ? ggml_time_us() : 0;
+         for (int pass = 0; pass < 2; pass++) {
+             const bool host_pass = sched->host_weights_first[split_backend_id] ? pass == 0 : pass == 1;
+             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                 if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) == host_pass) {
+                     ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
++                    n_copy_inputs++;
++                    n_host_weights += host_pass;
+                 }
+             }
+         }
++        const int64_t t1 = timing ? ggml_time_us() : 0;
++        t_copies += t1 - t0;
+ 
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            if (timing) {
++                t_compute += ggml_time_us() - t1;
++            }
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
+@@ -2270,6 +2287,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (timing) {
++        const int64_t t_total = ggml_time_us() - t_start;
++        GGML_LOG_INFO("sched timing: %d splits, %d nodes: host %.1f ms = copies %.1f ms (%lld inputs, %lld host weights) + compute launches %.1f ms + other %.1f ms\n",
++            sched->n_splits, sched->graph.n_nodes, t_total/1000.0, t_copies/1000.0, (long long) n_copy_inputs, (long long) n_host_weights,
++            t_compute/1000.0, (t_total - t_copies - t_compute)/1000.0);
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+-- 
+2.43.0
+

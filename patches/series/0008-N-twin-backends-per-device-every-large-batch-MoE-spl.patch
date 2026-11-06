@@ -1,0 +1,244 @@
+From 065d1a7855e5fed453cf3c52ec1497081fb3c752 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:06:08 -0600
+Subject: [PATCH 008/141] N twin backends per device: every large-batch MoE
+ split rotates over the twins
+
+LLAMA_TWIN_BACKENDS=N creates N twins per GPU (ggml_backend_cuda_init_twin(device, k)); the primary keeps attention and
+layer il uploads and computes its experts on twin il % N, so each upload runs under the previous layer GEMMs on another
+stream. With one twin the primary own uploads waited behind its attention (+1-8 % only).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ggml/include/ggml-cuda.h        |  5 ++-
+ ggml/src/ggml-cuda/common.cuh   |  2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 71 +++++++++++++++++++--------------
+ src/llama-context.cpp           | 18 +++++----
+ src/llama-graph.cpp             |  9 ++++-
+ 5 files changed, 62 insertions(+), 43 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 649c4fb86..fa5d4da5d 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -24,8 +24,9 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
+ // a twin backend of a device: a second backend on the same CUDA device with its own stream, device object and buffer type, so a
+ // scheduler orders its work against the primary backend with copies and events (also ggml_backend_dev_init(dev, "twin"))
+-GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init_twin(int device);
+-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device);
++// k = 0..3 selects one of up to four twins of the device (ggml_backend_dev_init(dev, "twin"), "twin1", ...)
++GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init_twin(int device, int k);
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index daf7435f3..7d49f02f5 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1455,7 +1455,7 @@ struct ggml_cuda_stream_context {
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+-    bool twin = false; // see ggml_backend_cuda_init_twin
++    int twin_idx = -1; // -1 = the primary backend of the device, k = twin k (see ggml_backend_cuda_init_twin)
+     cudaEvent_t copy_event = nullptr;
+ 
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0c6933dd1..e5cc58efc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5569,7 +5569,7 @@ struct ggml_backend_cuda_device_context {
+     std::string description;
+     std::string pci_bus_id;
+     int op_offload_min_batch_size;
+-    bool twin = false; // a second device object for the same GPU, with its own buffer type: see ggml_backend_cuda_twin_device
++    int twin_idx = -1; // -1 = the registry's device; k = twin k of the GPU, with its own buffer type: see ggml_backend_cuda_twin_device
+ };
+ 
+ static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
+@@ -5736,15 +5736,18 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
+ 
+ static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+-    if (ctx->twin || (params != nullptr && strcmp(params, "twin") == 0)) {
+-        return ggml_backend_cuda_init_twin(ctx->device);
++    if (ctx->twin_idx >= 0) {
++        return ggml_backend_cuda_init_twin(ctx->device, ctx->twin_idx);
++    }
++    if (params != nullptr && strncmp(params, "twin", 4) == 0) {
++        return ggml_backend_cuda_init_twin(ctx->device, params[4] != '\0' ? atoi(params + 4) : 0);
+     }
+     return ggml_backend_cuda_init(ctx->device);
+ }
+ 
+ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_backend_dev_t dev) {
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+-    return ctx->twin ? ggml_backend_cuda_buffer_type_twin(ctx->device) : ggml_backend_cuda_buffer_type(ctx->device);
++    return ctx->twin_idx >= 0 ? ggml_backend_cuda_buffer_type_twin(ctx->device, ctx->twin_idx) : ggml_backend_cuda_buffer_type(ctx->device);
+ }
+ 
+ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+@@ -6468,61 +6471,67 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
+     return &reg;
+ }
+ 
+-// twin device objects: one per CUDA device, created on demand, not listed by the registry
+-static ggml_backend_dev_t ggml_backend_cuda_twin_device(int device) {
++#define GGML_CUDA_MAX_TWINS 4
++
++static std::string ggml_backend_cuda_twin_name(int device, int k) {
++    return GGML_CUDA_NAME + std::to_string(device) + "_twin" + (k > 0 ? std::to_string(k) : "");
++}
++
++// twin device objects: up to GGML_CUDA_MAX_TWINS per CUDA device, created on demand, not listed by the registry
++static ggml_backend_dev_t ggml_backend_cuda_twin_device(int device, int k) {
+     static std::mutex mutex;
+     std::lock_guard<std::mutex> lock(mutex);
+-    static ggml_backend_device twin_devices[GGML_CUDA_MAX_DEVICES];
+-    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+-    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
++    static ggml_backend_device twin_devices[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_TWINS];
++    static bool initialized[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_TWINS] = {};
++    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || k < 0 || k >= GGML_CUDA_MAX_TWINS) {
+         return nullptr;
+     }
+-    if (!initialized[device]) {
++    if (!initialized[device][k]) {
+         ggml_backend_dev_t primary = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device);
+         ggml_backend_cuda_device_context * ctx = new ggml_backend_cuda_device_context(*(ggml_backend_cuda_device_context *) primary->context);
+-        ctx->name += "_twin";
+-        ctx->twin  = true;
+-        twin_devices[device] = {
++        ctx->name     = ggml_backend_cuda_twin_name(device, k);
++        ctx->twin_idx = k;
++        twin_devices[device][k] = {
+             /* .iface   = */ ggml_backend_cuda_device_interface,
+             /* .reg     = */ ggml_backend_cuda_reg(),
+             /* .context = */ ctx,
+         };
+-        initialized[device] = true;
++        initialized[device][k] = true;
+     }
+-    return &twin_devices[device];
++    return &twin_devices[device][k];
+ }
+ 
+-ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device) {
++ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k) {
+     static std::mutex mutex;
+     std::lock_guard<std::mutex> lock(mutex);
+-    static ggml_backend_buffer_type twin_bufts[GGML_CUDA_MAX_DEVICES];
+-    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+-    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
++    static ggml_backend_buffer_type twin_bufts[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_TWINS];
++    static bool initialized[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_TWINS] = {};
++    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || k < 0 || k >= GGML_CUDA_MAX_TWINS) {
+         return nullptr;
+     }
+-    if (!initialized[device]) {
+-        twin_bufts[device] = {
++    if (!initialized[device][k]) {
++        twin_bufts[device][k] = {
+             /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
+-            /* .device   = */ ggml_backend_cuda_twin_device(device),
+-            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device) + "_twin"},
++            /* .device   = */ ggml_backend_cuda_twin_device(device, k),
++            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, ggml_backend_cuda_twin_name(device, k)},
+         };
+-        initialized[device] = true;
++        initialized[device][k] = true;
+     }
+-    return &twin_bufts[device];
++    return &twin_bufts[device][k];
+ }
+ 
+-ggml_backend_t ggml_backend_cuda_init_twin(int device) {
+-    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+-        GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
++ggml_backend_t ggml_backend_cuda_init_twin(int device, int k) {
++    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || k < 0 || k >= GGML_CUDA_MAX_TWINS) {
++        GGML_LOG_ERROR("%s: invalid device %d or twin %d\n", __func__, device, k);
+         return nullptr;
+     }
+     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
+-    ctx->name += "_twin";
+-    ctx->twin  = true;
++    ctx->name     = ggml_backend_cuda_twin_name(device, k);
++    ctx->twin_idx = k;
+     ggml_backend_t twin = new ggml_backend {
+         /* .guid    = */ ggml_backend_cuda_guid(),
+         /* .iface   = */ ggml_backend_cuda_interface,
+-        /* .device  = */ ggml_backend_cuda_twin_device(device),
++        /* .device  = */ ggml_backend_cuda_twin_device(device, k),
+         /* .context = */ ctx,
+     };
+     return twin;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3d2f49cfb..c8bf8d93a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -482,6 +482,7 @@ llama_context::llama_context(
+         // large-batch expert splits of alternate host-resident layers run on it, so the scheduler copies a layer's experts while
+         // the primary backend computes the previous layer (prefill overlap)
+         if (const char * s = getenv("LLAMA_TWIN_BACKENDS"); s != nullptr && atoi(s) > 0) {
++            const int n_twins = std::min(atoi(s), 4);
+             const size_t n_primary = backends.size();
+             for (size_t i = 0; i < n_primary; ++i) {
+                 ggml_backend_t primary = backends[i].get();
+@@ -489,14 +490,17 @@ llama_context::llama_context(
+                 if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                     continue;
+                 }
+-                ggml_backend_t twin = ggml_backend_dev_init(dev, "twin"); // a twin device object with its own buffer type (CUDA)
+-                if (twin == nullptr) {
+-                    throw std::runtime_error(format("failed to initialize the twin backend of %s", ggml_backend_dev_name(dev)));
++                for (int k = 0; k < n_twins; ++k) {
++                    const std::string params_twin = "twin" + (k > 0 ? std::to_string(k) : std::string());
++                    ggml_backend_t twin = ggml_backend_dev_init(dev, params_twin.c_str()); // a twin device object with its own buffer type (CUDA)
++                    if (twin == nullptr) {
++                        throw std::runtime_error(format("failed to initialize twin %d of %s", k, ggml_backend_dev_name(dev)));
++                    }
++                    backends.emplace_back(twin);
++                    twins.emplace_back(primary, twin);
++                    LLAMA_LOG_INFO("%s: twin backend %s for %s (%s)\n", __func__, ggml_backend_name(twin), ggml_backend_dev_name(dev),
++                        ggml_backend_buft_name(ggml_backend_get_default_buffer_type(twin)));
+                 }
+-                backends.emplace_back(twin);
+-                twins.emplace_back(primary, twin);
+-                LLAMA_LOG_INFO("%s: twin backend %s for %s (%s)\n", __func__, ggml_backend_name(twin), ggml_backend_dev_name(dev),
+-                    ggml_backend_buft_name(ggml_backend_get_default_buffer_type(twin)));
+             }
+         }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6b3b7f3d8..ced42c70a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2552,14 +2552,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // so the scheduler copies this layer's experts while the primary backend computes the previous layer
+     ggml_backend_t twin = nullptr;
+     const int n_nodes_twin = ggml_graph_n_nodes(gf);
+-    if (twins != nullptr && slots == nullptr && moe_cache != nullptr && il >= 0 && (il % 2) == 1 && n_tokens > 32 &&
++    if (twins != nullptr && slots == nullptr && moe_cache != nullptr && il >= 0 && n_tokens > 32 &&
+         moe_cache->get_experts(up_exps != nullptr ? up_exps : gate_up_exps) != nullptr) {
++        // the twins of the layer's device, in order; layer il rotates over them so consecutive layers upload on different streams
+         ggml_backend_t primary = moe_cache->backend(il);
++        std::vector<ggml_backend_t> cands;
+         for (const auto & pt : *twins) {
+             if (pt.first == primary) {
+-                twin = pt.second;
++                cands.push_back(pt.second);
+             }
+         }
++        if (!cands.empty()) {
++            twin = cands[il % cands.size()];
++        }
+     }
+ 
+     ggml_tensor * experts = nullptr;
+-- 
+2.43.0
+

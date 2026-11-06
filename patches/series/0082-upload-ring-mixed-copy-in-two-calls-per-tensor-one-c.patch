@@ -1,0 +1,73 @@
+From 30a5dbff33bbbba44beb5cdb6de72a65707ac0e8 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:39:25 -0600
+Subject: [PATCH 082/141] upload ring mixed copy in two calls per tensor: one
+ cudaMemcpyBatchAsync for the host runs, one gather kernel for the cached
+ experts (per-call copies blocked the host)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 48 +++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 754bda5f9..e034496b4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7133,6 +7133,54 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     // 0082 GGML_CUDA_RING_MIXED=1: given both the table and the host tensor, the copy engine copies a run of host entries in one
+     // host-to-device transfer and a cached expert (an entry elsewhere, a device bank) device-to-device, so the cache saves PCIe bytes
+     static const bool ring_mixed = getenv("GGML_CUDA_RING_MIXED") != nullptr && atoi(getenv("GGML_CUDA_RING_MIXED")) != 0;
++#if CUDART_VERSION >= 12080
++    // 0083: in two calls -- the host runs in one batched copy, the cached experts by one gather kernel (one call per copy filled the
++    // copy queue and blocked the host)
++    if (host_all != nullptr && srcs != nullptr && ring_mixed && n <= GGML_CUDA_GATHER_MAX) {
++        const char * hb = (const char *) host_all;
++        void       * run_dst[GGML_CUDA_GATHER_MAX];
++        const void * run_src[GGML_CUDA_GATHER_MAX];
++        size_t       run_len[GGML_CUDA_GATHER_MAX];
++        size_t       n_runs  = 0;
++        ggml_cuda_gather_table table;
++        bool any_dev = false;
++        for (int64_t e = 0; e < GGML_CUDA_GATHER_MAX; ++e) {
++            table.src[e] = nullptr;
++        }
++        for (int64_t e = 0; e < n; ) {
++            if (srcs[e] == hb + (size_t) e*size) {
++                int64_t e1 = e + 1;
++                while (e1 < n && srcs[e1] == hb + (size_t) e1*size) {
++                    e1++;
++                }
++                run_dst[n_runs] = dst + (size_t) e*size;
++                run_src[n_runs] = hb + (size_t) e*size;
++                run_len[n_runs] = (size_t) (e1 - e)*size;
++                n_runs++;
++                e = e1;
++            } else {
++                table.src[e] = srcs[e];
++                any_dev = true;
++                e++;
++            }
++        }
++        if (n_runs > 0) {
++            cudaMemcpyAttributes attr = {};
++            attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
++            size_t attr_idx = 0;
++            CUDA_CHECK(cudaMemcpyBatchAsync(run_dst, run_src, run_len, n_runs, &attr, &attr_idx, 1, r.stream));
++        }
++        if (any_dev) {
++            const size_t chunk = 1024*1024;
++            const dim3 grid((unsigned) ((size + chunk - 1)/chunk), (unsigned) n);
++            ggml_cuda_gather_copy_kernel<<<grid, 256, 0, r.stream>>>(table, dst, size, chunk);
++            CUDA_CHECK(cudaGetLastError());
++        }
++        CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++        CUDA_CHECK(cudaStreamWaitEvent(main_stream, r.ev_upload, 0));
++        return dst;
++    }
++#endif // CUDART_VERSION >= 12080
+     if (host_all != nullptr && srcs != nullptr && ring_mixed) {
+         const char * hb = (const char *) host_all;
+         int64_t e = 0;
+-- 
+2.43.0
+

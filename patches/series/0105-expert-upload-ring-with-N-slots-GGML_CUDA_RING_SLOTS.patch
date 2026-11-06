@@ -1,0 +1,143 @@
+From 7c94b09ca9d5dc4ff67c1d3f809314f8702df8c5 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 01:55:00 -0600
+Subject: [PATCH 105/141] expert upload ring with N slots
+ (GGML_CUDA_RING_SLOTS=2..4, default 2): the upload of split k waits for split
+ k-N
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 49 ++++++++++++++++++++++-----------
+ 1 file changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f108ceb15..f50d8b15b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7073,15 +7073,26 @@ void ggml_backend_cuda_gather_copy_async(ggml_backend_t backend, void * dst, con
+ // expert upload ring (see ggml-cuda.h): two slots per device, an upload stream, and the events that order it against the main stream
+ struct ggml_cuda_upload_ring {
+     cudaStream_t stream     = nullptr;
+-    cudaEvent_t  ev_main[2] = { nullptr, nullptr }; // the main stream's progress, recorded at the start of split k into [k%2]
++    cudaEvent_t  ev_main[4] = {};                   // the main stream's progress, recorded at the start of split k into [k%N]
+     cudaEvent_t  ev_upload  = nullptr;              // the last gather on the upload stream
+-    void *       slot[2]    = { nullptr, nullptr };
++    void *       slot[4]    = {};
+     size_t       slot_bytes = 0;
+     size_t       used       = 0;  // bump pointer in the current slot
+     int64_t      k          = -1; // split counter
+     bool         side_pending = false; // side uploads issued since the last wait
+ };
+ 
++// 0106 GGML_CUDA_RING_SLOTS=N (2-4, default 2): the upload of split k may start once split k-N is done (N-1 splits of lookahead)
++static int ggml_cuda_ring_slots(void) {
++    static int n = -1;
++    if (n < 0) {
++        const char * e = getenv("GGML_CUDA_RING_SLOTS");
++        n = e != nullptr ? atoi(e) : 2;
++        n = n < 2 ? 2 : (n > 4 ? 4 : n);
++    }
++    return n;
++}
++
+ static ggml_cuda_upload_ring g_cuda_upload_ring[GGML_CUDA_MAX_DEVICES];
+ static ggml_cuda_upload_ring g_cuda_weight_ring[GGML_CUDA_MAX_DEVICES]; // 0078: host-memory weights (LLAMA_TP_SHADOW_HOST)
+ 
+@@ -7092,7 +7103,7 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     ggml_cuda_upload_ring & r = rings[dev];
+     if (r.stream == nullptr) {
+         CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
+-        for (int i = 0; i < 2; ++i) {
++        for (int i = 0; i < 4; ++i) {
+             CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_main[i], cudaEventDisableTiming));
+         }
+         CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_upload, cudaEventDisableTiming));
+@@ -7101,31 +7112,34 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+     if (first_of_split) {
+         r.k += 1;
+         r.used = 0;
+-        const int s = (int) (r.k % 2);
++        const int s = (int) (r.k % ggml_cuda_ring_slots());
+         // the main stream's progress now: every split issued so far, the previous MoE split's GEMMs included
+         CUDA_CHECK(cudaEventRecord(r.ev_main[s], main_stream));
+         // slot s was last read by split k-2, which was done when the previous call recorded ev_main[(k-1)%2]
+-        if (r.k >= 1) {
+-            CUDA_CHECK(cudaStreamWaitEvent(r.stream, r.ev_main[(r.k - 1) % 2], 0));
++        if (r.k >= ggml_cuda_ring_slots() - 1) {
++            CUDA_CHECK(cudaStreamWaitEvent(r.stream, r.ev_main[(r.k - ggml_cuda_ring_slots() + 1) % ggml_cuda_ring_slots()], 0));
+         }
+     }
+     if (r.k < 0) {
+         return nullptr;
+     }
+-    const int    s     = (int) (r.k % 2);
++    const int    s     = (int) (r.k % ggml_cuda_ring_slots());
+     const size_t bytes = (size_t) n*size;
+     if (r.used + bytes > r.slot_bytes) {
+         // the slots are sized on the first split (the sizes do not change afterwards); a later growth synchronizes the device
+         const size_t need = std::max(r.used + bytes, split_bytes);
+         CUDA_CHECK(cudaDeviceSynchronize());
+-        for (int i = 0; i < 2; ++i) {
++        for (int i = 0; i < 4; ++i) {
+             if (r.slot[i] != nullptr) {
+                 CUDA_CHECK(cudaFree(r.slot[i]));
++                r.slot[i] = nullptr;
+             }
++        }
++        for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
+             CUDA_CHECK(cudaMalloc(&r.slot[i], need));
+         }
+         r.slot_bytes = need;
+-        GGML_LOG_INFO("%s: device %d: two upload slots of %.1f MiB\n", __func__, dev, need/1024.0/1024.0);
++        GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), need/1024.0/1024.0);
+     }
+     char * dst = (char *) r.slot[s] + r.used;
+     r.used += GGML_PAD(bytes, 256);
+@@ -7244,7 +7258,7 @@ void * ggml_backend_cuda_weight_ring_upload(ggml_backend_t backend, bool first_o
+ static void ggml_cuda_upload_ring_init(ggml_cuda_upload_ring & r) {
+     if (r.stream == nullptr) {
+         CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
+-        for (int i = 0; i < 2; ++i) {
++        for (int i = 0; i < 4; ++i) {
+             CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_main[i], cudaEventDisableTiming));
+         }
+         CUDA_CHECK(cudaEventCreateWithFlags(&r.ev_upload, cudaEventDisableTiming));
+@@ -7290,27 +7304,30 @@ void * ggml_backend_cuda_upload_ring_reserve(ggml_backend_t backend, bool first_
+     if (first_of_split) {
+         r.k += 1;
+         r.used = 0;
+-        const int s = (int) (r.k % 2);
++        const int s = (int) (r.k % ggml_cuda_ring_slots());
+         CUDA_CHECK(cudaEventRecord(r.ev_main[s], main_stream));
+-        if (r.k >= 1) {
+-            CUDA_CHECK(cudaStreamWaitEvent(r.stream, r.ev_main[(r.k - 1) % 2], 0));
++        if (r.k >= ggml_cuda_ring_slots() - 1) {
++            CUDA_CHECK(cudaStreamWaitEvent(r.stream, r.ev_main[(r.k - ggml_cuda_ring_slots() + 1) % ggml_cuda_ring_slots()], 0));
+         }
+     }
+     if (r.k < 0) {
+         return nullptr;
+     }
+-    const int s = (int) (r.k % 2);
++    const int s = (int) (r.k % ggml_cuda_ring_slots());
+     if (r.used + bytes > r.slot_bytes) {
+         const size_t need = std::max(r.used + bytes, split_bytes);
+         CUDA_CHECK(cudaDeviceSynchronize());
+-        for (int i = 0; i < 2; ++i) {
++        for (int i = 0; i < 4; ++i) {
+             if (r.slot[i] != nullptr) {
+                 CUDA_CHECK(cudaFree(r.slot[i]));
++                r.slot[i] = nullptr;
+             }
++        }
++        for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
+             CUDA_CHECK(cudaMalloc(&r.slot[i], need));
+         }
+         r.slot_bytes = need;
+-        GGML_LOG_INFO("%s: device %d: two upload slots of %.1f MiB\n", __func__, dev, need/1024.0/1024.0);
++        GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), need/1024.0/1024.0);
+     }
+     char * dst = (char *) r.slot[s] + r.used;
+     r.used += GGML_PAD(bytes, 256);
+-- 
+2.43.0
+

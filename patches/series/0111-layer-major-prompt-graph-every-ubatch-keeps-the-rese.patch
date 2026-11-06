@@ -1,0 +1,49 @@
+From b5b05f0c97ba9dda44992ee139bebbf97c0171e9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 11:43:07 -0600
+Subject: [PATCH 111/141] layer-major prompt graph: every ubatch keeps the
+ reserve graph structure (ceil(n_ubatch/R) attention blocks and
+ ceil(n_ubatch/LLAMA_LM_MOE_ROWS) FFN blocks sharing its rows evenly), so the
+ allocator plans once instead of synchronizing every backend to re-plan each
+ ubatch
+
+---
+ src/models/glm-dsa.cpp | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index cffa60a34..77cc31af2 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -607,10 +607,15 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         // the attention blocks: rows [r0, r0 + nr), keys [0, n_kv), the staircase view at column c, row d
+         struct lm_block { int64_t r0, nr, n_kv, c, d; };
+         std::vector<lm_block> blocks;
+-        for (int64_t r0 = 0; r0 < n_tokens; r0 += R) {
+-            lm_block b = { r0, std::min(R, n_tokens - r0), n_kv, 0, 0 };
++        // 0112: the reserve graph's structure for every ubatch -- ceil(n_ubatch / R) blocks sharing the rows evenly (fewer only for a
++        // ubatch with fewer rows), so every layer-major graph fits the one worst-case reserve and the allocator never re-plans (which
++        // synchronizes every backend: with blocks of R rows each ubatch after the first waited ~1.8 s for the one before it)
++        const int64_t n_blk = std::max<int64_t>(1, std::min<int64_t>(n_tokens, ((int64_t) cparams.n_ubatch + R - 1)/R));
++        for (int64_t ib = 0, r0 = 0; ib < n_blk; ++ib) {
++            lm_block b = { r0, n_tokens/n_blk + (ib < n_tokens % n_blk ? 1 : 0), n_kv, 0, 0 };
++            r0 += b.nr;
+             if (!cparams.lm_reserve) {
+-                const int64_t p0   = ubatch.pos[r0];
++                const int64_t p0   = ubatch.pos[b.r0];
+                 const int64_t base = S - p0;
+                 b.n_kv = std::min<int64_t>(n_kv, GGML_PAD(p0 + b.nr, 256));
+                 b.c    = GGML_PAD(base, 8);
+@@ -742,7 +747,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             // the FFN in balanced blocks of at most LLAMA_LM_MOE_ROWS rows (a block of a prompt ubatch never shrinks to the decode
+             // path's 8 rows); a layer's experts are one copy for all of them
+             const int64_t nh  = h->ne[1];
+-            const int64_t nbm = std::max<int64_t>(1, (nh + lm_moe_rows - 1)/lm_moe_rows); // 0110: one block on 0 rows when none is an output
++            // 0110 / 0112: the reserve's FFN block count, some blocks of 0 rows on a short ubatch or the cropped last layer
++            const int64_t nbm = std::max<int64_t>(1, ((int64_t) cparams.n_ubatch + lm_moe_rows - 1)/lm_moe_rows);
+             std::vector<ggml_tensor *> fouts;
+             for (int64_t m = 0, m0 = 0; m < nbm; ++m) {
+                 const int64_t nm = nh/nbm + (m < nh % nbm ? 1 : 0);
+-- 
+2.43.0
+

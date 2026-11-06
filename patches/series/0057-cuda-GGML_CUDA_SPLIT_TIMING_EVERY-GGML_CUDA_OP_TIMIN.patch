@@ -1,0 +1,37 @@
+From 81b7315ecaa4369118197f255ad7327f43556643 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 03:49:00 -0600
+Subject: [PATCH 057/141] cuda: GGML_CUDA_SPLIT_TIMING_EVERY /
+ GGML_CUDA_OP_TIMING_EVERY set the device timers print intervals
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1e63d5124..44fcc7178 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4925,7 +4925,8 @@ static void ggml_cuda_op_timing_flush(int device, ggml_cuda_op_timing & t) {
+         t.tail = (t.tail + 1) % ggml_cuda_op_timing::N;
+         t.n_done += 1;
+     }
+-    if (t.n_done >= 65536) {
++    static const int64_t every_ops = getenv("GGML_CUDA_OP_TIMING_EVERY") != nullptr ? std::max(1LL, atoll(getenv("GGML_CUDA_OP_TIMING_EVERY"))) : 65536;
++    if (t.n_done >= every_ops) {
+         double total = 0.0;
+         std::vector<int> order;
+         for (size_t k = 0; k < t.names.size(); ++k) {
+@@ -5293,7 +5294,8 @@ static int ggml_cuda_split_timing_begin(ggml_backend_cuda_context * cuda_ctx) {
+         t.tail = (t.tail + 1) % ggml_cuda_split_timing::N;
+         t.n   += 1;
+     }
+-    if (t.n >= 4096) {
++    static const int every_splits = getenv("GGML_CUDA_SPLIT_TIMING_EVERY") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_SPLIT_TIMING_EVERY"))) : 4096;
++    if (t.n >= every_splits) {
+         GGML_LOG_INFO("cuda split timing: device %d: %d splits: busy %.1f ms, gaps %.1f ms (%.1f us per split busy, %.1f us gap)\n",
+             cuda_ctx->device, t.n, t.busy_ms, t.gap_ms, 1000.0*t.busy_ms/t.n, 1000.0*t.gap_ms/t.n);
+         t.n = 0;
+-- 
+2.43.0
+

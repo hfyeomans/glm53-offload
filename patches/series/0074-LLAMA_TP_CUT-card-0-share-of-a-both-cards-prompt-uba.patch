@@ -1,0 +1,32 @@
+From 8d23bf7391329fa7242f8a04d4505805341aa8e4 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:56:49 -0600
+Subject: [PATCH 074/141] LLAMA_TP_CUT: card 0 share of a both-cards prompt
+ ubatch (earlier positions attend over fewer keys)
+
+---
+ src/models/glm-dsa.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index ac9e6293b..38d7ad2a2 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -249,9 +249,11 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         };
+         auto W = [&](ggml_tensor * w, int c) { return model.tp_w(w, c); };
+ 
+-        // the token halves: card 0 the first, card 1 the rest; the cut on a multiple of 64 rows
+-        int64_t t_cut = (n_tokens/2) & ~(int64_t) 63;
+-        if (t_cut == 0) {
++        // the token halves: card 0 the first, card 1 the rest; the cut on a multiple of 64 rows.  0073 LLAMA_TP_CUT: card 0's share (the
++        // earlier positions attend over fewer keys)
++        static const double tp_cut = getenv("LLAMA_TP_CUT") != nullptr ? std::min(0.9, std::max(0.1, atof(getenv("LLAMA_TP_CUT")))) : 0.5;
++        int64_t t_cut = ((int64_t) (n_tokens*tp_cut)) & ~(int64_t) 63;
++        if (t_cut <= 0 || t_cut >= n_tokens) {
+             t_cut = n_tokens/2;
+         }
+         const int64_t n_tok[2] = { t_cut, n_tokens - t_cut };
+-- 
+2.43.0
+

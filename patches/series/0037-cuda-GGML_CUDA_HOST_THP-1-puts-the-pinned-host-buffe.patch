@@ -1,0 +1,107 @@
+From c372d7592fe16fa8a7ceab70e2b3b921d63a8535 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 15:29:48 -0600
+Subject: [PATCH 037/141] cuda: GGML_CUDA_HOST_THP=1 puts the pinned host
+ buffers on transparent huge pages (madvise + cudaHostRegister) so CPU reads
+ of host weights stop walking 4 KiB pages
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 74 +++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 189520e49..6e0b8e91c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1412,7 +1412,75 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
+     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+ }
+ 
++// GGML_CUDA_HOST_THP=1: pinned host buffers on transparent huge pages (see 0036-host-thp.py)
++#if !defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#include <sys/mman.h>
++static std::mutex ggml_cuda_host_thp_mutex;
++static std::unordered_map<void *, std::pair<void *, size_t>> ggml_cuda_host_thp_allocs; // aligned ptr -> (mmap base, mmap size)
++
++static bool ggml_cuda_host_thp_enabled() {
++    static const bool enabled = [] {
++        const char * s = getenv("GGML_CUDA_HOST_THP");
++        const bool on = s != nullptr && atoi(s) != 0;
++        if (on) {
++            GGML_LOG_INFO("%s: pinned host buffers on transparent huge pages (madvise + cudaHostRegister)\n", __func__);
++        }
++        return on;
++    }();
++    return enabled;
++}
++
++static void * ggml_cuda_host_malloc_thp(size_t size) {
++    const size_t align = 2ull << 20;
++    const size_t sz    = (size + align - 1) & ~(align - 1);
++    const size_t msz   = sz + align;
++    void * base = mmap(nullptr, msz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (base == MAP_FAILED) {
++        GGML_LOG_WARN("%s: mmap of %.2f MiB failed\n", __func__, msz / 1024.0 / 1024.0);
++        return nullptr;
++    }
++    void * ptr = (void *) (((uintptr_t) base + align - 1) & ~(uintptr_t) (align - 1));
++    if (madvise(ptr, sz, MADV_HUGEPAGE) != 0) {
++        GGML_LOG_WARN("%s: madvise(MADV_HUGEPAGE) failed, the buffer stays on small pages\n", __func__);
++    }
++    cudaError_t err = cudaHostRegister(ptr, sz, cudaHostRegisterPortable | cudaHostRegisterMapped);
++    if (err != cudaSuccess) {
++        (void) cudaGetLastError();
++        GGML_LOG_WARN("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__, sz / 1024.0 / 1024.0, cudaGetErrorString(err));
++        munmap(base, msz);
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(ggml_cuda_host_thp_mutex);
++    ggml_cuda_host_thp_allocs[ptr] = { base, msz };
++    return ptr;
++}
++
++static bool ggml_cuda_host_free_thp(void * ptr) {
++    std::pair<void *, size_t> m;
++    {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_thp_mutex);
++        auto it = ggml_cuda_host_thp_allocs.find(ptr);
++        if (it == ggml_cuda_host_thp_allocs.end()) {
++            return false;
++        }
++        m = it->second;
++        ggml_cuda_host_thp_allocs.erase(it);
++    }
++    (void) cudaHostUnregister(ptr);
++    (void) cudaGetLastError();
++    munmap(m.first, m.second);
++    return true;
++}
++#else
++static bool   ggml_cuda_host_thp_enabled()          { return false; }
++static void * ggml_cuda_host_malloc_thp(size_t)      { return nullptr; }
++static bool   ggml_cuda_host_free_thp(void *)        { return false; }
++#endif
++
+ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
++    if (ggml_cuda_host_free_thp(buffer->context)) {
++        return;
++    }
+     CUDA_CHECK(cudaFreeHost(buffer->context));
+ }
+ 
+@@ -1422,6 +1490,12 @@ static void * ggml_cuda_host_malloc(size_t size) {
+     }
+ 
+     void * ptr = nullptr;
++    if (ggml_cuda_host_thp_enabled()) {
++        ptr = ggml_cuda_host_malloc_thp(size);
++        if (ptr != nullptr) {
++            return ptr;
++        }
++    }
+     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+     if (err != cudaSuccess) {
+         // clear the error
+-- 
+2.43.0
+

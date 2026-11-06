@@ -1,0 +1,269 @@
+From 7513ed06586ef8e9d9698256bc5758932134e290 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:57:59 -0600
+Subject: [PATCH 051/141] moe-cache: LLAMA_MOE_PREDICT=1 predicts a layer's
+ experts on the CPU from the previous layer's FFN input during its attention
+ and scores the prediction (measurement only)
+
+---
+ src/llama-moe-cache.cpp | 208 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 208 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 816804350..9b72b7a1a 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -374,6 +374,7 @@ struct llama_moe_cache::impl {
+         int32_t              n_used  = 1;
+         ggml_backend_t       backend = nullptr;
+         ggml_backend_event_t ev      = nullptr; // recorded behind the reads of the ids and of the stash
++        const ggml_tensor *  x_t     = nullptr; // 0050: the layer's FFN input (an input of its CPU part, in the stash)
+     };
+     pending_plan defer_st;
+ 
+@@ -450,6 +451,151 @@ struct llama_moe_cache::impl {
+     std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
+     std::vector<uint8_t> fill_async; // per fill of the last plan: uploaded on the side stream (0045)
+ 
++    // LLAMA_MOE_PREDICT=1 (0050): layer il's experts predicted on the CPU from layer il-1's FFN input while the card runs il's attention
++    static bool predict_enabled() {
++        static const bool v = getenv("LLAMA_MOE_PREDICT") != nullptr && atoi(getenv("LLAMA_MOE_PREDICT")) != 0;
++        return v;
++    }
++    struct pred_layer {
++        std::vector<float> router; // [n_expert][n_embd], ffn_gate_inp
++        std::vector<float> norm;   // [n_embd], ffn_norm
++        std::vector<float> epb;    // [n_expert], exp_probs_b (empty: none)
++    };
++    std::vector<pred_layer> pq;
++    int64_t pq_n_embd = 0, pq_n_expert = 0, pq_n_tok = 0;
++    std::vector<float>   pq_x;      // [n_tok][n_embd] the FFN input of layer pq_x_il
++    int32_t              pq_x_il = -1;
++    std::vector<float>   pq_xp;     // the prediction's input: pq_x renormalized for the predicted layer
++    std::vector<float>   pq_logits; // [n_tok][n_expert]
++    std::vector<int32_t> pq_sel;    // [n_tok][n_expert_used] the predicted experts
++    std::vector<uint8_t> pq_miss;   // [n_expert] predicted and absent from the slot map when predicted
++    int32_t              pq_il = -1; // the layer pq_sel predicts
++    ggml_backend_ptr     pq_cpu;
++    ggml_context_ptr     pq_ctx;
++    ggml_cgraph *        pq_gf = nullptr;
++    struct pq_stats {
++        double n = 0, sel = 0, sel_hit = 0, miss = 0, miss_hit = 0, pred_miss = 0, t_pred = 0;
++        std::vector<float> win;
++    } pqs;
++
++    static void pq_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
++        GGML_UNUSED(dst);
++        GGML_UNUSED(a);
++        impl * self = (impl *) ud;
++        const pred_layer & p = self->pq[self->pq_il];
++        const int64_t ne = self->pq_n_embd, nx = self->pq_n_expert, nt = self->pq_n_tok;
++        for (int64_t e = ith*nx/nth; e < (ith + 1)*nx/nth; ++e) {
++            const float * w = p.router.data() + e*ne;
++            for (int64_t t = 0; t < nt; ++t) {
++                const float * x = self->pq_xp.data() + t*ne;
++                float s = 0.0f;
++                for (int64_t j = 0; j < ne; ++j) {
++                    s += w[j]*x[j];
++                }
++                self->pq_logits[t*nx + e] = s;
++            }
++        }
++    }
++
++    // layer il's experts from layer il-1's FFN input, before the plan of il (the slot map is the one il's hits ran on)
++    void pq_predict(int32_t il) {
++        pq_il = -1;
++        if (!pq_cpu || pq_x_il < 0 || pq_x_il + 1 != il || il >= (int32_t) pq.size() || pq[il].router.empty() || pq[pq_x_il].norm.empty()) {
++            return;
++        }
++        const int64_t t0 = ggml_time_us();
++        const pred_layer & p  = pq[il];
++        const pred_layer & pp = pq[pq_x_il];
++        const int64_t ne = pq_n_embd, nx = pq_n_expert;
++        pq_xp.resize(pq_x.size());
++        for (int64_t t = 0; t < pq_n_tok; ++t) {
++            for (int64_t j = 0; j < ne; ++j) {
++                const float wp = pp.norm[j];
++                pq_xp[t*ne + j] = pq_x[t*ne + j]/(std::fabs(wp) > 1e-6f ? wp : 1e-6f)*p.norm[j];
++            }
++        }
++        pq_logits.resize(pq_n_tok*nx);
++        pq_il = il;
++        ggml_backend_graph_compute(pq_cpu.get(), pq_gf);
++        const layer & l = layers[il];
++        const group & g = groups[l.ig];
++        const bool epb_in_bias = !l.route_epb.empty();
++        pq_sel.resize(pq_n_tok*n_expert_used);
++        pq_miss.assign(nx, 0);
++        std::vector<std::pair<float, int32_t>> sc(nx);
++        for (int64_t t = 0; t < pq_n_tok; ++t) {
++            for (int64_t e = 0; e < nx; ++e) {
++                float b = epb_in_bias || p.epb.empty() ? 0.0f : p.epb[e];
++                if (l.route_bias != nullptr) {
++                    b += l.route_bias_host[e];
++                }
++                sc[e] = { 1.0f/(1.0f + std::exp(-pq_logits[t*nx + e])) + b, (int32_t) e };
++            }
++            std::partial_sort(sc.begin(), sc.begin() + n_expert_used, sc.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
++            for (int32_t k = 0; k < n_expert_used; ++k) {
++                const int32_t e = sc[k].second;
++                pq_sel[t*n_expert_used + k] = e;
++                if (g.slru.slot_map[il][e] >= g.slru.n_slots) {
++                    pq_miss[e] = 1;
++                }
++            }
++        }
++        pqs.t_pred += ggml_time_us() - t0;
++    }
++
++    // after the plan of il: score the prediction, keep il's FFN input for il+1
++    void pq_score_and_keep(int32_t il, const ggml_tensor * x_t, int64_t t_ready, int64_t t_ids) {
++        if (pq_il == il) {
++            const int64_t nt = (int64_t) ids.size()/n_expert_used;
++            for (int64_t t = 0; t < nt && t < pq_n_tok; ++t) {
++                for (int32_t k = 0; k < n_expert_used; ++k) {
++                    const int32_t e = ids[t*n_expert_used + k];
++                    bool hit = false;
++                    for (int32_t k2 = 0; k2 < n_expert_used && !hit; ++k2) {
++                        hit = pq_sel[t*n_expert_used + k2] == e;
++                    }
++                    pqs.sel += 1;
++                    pqs.sel_hit += hit;
++                }
++            }
++            for (int64_t e = 0; e < pq_n_expert; ++e) {
++                pqs.miss      += fill_mark[e];
++                pqs.miss_hit  += fill_mark[e] && pq_miss[e];
++                pqs.pred_miss += pq_miss[e];
++            }
++            pqs.n += 1;
++            pqs.win.push_back((float) (t_ids - t_ready));
++            if (pqs.n >= 4096) {
++                std::vector<float> w = pqs.win;
++                std::sort(w.begin(), w.end());
++                LLAMA_LOG_INFO("llama_moe_cache: predict: %.0f layer-steps, top-%d overlap %.1f %%, misses %.2f per layer of which predicted %.1f %% (recall), "
++                    "predicted misses %.2f per layer of which real %.1f %% (precision), prediction %.1f us, window to the ids %.0f us (p25 %.0f, p75 %.0f)\n",
++                    pqs.n, n_expert_used, 100.0*pqs.sel_hit/std::max(1.0, pqs.sel), pqs.miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.miss),
++                    pqs.pred_miss/pqs.n, 100.0*pqs.miss_hit/std::max(1.0, pqs.pred_miss), pqs.t_pred/pqs.n,
++                    (double) w[w.size()/2], (double) w[w.size()/4], (double) w[w.size()*3/4]);
++                pqs = pq_stats();
++            }
++        }
++        pq_il = -1;
++        // il's FFN input from the stash (the next copy overwrites it)
++        pq_x_il = -1;
++        if (x_t == nullptr || x_t->ne[0] != pq_n_embd || x_t->data == nullptr) {
++            return;
++        }
++        const ggml_tensor * base = base_of(x_t);
++        const size_t offs = (const uint8_t *) x_t->data - (const uint8_t *) base->data;
++        const size_t size = ggml_nbytes(x_t);
++        for (const stash_entry & e : stash) {
++            if (e.base == base && offs >= e.offs && offs + size <= e.offs + e.size) {
++                pq_n_tok = ggml_nelements(x_t)/pq_n_embd;
++                pq_x.resize(pq_n_tok*pq_n_embd);
++                memcpy(pq_x.data(), (const uint8_t *) ggml_backend_buffer_get_base(stash_buf.get()) + e.pos + (offs - e.offs), size);
++                pq_x_il = il;
++                break;
++            }
++        }
++    }
++
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+ 
+@@ -769,6 +915,57 @@ struct llama_moe_cache::impl {
+                 LLAMA_LOG_INFO("llama_moe_cache: asynchronous fills (one-token batches)\n");
+             }
+         }
++        if (predict_enabled() && !no_alloc) {
++            pq_n_embd   = model.hparams.n_embd;
++            pq_n_expert = model.hparams.n_expert;
++            pq.resize(layers.size());
++            auto to_f32 = [](const ggml_tensor * t, std::vector<float> & out, int64_t n_row, int64_t row) {
++                std::vector<uint8_t> raw(ggml_nbytes(t));
++                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
++                out.resize(n_row*row);
++                if (t->type == GGML_TYPE_F32) {
++                    memcpy(out.data(), raw.data(), out.size()*sizeof(float));
++                } else {
++                    const auto * tt = ggml_get_type_traits(t->type);
++                    GGML_ASSERT(tt->to_float != nullptr);
++                    for (int64_t r = 0; r < n_row; ++r) {
++                        tt->to_float(raw.data() + r*t->nb[1], out.data() + r*row, row);
++                    }
++                }
++            };
++            size_t n_pl = 0;
++            for (size_t il = 0; il < layers.size() && il < model.layers.size(); ++il) {
++                const llama_layer & L = model.layers[il];
++                if (L.ffn_norm != nullptr && L.ffn_norm->ne[0] == pq_n_embd) {
++                    to_f32(L.ffn_norm, pq[il].norm, 1, pq_n_embd);
++                }
++                if (layers[il].ig < 0 || L.ffn_gate_inp == nullptr || L.ffn_gate_inp->ne[0] != pq_n_embd || L.ffn_gate_inp->ne[1] != pq_n_expert) {
++                    continue;
++                }
++                to_f32(L.ffn_gate_inp, pq[il].router, pq_n_expert, pq_n_embd);
++                if (L.ffn_exp_probs_b != nullptr && ggml_nelements(L.ffn_exp_probs_b) == pq_n_expert) {
++                    to_f32(L.ffn_exp_probs_b, pq[il].epb, 1, pq_n_expert);
++                }
++                n_pl++;
++            }
++            pq_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++            if (pq_cpu) {
++                const int n_th = getenv("LLAMA_MOE_PREDICT_THREADS") != nullptr ? atoi(getenv("LLAMA_MOE_PREDICT_THREADS")) : 64;
++                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(pq_cpu.get()));
++                auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++                if (set_n_threads != nullptr) {
++                    set_n_threads(pq_cpu.get(), n_th);
++                }
++                ggml_init_params ip = { 1u << 20, nullptr, false };
++                pq_ctx.reset(ggml_init(ip));
++                ggml_tensor * dummy = ggml_new_tensor_1d(pq_ctx.get(), GGML_TYPE_F32, 1);
++                ggml_tensor * node  = ggml_map_custom1(pq_ctx.get(), dummy, pq_op, GGML_N_TASKS_MAX, this);
++                pq_gf = ggml_new_graph(pq_ctx.get());
++                ggml_build_forward_expand(pq_gf, node);
++            }
++            LLAMA_LOG_INFO("llama_moe_cache: predicting each layer's experts from the previous layer's FFN input (%zu layers, %.0f MiB of routers on the host)\n",
++                n_pl, n_pl*pq_n_expert*pq_n_embd*sizeof(float)/1024.0/1024.0);
++        }
+ 
+         for (size_t id = 0; id < devices.size(); ++id) {
+             const device & d = devices[id];
+@@ -922,7 +1119,14 @@ struct llama_moe_cache::impl {
+         defer_st.il = -1;
+         layer & l = layers[il];
+         group & g = groups[l.ig];
++        // LLAMA_MOE_PREDICT (0050): the prediction runs while the card may still be on the layer's attention
++        int64_t t_ready = 0;
++        if (predict_enabled()) {
++            pq_predict(il);
++            t_ready = ggml_time_us();
++        }
+         ggml_backend_event_synchronize(defer_st.ev);
++        const int64_t t_ids = predict_enabled() ? ggml_time_us() : 0;
+         if (trace != nullptr) {
+             write_trace(il, defer_st.n_used);
+         }
+@@ -949,6 +1153,9 @@ struct llama_moe_cache::impl {
+         for (size_t i = 0; i < ids.size(); ++i) {
+             cpu_ids[i] = fill_mark[ids[i]] ? ids[i] : -1;
+         }
++        if (predict_enabled()) {
++            pq_score_and_keep(il, defer_st.x_t, t_ready, t_ids);
++        }
+         // the uploads go behind the hits of this layer, consecutive experts going to consecutive slots together: on the side stream with
+         // LLAMA_MOE_ASYNC_FILL_TOKENS (0046: the layer's next lookup waits for them), else on the main stream
+         ggml_backend_t backend = defer_st.backend;
+@@ -1148,6 +1355,7 @@ struct llama_moe_cache::impl {
+             }
+             ggml_backend_event_record(ev, backend);
+             defer_st = { il, it_cpu->second.n_used, backend, ev };
++            defer_st.x_t = it_cpu->second.inputs.size() > 1 ? it_cpu->second.inputs[1] : nullptr;
+             if (l.fill_ev_pending) {
+                 // 0046: the hits read the slots that the layer's last deferred plan filled on the side stream
+                 ggml_backend_event_wait(backend, l.fill_ev);
+-- 
+2.43.0
+

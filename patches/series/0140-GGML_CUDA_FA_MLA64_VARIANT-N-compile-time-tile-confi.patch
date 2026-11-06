@@ -1,0 +1,59 @@
+From caeccd3b7eee8e50da944f6ec30317b8bd621efe Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 15:04:40 -0600
+Subject: [PATCH 140/141] GGML_CUDA_FA_MLA64_VARIANT=N: compile-time tile
+ configs for the 64-column MLA flash-attention tile (a sweep; 0 = unchanged)
+
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 84716fa65..df579f250 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -82,7 +82,20 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32, 288, 256, 128, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 4,  32, 288, 256, 128, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, false);
++    // 0136 GGML_CUDA_FA_MLA64_VARIANT=N: a compile-time sweep of the 64-column MLA tile (0 = the table's)
++#if defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 1
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  64, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 2
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 3
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 512, 1,  32, 160, 128, 128, 1, false);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 4
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 512, 1,  64, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 5
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  64,  96, 128, 128, 1, false);
++#else
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128, 128, 1, false);
++#endif // GGML_CUDA_FA_MLA64_VARIANT
+ 
+     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
+ }
+@@ -104,7 +117,20 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 4,  32,  96,  64, 128, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 4,  32,  96,  64, 128, 1, false);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, false);
++    // 0136 GGML_CUDA_FA_MLA64_VARIANT=N: a compile-time sweep of the 64-column MLA tile (0 = the table's)
++#if defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 1
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  64, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 2
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 3
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 512, 1,  32, 160, 128, 128, 1, false);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 4
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 512, 1,  64, 288, 256, 128, 1, true);
++#elif defined(GGML_CUDA_FA_MLA64_VARIANT) && GGML_CUDA_FA_MLA64_VARIANT == 5
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  64,  96, 128, 128, 1, false);
++#else
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128, 128, 1, false);
++#endif // GGML_CUDA_FA_MLA64_VARIANT
+ 
+     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+ }
+-- 
+2.43.0
+

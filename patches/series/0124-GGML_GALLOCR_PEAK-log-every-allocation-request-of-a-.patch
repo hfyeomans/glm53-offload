@@ -1,0 +1,46 @@
+From eb03ca119105452f2d250ed59a3a4ba5d2a4d57a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:11:46 -0600
+Subject: [PATCH 124/141] GGML_GALLOCR_PEAK: log every allocation request of a
+ node of 1 GiB or more with its sources reuse conditions (replaces the
+ after-the-fact log)
+
+---
+ ggml/src/ggml-alloc.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index c7d8a9d57..dd3049be5 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -680,6 +680,27 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+     GGML_ASSERT(buffer_id >= 0);
+     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+ 
++    // 0123 GGML_GALLOCR_PEAK: every request for a node of 1 GiB or more, with its sources' reuse conditions
++    if (gallocr_peak_mib() > 0 && ggml_nbytes(node) >= ((size_t) 1 << 30)) {
++        static int n_said = 0;
++        if (n_said++ < 16) {
++            GGML_LOG_INFO("gallocr inplace: %s (%s) %.1f MiB: allocated %d view %d can-inplace %d buffer %d\n", node->name, ggml_op_desc(node),
++                ggml_nbytes(node)/1024.0/1024.0, (int) ggml_gallocr_is_allocated(galloc, node), (int) ggml_impl_is_view(node),
++                (int) ggml_op_can_inplace(node->op), buffer_id);
++            for (int i = 0; i < GGML_MAX_SRC; i++) {
++                struct ggml_tensor * parent = node->src[i];
++                if (parent == NULL) {
++                    continue;
++                }
++                struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
++                GGML_LOG_INFO("gallocr inplace:   src%d %s (%s) %.1f MiB: own %d output %d same layout %d children %d views %d view %d\n", i,
++                    parent->name, ggml_op_desc(parent), ggml_nbytes(parent)/1024.0/1024.0, (int) ggml_gallocr_is_own(galloc, parent),
++                    (int) ((parent->flags & GGML_TENSOR_FLAG_OUTPUT) != 0), (int) ggml_are_same_layout(node, parent), p_hn->n_children,
++                    p_hn->n_views, (int) ggml_impl_is_view(parent));
++            }
++        }
++    }
++
+     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
+         hn->allocated = true;
+         assert(hn->addr.offset == 0);
+-- 
+2.43.0
+

@@ -1,0 +1,255 @@
+From e31bcb9a71a7021e2e44638d6f3eb12e89d09b38 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 11:51:31 -0600
+Subject: [PATCH 029/141] LLAMA_MOE_RING_ONLY=1: the MUL_MAT_ID expert copies
+ of large batches get a placeholder buffer and no graph memory; the copy
+ callback points them at an upload-ring slot first
+
+---
+ ggml/include/ggml-backend.h     |  3 ++
+ ggml/include/ggml-cuda.h        |  6 ++++
+ ggml/src/ggml-backend.cpp       | 16 +++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 50 +++++++++++++++++++++++++++++++++
+ src/llama-context.cpp           | 50 +++++++++++++++++++++++++++++++++
+ src/llama-context.h             |  3 ++
+ 6 files changed, 128 insertions(+)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 0f8bf17f7..67b736f3f 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -380,6 +380,9 @@ extern "C" {
+     // enqueue the copies of a split's weights in host memory before the copies of its other inputs, so they start before the split
+     // waits for inputs computed by other backends (the copy callback must then not read those inputs)
+     GGML_API void                 ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable);
++    // the copies of host-memory MUL_MAT_ID weights (src0) on this backend get this buffer as a placeholder and no graph memory: the copy
++    // callback must point each one at memory of its own before filling it (NULL = off)
++    GGML_API void                 ggml_backend_sched_set_expert_placeholder(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t buffer);
+ 
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index c6b3826f2..5f4e93791 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -43,6 +43,12 @@ GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_gather(ggml_backend_t back
+ // for every side upload issued since the last wait
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_async(ggml_backend_t backend, void * dst, const void * src, size_t bytes);
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend);
++
++// upload ring without the gather: reserve `bytes` in the current slot (`first_of_split` starts the next slot) and return its device
++// address, the main stream ordered after the ring stream; copy_commit fills it from the host on the ring stream and makes the main
++// stream wait for that copy
++GGML_BACKEND_API void * ggml_backend_cuda_upload_ring_reserve(ggml_backend_t backend, bool first_of_split, size_t bytes, size_t split_bytes);
++GGML_BACKEND_API void   ggml_backend_cuda_upload_ring_copy_commit(ggml_backend_t backend, void * dst, const void * src, size_t bytes);
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_twin(int device, int k);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 041d2d639..ad0860285 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1235,6 +1235,7 @@ struct ggml_backend_sched {
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
+     bool host_weights_first[GGML_SCHED_MAX_BACKENDS] = {}; // per backend, see ggml_backend_sched_set_host_weights_first
++    ggml_backend_buffer_t expert_placeholder[GGML_SCHED_MAX_BACKENDS] = {}; // per backend, see ggml_backend_sched_set_expert_placeholder
+ 
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+@@ -1813,6 +1814,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             }
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++                            // MUL_MAT_ID experts in host memory that the copy callback serves from memory of its own: no graph memory
++                            if (host_weight && node->op == GGML_OP_MUL_MAT_ID && j == 0 && sched->expert_placeholder[cur_backend_id] != NULL) {
++                                tensor_copy->buffer = sched->expert_placeholder[cur_backend_id];
++                                tensor_copy->data   = ggml_backend_buffer_get_base(sched->expert_placeholder[cur_backend_id]);
++                            }
+                             if (sched->n_copies > 1 && !host_weight) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+@@ -2174,6 +2180,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         ggml_sched_copy_account(1, tc0);
+         return;
+     }
++    if (sched->expert_placeholder[split_backend_id] != NULL && input_cpy->buffer == sched->expert_placeholder[split_backend_id]) {
++        GGML_ABORT("%s: the copy of %s has no graph memory (expert placeholder) and the copy callback did not serve it", __func__, input->name);
++    }
+ 
+     if (sched->n_copies > 1 && ggml_backend_sched_is_host_weight(input)) {
+         // the single copy is reused by the allocator, so write it in order with the work of the split backend
+@@ -2472,6 +2481,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     free(sched);
+ }
+ 
++void ggml_backend_sched_set_expert_placeholder(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_buffer_t buffer) {
++    GGML_ASSERT(sched);
++    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
++    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
++    sched->expert_placeholder[backend_id] = buffer;
++}
++
+ void ggml_backend_sched_set_host_weights_first(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable) {
+     GGML_ASSERT(sched);
+     const int backend_id = ggml_backend_sched_backend_id(sched, backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ad3a359dc..189520e49 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6903,6 +6903,56 @@ void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend) {
+     r.side_pending = false;
+ }
+ 
++void * ggml_backend_cuda_upload_ring_reserve(ggml_backend_t backend, bool first_of_split, size_t bytes, size_t split_bytes) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const int dev = cuda_ctx->device;
++    ggml_cuda_set_device(dev);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[dev];
++    ggml_cuda_upload_ring_init(r);
++    cudaStream_t main_stream = cuda_ctx->stream();
++    if (first_of_split) {
++        r.k += 1;
++        r.used = 0;
++        const int s = (int) (r.k % 2);
++        CUDA_CHECK(cudaEventRecord(r.ev_main[s], main_stream));
++        if (r.k >= 1) {
++            CUDA_CHECK(cudaStreamWaitEvent(r.stream, r.ev_main[(r.k - 1) % 2], 0));
++        }
++    }
++    if (r.k < 0) {
++        return nullptr;
++    }
++    const int s = (int) (r.k % 2);
++    if (r.used + bytes > r.slot_bytes) {
++        const size_t need = std::max(r.used + bytes, split_bytes);
++        CUDA_CHECK(cudaDeviceSynchronize());
++        for (int i = 0; i < 2; ++i) {
++            if (r.slot[i] != nullptr) {
++                CUDA_CHECK(cudaFree(r.slot[i]));
++            }
++            CUDA_CHECK(cudaMalloc(&r.slot[i], need));
++        }
++        r.slot_bytes = need;
++        GGML_LOG_INFO("%s: device %d: two upload slots of %.1f MiB\n", __func__, dev, need/1024.0/1024.0);
++    }
++    char * dst = (char *) r.slot[s] + r.used;
++    r.used += GGML_PAD(bytes, 256);
++    // the main stream may write into the slot itself (medium batches): order it after the ring stream's older uploads
++    CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++    CUDA_CHECK(cudaStreamWaitEvent(main_stream, r.ev_upload, 0));
++    return dst;
++}
++
++void ggml_backend_cuda_upload_ring_copy_commit(ggml_backend_t backend, void * dst, const void * src, size_t bytes) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    ggml_cuda_upload_ring_init(r);
++    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, r.stream));
++    CUDA_CHECK(cudaEventRecord(r.ev_upload, r.stream));
++    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), r.ev_upload, 0));
++}
++
+ bool ggml_backend_cuda_host_ptr_device_accessible(const void * ptr) {
+     cudaPointerAttributes attr;
+     const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a0617bc63..bb3f1d8c3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -805,6 +805,21 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+ 
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
++    expert_placeholders.clear();
++#ifdef GGML_USE_CUDA
++    if (llama_moe_ring_only() && moe_cache && twins.empty()) {
++        for (ggml_backend_t b : backend_ptrs) {
++            if (!ggml_backend_is_cuda(b)) {
++                continue;
++            }
++            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(b), 256);
++            GGML_ASSERT(buf != nullptr);
++            expert_placeholders.emplace_back(buf);
++            ggml_backend_sched_set_expert_placeholder(sched.get(), b, buf);
++        }
++        LLAMA_LOG_INFO("%s: MUL_MAT_ID expert copies live in the upload ring only (LLAMA_MOE_RING_ONLY)\n", __func__);
++    }
++#endif
+     for (const auto & pt : twins) {
+         ggml_backend_sched_set_host_weights_first(sched.get(), pt.second, true); // a twin's uploads start before it waits for the primary
+     }
+@@ -3006,6 +3021,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
+ 
++#ifdef GGML_USE_CUDA
++    // LLAMA_MOE_RING_ONLY: the copy has no graph memory, give it a ring slot first (every path below fills dst->data)
++    if (!lctx->expert_placeholders.empty() && ggml_backend_is_cuda(backend)) {
++        const int32_t il = lctx->moe_cache ? lctx->moe_cache->layer_of_weight(src) : -1;
++        size_t split_bytes = 0;
++        if (il >= 0 && il < (int32_t) lctx->model.layers.size()) {
++            const auto & layer = lctx->model.layers[il];
++            for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++                split_bytes += t ? GGML_PAD(ggml_nbytes(t), 256) : 0;
++            }
++        } else {
++            split_bytes = 3*GGML_PAD(ggml_nbytes(dst), 256);
++        }
++        const bool first = il < 0 || il != st.ring_il;
++        st.ring_il = il;
++        dst->data = ggml_backend_cuda_upload_ring_reserve(backend, first, ggml_nbytes(dst), split_bytes);
++        GGML_ASSERT(dst->data != nullptr);
++    }
++#endif
++
+     // all the experts in one gather kernel: the cached ones from the device banks, the rest from the pinned host weights (UVA)
+     auto gather_all = [&]() -> bool {
+ #ifdef GGML_USE_CUDA
+@@ -3020,6 +3055,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         // LLAMA_MOE_UPLOAD_RING=1: gather into the device's upload ring on its upload stream, overlapped with the previous split's
+         // GEMMs, and point the scheduler's copy at the slot (the twins did this with a second backend and twice the launches)
+         static const bool upload_ring = getenv("LLAMA_MOE_UPLOAD_RING") != nullptr && atoi(getenv("LLAMA_MOE_UPLOAD_RING")) != 0;
++        if (!lctx->expert_placeholders.empty()) {
++            // LLAMA_MOE_RING_ONLY: dst->data is the ring slot reserved above, fill it from the host by the copy engine
++            ggml_backend_cuda_upload_ring_copy_commit(backend, dst->data, src->data, ggml_nbytes(dst));
++            return true;
++        }
+         if (upload_ring && lctx->twins.empty() && lctx->moe_cache) {
+             const int32_t il = lctx->moe_cache->layer_of_weight(src);
+             if (il >= 0 && il < (int32_t) lctx->model.layers.size()) {
+@@ -3191,6 +3231,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
++// LLAMA_MOE_RING_ONLY=1 (needs LLAMA_MOE_UPLOAD_RING=1 and LLAMA_MOE_UPLOAD_RING_MEMCPY=1): the MUL_MAT_ID expert copies of large batches
++// live in the upload ring only, the graph allocator reserves nothing for them
++static bool llama_moe_ring_only() {
++    static const bool v = [] {
++        auto on = [](const char * k) { return getenv(k) != nullptr && atoi(getenv(k)) != 0; };
++        return on("LLAMA_MOE_RING_ONLY") && on("LLAMA_MOE_UPLOAD_RING") && on("LLAMA_MOE_UPLOAD_RING_MEMCPY");
++    }();
++    return v;
++}
++
+ static bool llama_has_host_weight(const ggml_tensor * t) {
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+         if (t->src[i] && llama_tensor_is_host_weight(t->src[i])) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 57bb4e1c9..25ba18cba 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -410,6 +410,9 @@ private:
+     // twin backends for the prefill overlap (LLAMA_TWIN_BACKENDS): primary -> second backend on the same device
+     std::vector<std::pair<ggml_backend_t, ggml_backend_t>> twins;
+ 
++    // LLAMA_MOE_RING_ONLY: per CUDA backend, the placeholder buffer of the MUL_MAT_ID expert copies (see sched_new)
++    std::vector<ggml_backend_buffer_ptr> expert_placeholders;
++
+     // graph reallocations during inference where the backend assignments did not change, split by whether the
+     // graph size is the same as the previously scheduled one (unexpected) or different
+     int32_t n_reallocs_same = 0;
+-- 
+2.43.0
+

@@ -1,0 +1,100 @@
+From 3a92d7698b503fbaf5c7f8950b3efe7340bf1dab Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:30:46 -0600
+Subject: [PATCH 015/141] sched: GGML_SCHED_TIMING=1 breaks the input-copy host
+ time down by path (user input, callback, host weight, async copy, synchronous
+ fallback)
+
+---
+ ggml/src/ggml-backend.cpp | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 62f7be40b..041d2d639 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2046,6 +2046,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+ static bool ggml_backend_sched_timing_enabled(void);
+ 
++// host time of ggml_backend_sched_copy_input per path (GGML_SCHED_TIMING): 0 user input, 1 copy callback, 2 host weight, 3 async copy,
++// 4 synchronous fallback
++static int64_t ggml_sched_copy_t[5];
++static int64_t ggml_sched_copy_n[5];
++
++static inline void ggml_sched_copy_account(int cat, int64_t t0) {
++    if (t0 != 0) {
++        ggml_sched_copy_t[cat] += ggml_time_us() - t0;
++        ggml_sched_copy_n[cat] += 1;
++    }
++}
++
+ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     bool backend_ids_changed = false;
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+@@ -2136,6 +2148,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++    const int64_t tc0 = ggml_backend_sched_timing_enabled() ? ggml_time_us() : 0;
+ 
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+@@ -2145,6 +2158,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             ggml_backend_synchronize(split_backend);
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
++        ggml_sched_copy_account(0, tc0);
+         return;
+     }
+ 
+@@ -2157,18 +2171,24 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+ 
+     if (sched->callback_copy != NULL &&
+         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++        ggml_sched_copy_account(1, tc0);
+         return;
+     }
+ 
+     if (sched->n_copies > 1 && ggml_backend_sched_is_host_weight(input)) {
+         // the single copy is reused by the allocator, so write it in order with the work of the split backend
+         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++        ggml_sched_copy_account(2, tc0);
+         return;
+     }
+ 
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+-    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++    if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++        ggml_sched_copy_account(3, tc0);
++        return;
++    }
++    {
+         ggml_backend_synchronize(input_backend);
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+@@ -2176,6 +2196,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+             ggml_backend_synchronize(split_backend);
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
++        ggml_sched_copy_account(4, tc0);
+     }
+ }
+ 
+@@ -2318,6 +2339,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         GGML_LOG_INFO("sched timing: %d splits, %d nodes: host %.1f ms = copies %.1f ms (%lld inputs, %lld host weights) + compute launches %.1f ms + other %.1f ms\n",
+             sched->n_splits, sched->graph.n_nodes, t_total/1000.0, t_copies/1000.0, (long long) n_copy_inputs, (long long) n_host_weights,
+             t_compute/1000.0, (t_total - t_copies - t_compute)/1000.0);
++        GGML_LOG_INFO("sched copies: user %.1f ms (%lld), callback %.1f ms (%lld), host weights %.1f ms (%lld), async %.1f ms (%lld), sync fallback %.1f ms (%lld)\n",
++            ggml_sched_copy_t[0]/1000.0, (long long) ggml_sched_copy_n[0], ggml_sched_copy_t[1]/1000.0, (long long) ggml_sched_copy_n[1],
++            ggml_sched_copy_t[2]/1000.0, (long long) ggml_sched_copy_n[2], ggml_sched_copy_t[3]/1000.0, (long long) ggml_sched_copy_n[3],
++            ggml_sched_copy_t[4]/1000.0, (long long) ggml_sched_copy_n[4]);
++        memset(ggml_sched_copy_t, 0, sizeof(ggml_sched_copy_t));
++        memset(ggml_sched_copy_n, 0, sizeof(ggml_sched_copy_n));
+     }
+ 
+     return GGML_STATUS_SUCCESS;
+-- 
+2.43.0
+

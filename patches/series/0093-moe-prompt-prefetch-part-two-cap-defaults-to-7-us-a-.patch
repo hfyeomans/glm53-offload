@@ -1,0 +1,26 @@
+From c1e0311c7e5c09cdc3a3bfa4b0f2b2164b792131 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 16:26:02 -0600
+Subject: [PATCH 093/141] moe prompt prefetch: part two cap defaults to 7 us a
+ token (measured: 921 / 1,210 / 1,124 against 903 / 1,209 / 1,121 at 5)
+
+---
+ src/llama-moe-cache.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index c69e25aa5..a7955cf14 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1938,7 +1938,7 @@ struct llama_moe_cache::impl {
+             // are one copy
+             ln.p_pf_n1 = std::min<int32_t>((int32_t) cand.size(), l.p_pf_want1);
+             // 0093: part two no longer than the next layer's attention (the next plan's read-back queues behind it)
+-            static const double post_us = prompt_env("LLAMA_MOE_PROMPT_POST_US", 5.0);
++            static const double post_us = prompt_env("LLAMA_MOE_PROMPT_POST_US", 7.0); // 0094: 5 -> 7, measured
+             const int32_t n2_max = (int32_t) std::floor(post_us*n_tok/1e3/u_ms);
+             if ((int32_t) cand.size() > ln.p_pf_n1 + n2_max) {
+                 cand.resize(ln.p_pf_n1 + n2_max);
+-- 
+2.43.0
+

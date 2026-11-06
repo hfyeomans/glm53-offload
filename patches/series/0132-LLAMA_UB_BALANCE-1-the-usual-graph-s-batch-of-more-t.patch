@@ -1,0 +1,33 @@
+From a11e5ac9b208befab05ad5107b6002e8b66ce9b1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:15:57 -0600
+Subject: [PATCH 132/141] LLAMA_UB_BALANCE=1: the usual graph's batch of more
+ than n_ubatch tokens in equal ubatches instead of n_ubatch-sized ones and a
+ tail
+
+---
+ src/llama-context.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 321a2b5c3..3bb57447d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2264,6 +2264,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         n_ub = std::min(cparams.n_ubatch, u);
+         lm_try = true;
+     }
++    // 0127 LLAMA_UB_BALANCE=1: the usual graph's batch of more than n_ubatch tokens in k equal ubatches, not n_ubatch-sized ones and a tail
++    static const bool ub_balance = getenv("LLAMA_UB_BALANCE") != nullptr && atoi(getenv("LLAMA_UB_BALANCE")) != 0;
++    if (ub_balance && !lm_on && balloc->get_n_tokens() > n_ub) {
++        const uint32_t n_all = balloc->get_n_tokens();
++        const uint32_t k = (n_all + n_ub - 1)/n_ub;
++        const uint32_t u = ((n_all + k - 1)/k + 255)/256*256;
++        n_ub = std::min(n_ub, u);
++    }
+ 
+     while (true) {
+         mctx = memory->init_batch(*balloc, n_ub, embd_all);
+-- 
+2.43.0
+

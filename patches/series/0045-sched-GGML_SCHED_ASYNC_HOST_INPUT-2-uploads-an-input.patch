@@ -1,0 +1,155 @@
+From 94fe5220e89dd92061de4c72ccc28e545af5c423 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 19:31:26 -0600
+Subject: [PATCH 045/141] sched: GGML_SCHED_ASYNC_HOST_INPUT=2 uploads an input
+ computed on the host on a CUDA upload stream of its own, so it overlaps the
+ work queued before it (pipeline-parallel copies only)
+
+---
+ ggml/src/ggml-backend.cpp       | 37 +++++++++++++++++++++++----
+ ggml/src/ggml-cuda/ggml-cuda.cu | 45 +++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 9aa3ecb52..c84f3cb6c 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1236,6 +1236,9 @@ struct ggml_backend_sched {
+     void * callback_copy_user_data;
+     bool host_weights_first[GGML_SCHED_MAX_BACKENDS] = {}; // per backend, see ggml_backend_sched_set_host_weights_first
+     ggml_backend_buffer_t expert_placeholder[GGML_SCHED_MAX_BACKENDS] = {}; // per backend, see ggml_backend_sched_set_expert_placeholder
++    // GGML_SCHED_ASYNC_HOST_INPUT=2 (0044): per backend, its upload stream for inputs computed on the host (NULL: the backend offers none)
++    void (*host_input_begin[GGML_SCHED_MAX_BACKENDS])(ggml_backend_t) = {};
++    void (*host_input_upload[GGML_SCHED_MAX_BACKENDS])(ggml_backend_t, void *, const void *, size_t) = {};
+ 
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+@@ -2146,16 +2149,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+ }
+ 
+ // GGML_SCHED_ASYNC_HOST_INPUT=1: inputs computed by a host backend are uploaded on the split backend's stream (0038)
+-static bool ggml_backend_sched_async_host_input(void) {
++// GGML_SCHED_ASYNC_HOST_INPUT=2: on an upload stream of the backend's own, where it offers one and the copies are the inputs' alone (0044)
++static int ggml_backend_sched_async_host_input(void) {
+     static int v = -1;
+     if (v < 0) {
+         const char * s = getenv("GGML_SCHED_ASYNC_HOST_INPUT");
+-        v = s != NULL && atoi(s) != 0;
++        const int e = s != NULL ? atoi(s) : 0;
++        v = e > 0 ? e : 0;
+         if (v) {
+-            GGML_LOG_INFO("%s: inputs computed on the host are uploaded asynchronously\n", __func__);
++            GGML_LOG_INFO("%s: inputs computed on the host are uploaded asynchronously%s\n", __func__, v >= 2 ? ", on an upload stream of their own" : "");
+         }
+     }
+-    return v != 0;
++    return v;
+ }
+ 
+ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+@@ -2208,7 +2213,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     if (ggml_backend_sched_async_host_input() && input->buffer != NULL && input_cpy->buffer != NULL &&
+             ggml_backend_buffer_is_host(input->buffer) && !ggml_backend_buffer_is_host(input_cpy->buffer) && !ggml_backend_sched_is_host_weight(input) &&
+             split_backend->iface.set_tensor_async != NULL) {
+-        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++        if (ggml_backend_sched_async_host_input() >= 2 && sched->n_copies > 1 && sched->host_input_upload[split_backend_id] != NULL) {
++            // 0044: on the backend's upload stream, during the work queued before it; with copies, the copy is this input's alone
++            sched->host_input_upload[split_backend_id](split_backend, input_cpy->data, input->data, ggml_nbytes(input));
++        } else {
++            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++        }
+         ggml_sched_copy_account(3, tc0);
+         return;
+     }
+@@ -2279,6 +2289,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+     int prev_backend_id = -1;
+ 
++    // 0044: each backend's upload stream for host-computed inputs starts behind what its main stream holds now (the earlier graphs)
++    if (sched->n_copies > 1 && ggml_backend_sched_async_host_input() >= 2) {
++        for (int b = 0; b < sched->n_backends; b++) {
++            if (sched->host_input_begin[b] != NULL) {
++                sched->host_input_begin[b](sched->backends[b]);
++            }
++        }
++    }
++
+     if (sched->n_copies > 1) {
+         ggml_backend_sched_upload_user_inputs(sched);
+     }
+@@ -2438,6 +2457,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+ 
++        // 0044: the backend's upload stream for host-computed inputs, if its registry offers one
++        ggml_backend_dev_t host_input_dev = ggml_backend_get_device(backends[b]);
++        ggml_backend_reg_t host_input_reg = host_input_dev != NULL ? ggml_backend_dev_backend_reg(host_input_dev) : NULL;
++        if (host_input_reg != NULL) {
++            sched->host_input_begin[b]  = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(host_input_reg, "ggml_backend_host_input_begin");
++            sched->host_input_upload[b] = (void (*)(ggml_backend_t, void *, const void *, size_t)) ggml_backend_reg_get_proc_address(host_input_reg, "ggml_backend_host_input_upload");
++        }
++
+         if (sched->n_copies > 1) {
+             for (int c = 0; c < sched->n_copies; c++) {
+                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 58a8c4dd4..46a427c00 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6774,8 +6774,53 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++// GGML_SCHED_ASYNC_HOST_INPUT=2 (0044): inputs that a host backend computed go up on an upload stream of their own per device, so they
++// overlap the work queued before them on the main stream; the split that reads one waits for it by an event.  The stream first waits for
++// what the main stream held when the graph started (ggml_backend_host_input_begin), so an earlier graph never sees its copy overwritten.
++struct ggml_cuda_host_input_stream {
++    cudaStream_t stream    = nullptr;
++    cudaEvent_t  ev_start  = nullptr; // the main stream at the start of the graph
++    cudaEvent_t  ev_upload = nullptr; // the last upload
++    bool         logged    = false;
++};
++
++static ggml_cuda_host_input_stream g_cuda_host_input[GGML_CUDA_MAX_DEVICES];
++
++static void ggml_backend_cuda_host_input_begin(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_host_input_stream & h = g_cuda_host_input[cuda_ctx->device];
++    if (h.stream == nullptr) {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&h.stream, cudaStreamNonBlocking));
++        CUDA_CHECK(cudaEventCreateWithFlags(&h.ev_start, cudaEventDisableTiming));
++        CUDA_CHECK(cudaEventCreateWithFlags(&h.ev_upload, cudaEventDisableTiming));
++    }
++    CUDA_CHECK(cudaEventRecord(h.ev_start, cuda_ctx->stream()));
++    CUDA_CHECK(cudaStreamWaitEvent(h.stream, h.ev_start, 0));
++}
++
++static void ggml_backend_cuda_host_input_upload(ggml_backend_t backend, void * dst, const void * src, size_t bytes) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_host_input_stream & h = g_cuda_host_input[cuda_ctx->device];
++    GGML_ASSERT(h.stream != nullptr && "ggml_backend_host_input_begin was not called");
++    if (!h.logged) {
++        GGML_LOG_INFO("%s: device %d: inputs computed on the host go up on an upload stream of their own\n", __func__, cuda_ctx->device);
++        h.logged = true;
++    }
++    CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, h.stream));
++    CUDA_CHECK(cudaEventRecord(h.ev_upload, h.stream));
++    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), h.ev_upload, 0));
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_host_input_begin") == 0) {
++        return (void *)ggml_backend_cuda_host_input_begin;
++    }
++    if (strcmp(name, "ggml_backend_host_input_upload") == 0) {
++        return (void *)ggml_backend_cuda_host_input_upload;
++    }
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_cuda_comm_init;
+     }
+-- 
+2.43.0
+

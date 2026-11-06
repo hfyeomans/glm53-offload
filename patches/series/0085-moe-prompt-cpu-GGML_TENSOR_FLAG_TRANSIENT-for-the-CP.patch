@@ -1,0 +1,117 @@
+From aec0bde2e2171ba8ce56291094c8389ddb10752b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:52:45 -0600
+Subject: [PATCH 085/141] moe prompt cpu: GGML_TENSOR_FLAG_TRANSIENT for the
+ CPU part input and result (one copy, like an intermediate; was 68 GB kept
+ under pipeline parallelism), skip -1 ids in the used-experts upload
+
+---
+ ggml/include/ggml.h       |  1 +
+ ggml/src/ggml-backend.cpp | 20 +++++++++++++++++++-
+ src/llama-context.cpp     |  5 ++++-
+ src/llama-graph.cpp       |  2 ++
+ 4 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index abef09ddc..33f2ef466 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -670,6 +670,7 @@ extern "C" {
+         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
++        GGML_TENSOR_FLAG_TRANSIENT = 32, // ...0086: as a split input of another backend, one copy allocated like an intermediate
+     };
+ 
+     enum ggml_tri_type {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 4cff5fe3e..821e716e9 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1281,6 +1281,11 @@ static bool ggml_backend_sched_input_is_transient(ggml_backend_sched_t sched, st
+         ggml_backend_sched_backend_is_gpu(sched->backends[input_backend_id]) && ggml_backend_sched_backend_is_gpu(sched->backends[split_backend_id]);
+ }
+ 
++// 0086: a tensor flagged transient (GGML_TENSOR_FLAG_TRANSIENT), or a view of one: as a split input, one copy allocated like an intermediate
++static bool ggml_backend_sched_is_flagged_transient(const struct ggml_tensor * t) {
++    return (t->flags & GGML_TENSOR_FLAG_TRANSIENT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_TRANSIENT));
++}
++
+ // views of the inputs from the user (e.g. reshaped inputs) can be split inputs too
+ static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
+     return (t->flags & GGML_TENSOR_FLAG_INPUT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_INPUT));
+@@ -1830,7 +1835,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         // user inputs and host weights are uploaded in order on the split backend stream, so one copy is enough
+                         const bool host_weight = ggml_backend_sched_is_host_weight(src);
+                         // 0065: a transient cross-GPU input (0060) is one copy, allocated and freed like an intermediate
+-                        const bool transient   = ggml_backend_sched_input_is_transient(sched, src, cur_backend_id);
++                        const bool transient   = ggml_backend_sched_input_is_transient(sched, src, cur_backend_id) ||
++                                                 ggml_backend_sched_is_flagged_transient(src); // 0086
+                         const bool single_copy = host_weight || transient || ggml_backend_sched_is_user_input(src);
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             if (single_copy && c > 0) {
+@@ -2053,6 +2059,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                 if (ggml_backend_sched_input_is_transient(sched, input, backend_id)) {
+                     continue; // 0060: likewise
+                 }
++                if (ggml_backend_sched_is_flagged_transient(input)) {
++                    continue; // 0086: likewise
++                }
+                 size_t id = hash_id(input);
+                 for (int c = 0; c < sched->n_copies; c++) {
+                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+@@ -2275,6 +2284,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         GGML_ABORT("%s: the copy of %s has no graph memory (expert placeholder) and the copy callback did not serve it", __func__, input->name);
+     }
+ 
++    // 0086: a flagged transient host-to-device input shares its memory with the split backend's intermediates, so it goes up on that
++    // backend's stream, in order with the work queued before it (not on an upload stream of its own)
++    if (ggml_backend_sched_is_flagged_transient(input) && input->buffer != NULL && input_cpy->buffer != NULL &&
++            ggml_backend_buffer_is_host(input->buffer) && !ggml_backend_buffer_is_host(input_cpy->buffer)) {
++        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++        ggml_sched_copy_account(3, tc0);
++        return;
++    }
++
+     if (sched->n_copies > 1 && ggml_backend_sched_is_host_weight(input)) {
+         // the single copy is reused by the allocator, so write it in order with the work of the split backend
+         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 77dedfed1..7f2d738aa 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3356,7 +3356,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+-                GGML_ASSERT(id >= 0 && id < n_expert);
++                if (id < 0) {
++                    continue; // 0086: an expert computed elsewhere (LLAMA_MOE_PROMPT_CPU)
++                }
++                GGML_ASSERT(id < n_expert);
+                 st.used[id] = true;
+             }
+         }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 06fc9708f..39c2e9ae8 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2803,6 +2803,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         const int64_t n_pairs = moe_cache->prompt_pairs(il, n_tokens, &ptok, &pids, &pw);
+         const int n_nodes_c = ggml_graph_n_nodes(gf);
+         ggml_tensor * x2  = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
++        x2->flags |= GGML_TENSOR_FLAG_TRANSIENT; // 0086: its host copy is one, allocated like an intermediate
+         ggml_tensor * xp  = ggml_get_rows(ctx0, x2, ggml_view_1d(ctx0, ptok, n_pairs, 0)); // [n_embd, n_pairs]
+         xp = ggml_reshape_3d(ctx0, xp, n_embd, 1, n_pairs);
+         ggml_tensor * idc = ggml_view_2d(ctx0, pids, 1, n_pairs, pids->nb[1], 0);
+@@ -2821,6 +2822,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * outc = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, &yc, 1, llama_moe_cache::prompt_scatter, GGML_N_TASKS_MAX,
+             moe_cache->prompt_scatter_userdata(il));
+         cb(outc, "ffn_moe_out_cpu", il);
++        outc->flags |= GGML_TENSOR_FLAG_TRANSIENT; // 0086: likewise its device copy
+         ggml_build_forward_expand(gf, outc);
+         for (int i = n_nodes_c; i < ggml_graph_n_nodes(gf); ++i) {
+             ggml_tensor * node = ggml_graph_node(gf, i);
+-- 
+2.43.0
+
