@@ -27,7 +27,8 @@ else
   if [ -z "$PRESET" ]; then
     CTX=$(curl -fs "$URL/props" | grep -o 'n_ctx":[0-9]*' | head -n 1 | grep -o '[0-9]*$')
     case ${CTX:-0} in
-      262144) PRESET=256k;; 524288) PRESET=512k;; 1000000|1048576) PRESET=1m;;
+      # the one-card 1M preset asks for 1,000,000 tokens and the server reports 1,000,192, the next multiple of 256
+      262144) PRESET=256k;; 524288) PRESET=512k;; 1000000|1000192|1048576) PRESET=1m;;
       *) echo "bench.sh: the server reports a context of ${CTX:-?} tokens, not one of the presets; pass --ctx"; exit 2;;
     esac
   fi

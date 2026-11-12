@@ -79,7 +79,8 @@ Each context has its own preset for one card and for two: six recipes, each meas
 <!-- /T:presets -->
 
 Take the smallest context your work fits in. A larger context takes GPU memory from the expert cache, so fewer experts sit on the
-GPU. The one-card 1M preset is 1,000,000 tokens and leaves the cache almost nothing to give: the card must be whole.
+GPU. The one-card 1M preset is 1,000,000 tokens (the server reports 1,000,192, the next multiple of 256) and leaves the cache almost
+nothing to give: the card must be whole.
 
 ## The route bias
 
