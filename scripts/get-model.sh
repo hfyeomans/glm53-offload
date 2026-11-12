@@ -1,12 +1,12 @@
 #!/bin/bash
 # get-model.sh -- get the model the recipes were measured on, GLM-5.3 UD-Q3_K_XL "a5" (336.7 GB in 9 shards), and verify it.
-# a5 is Unsloth's UD-Q3_K_XL with its Q8_0 non-expert tensors (attention, shared experts, dense FFN: 19.5 GB read on EVERY token)
-# requantized to Q5_K with Unsloth's own importance matrix; every routed expert, the embedding and the output head are copied byte
-# for byte.  Decode +11-14 %, perplexity +0.17 % (inside the error bar).
+# a5 is Unsloth's UD-Q3_K_XL with its Q8_0 attention, shared-expert and dense-FFN weights (16.2 GiB of the 19.4 GiB that are read
+# on EVERY token) requantized to Q5_K with Unsloth's own importance matrix; every routed expert, the embedding and the output head
+# are copied byte for byte.  Decode +11-14 %, perplexity +0.17 % (inside the error bar).
 #
 #   scripts/get-model.sh <dir>            download the a5 shards (337 GB) and check their sha256
 #   scripts/get-model.sh <dir> --build    build them instead: download Unsloth's UD-Q3_K_XL at a pinned revision, verify it, requantize
-#                                         it with this repo's image (123 s on the 64-core test host, no GPU) and check the result
+#                                         it with this repo's image (2 to 3 minutes on the 64-core test host, no GPU) and check the result
 #                                         against the same hashes.  Disk: 343 GB + 1.1 GB (imatrix) + 337 GB = ~681 GB.
 #     --delete-original                   with --build: remove Unsloth's shards after a verified requant
 #     --image glm53-offload:latest        with --build: the image that holds llama-quantize
@@ -30,7 +30,7 @@ esac; done
 [ $DEL = 0 ] || [ $BUILD = 1 ] || { echo "--delete-original goes with --build"; exit 2; }
 mkdir -p "$DIR" && DIR=$(cd "$DIR" && pwd)
 A5_REPO=killy369/GLM-5.3-UD-Q3_K_XL-a5-GGUF   # where the a5 shards are published, under UD-Q3_K_XL-a5/
-A5_REV=__HF_REV__                             # the published revision, set at the upload; until then the download is refused
+A5_REV=2e5e4b1564a454decfb5da1dde232a46aad366e2   # the revision that holds the nine shards and the licence
 REPO=unsloth/GLM-5.3-GGUF
 REV=346b3591c7f28d1a23716f97a065ecf12ec14771
 SRC=$DIR/UD-Q3_K_XL; DST=$DIR/UD-Q3_K_XL-a5; IMX=$DIR/imatrix_unsloth.gguf_file
@@ -120,8 +120,15 @@ TT=( --tensor-type 'blk\.8\.ffn_(gate|up)_exps=iq4_xs'  --tensor-type 'blk\.8\.f
 # the first matching --tensor-type wins and a tensor whose target equals its type is copied unchanged, so only the Q8_0 non-expert
 # tensors change (attn_k_b, 192 columns, falls back to Q5_1)
 say "requantizing to $DST"
-docker run --rm -v "$DIR":/m --entrypoint /app/llama-quantize "$IMAGE" --allow-requantize --keep-split \
-  --imatrix /m/imatrix_unsloth.gguf_file "${TT[@]}" --output-tensor-type q6_k --token-embedding-type q8_0 \
+# No GPU is passed to this container, so the NVIDIA runtime does not put the driver's libcuda.so.1 in it, and llama-quantize is
+# linked against it.  The CUDA base image carries one under compat/: enough to load the binary.  The requant runs on the CPU.
+# llama-quantize writes the path it was given for the importance matrix into the header (quantize.imatrix.file).  The reference
+# build read it from the path below, so the file is mounted there: with any other path the first shard (metadata only, no tensor)
+# differs in that one string, and its hash with it.
+IMX_AS=/data/models/unsloth__GLM-5.3-GGUF__346b3591c7f28d1a23716f97a065ecf12ec14771/imatrix_unsloth.gguf
+docker run --rm -v "$DIR":/m -v "$IMX":"$IMX_AS":ro -e LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/compat \
+  --entrypoint /app/llama-quantize "$IMAGE" --allow-requantize --keep-split \
+  --imatrix "$IMX_AS" "${TT[@]}" --output-tensor-type q6_k --token-embedding-type q8_0 \
   /m/UD-Q3_K_XL/GLM-5.3-UD-Q3_K_XL-00001-of-00009.gguf /m/UD-Q3_K_XL-a5/GLM-5.3-UD-Q3_K_XL-a5 Q5_K_M "$(nproc)" || exit 5
 
 say "verifying the a5 shards (sha256, 337 GB)"

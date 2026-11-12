@@ -35,7 +35,7 @@ start it.
 ## Quick start
 
 ```bash
-git clone <this repo> glm53-offload && cd glm53-offload
+git clone https://github.com/killy-netsphere/glm53-offload && cd glm53-offload
 docker build -t glm53-offload -f docker/Dockerfile .                       # ~5-15 min
 scripts/get-model.sh /path/to/models/glm53                                 # 337 GB download, sha256 checks
 ./run.sh --model /path/to/models/glm53/UD-Q3_K_XL-a5/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf --gpus 0      # one card
