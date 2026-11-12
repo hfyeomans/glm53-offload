@@ -1,5 +1,5 @@
 # 2gpu-512k.sh -- two RTX PRO 6000 (96 GB each, peer-to-peer), 512K context.
-# Decode: both cards work on every layer, as 2gpu-64k.
+# Decode: both cards work on every layer, as 2gpu-256k.
 # Prompt: from 513 new tokens the layer-major graph (4K-token attention blocks, both cards pipelined).  The both-cards prompt graph
 # is not used at this context.  Up to 128 new tokens stay on the decode path.
 CTX=524288

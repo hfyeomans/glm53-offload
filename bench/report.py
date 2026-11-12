@@ -8,15 +8,16 @@
       fill the tables of README.md and RESULTS.md (the blocks between <!-- T:name --> and <!-- /T:name -->) from
         results/<preset>.json           scripts/bench.sh against the preset as it ships (route bias 0)
         results/<preset>-bias003.json   scripts/bench.sh --decode-only against the preset started with --route-bias 0.03
+        results/<preset>-bias003-full.json   scripts/bench.sh in full against a second server with --route-bias 0.03
         recipes/<preset>.sh             the context, the cache size and the host memory
-      for the ten presets (1gpu-64k ... 2gpu-1m).  It fails if a file is missing or a block is left unfilled; --draft writes
+      for the six presets (1gpu-256k ... 2gpu-1m).  It fails if a file is missing or a block is left unfilled; --draft writes
       what it can.
 
 Python 3, stdlib only.
 """
 import argparse, json, os, re, statistics, sys
 
-RUNGS = ("64k", "128k", "256k", "512k", "1m")
+RUNGS = ("256k", "512k", "1m")
 PRESETS = [f"{n}gpu-{r}" for n in (1, 2) for r in RUNGS]
 DASH = "–"
 
@@ -104,7 +105,7 @@ def tables(repo, draft):
             return None
         return load(p)
 
-    R = {p: {"b0": bench(p), "b3": bench(f"{p}-bias003"), "rec": recipe(repo, p)} for p in PRESETS}
+    R = {p: {"b0": bench(p), "b3": bench(f"{p}-bias003"), "b3f": bench(f"{p}-bias003-full"), "rec": recipe(repo, p)} for p in PRESETS}
     cards = lambda p: p[0]
     ctx = lambda p: p.split("-")[1].upper()
 
@@ -115,12 +116,12 @@ def tables(repo, draft):
     def steps(j):
         return (j or {}).get("prefill", [])
 
-    # README: the 64K presets
-    head = steps(R["1gpu-64k"]["b0"]) or steps(R["2gpu-64k"]["b0"])
+    # README: the 256K presets
+    head = steps(R["1gpu-256k"]["b0"]) or steps(R["2gpu-256k"]["b0"])
     cols = [ktok(s["prompt_tokens"]) for s in head] or [DASH] * 3
-    rows = ["| 64K context | Decode | " + " | ".join(("Prompt, to " if i == 0 else "to ") + c + (" tokens" if i == 0 else "") for i, c in enumerate(cols)) + " |",
+    rows = ["| 256K context | Decode | " + " | ".join(("Prompt, to " if i == 0 else "to ") + c + (" tokens" if i == 0 else "") for i, c in enumerate(cols)) + " |",
             "|---|" + "---|" * (1 + len(cols))]
-    for p, label in (("1gpu-64k", "One card"), ("2gpu-64k", "Two cards")):
+    for p, label in (("1gpu-256k", "One card"), ("2gpu-256k", "Two cards")):
         st = steps(R[p]["b0"])
         cells = [f0(s.get("prompt_tps")) + (" tok/s" if i == 0 else "") for i, s in enumerate(st)] or [DASH] * len(cols)
         rows.append(f"| **{label}** | **{f1(dec(R[p]['b0']))} tok/s** | " + " | ".join(cells) + " |")
@@ -159,6 +160,23 @@ def tables(repo, draft):
             rows.append(f"| {'`' + p + '`' if i == 0 else ''} | {s['prompt_tokens']:,} | {f0(s.get('prompt_tps'))} | {f1(s.get('ttft_s'))} | {f1(s.get('decode_tps_after'))} |")
     t_prompt = "\n".join(rows)
 
+    # RESULTS: the prompt steps with the route bias; the decode after a step by tokens 65 to 128 of the answer
+    def win(s):
+        c = s.get("decode_curve_64") or []
+        return c[1] if len(c) > 1 else None
+
+    rows = ["| Preset | Prompt grown to | Prompt, tok/s: bias 0 | bias 0.03 | First token after, s: bias 0 | bias 0.03 | "
+            "Decode after it, tokens 65 to 128, tok/s: bias 0 | bias 0.03 |", "|---|---|---|---|---|---|---|---|"]
+    for p in PRESETS:
+        s0, s3 = steps(R[p]["b0"]), steps(R[p]["b3f"])
+        if not s0 or len(s0) != len(s3) or any(a["prompt_tokens"] != b["prompt_tokens"] for a, b in zip(s0, s3)):
+            rows.append(f"| `{p}` | " + " | ".join([DASH] * 7) + " |")
+            continue
+        for i, (a, b) in enumerate(zip(s0, s3)):
+            rows.append(f"| {'`' + p + '`' if i == 0 else ''} | {a['prompt_tokens']:,} | {f0(a.get('prompt_tps'))} | {f0(b.get('prompt_tps'))} | "
+                        f"{f1(a.get('ttft_s'))} | {f1(b.get('ttft_s'))} | {f1(win(a))} | {f1(win(b))} |")
+    t_prompt_bias = "\n".join(rows)
+
     # RESULTS: what each preset is sized for
     rows = ["| Preset | Context, tokens | Expert cache, MiB | Host RAM in use at the peak, GiB |", "|---|---|---|---|"]
     for p in PRESETS:
@@ -168,7 +186,7 @@ def tables(repo, draft):
 
     left = []
     for name, blocks in (("README.md", {"headline": headline, "presets": presets}),
-                         ("RESULTS.md", {"decode": t_decode, "prompt": t_prompt, "sizes": t_sizes})):
+                         ("RESULTS.md", {"decode": t_decode, "prompt": t_prompt, "prompt-bias": t_prompt_bias, "sizes": t_sizes})):
         path = os.path.join(repo, name)
         with open(path, encoding="utf-8") as f:
             text = f.read()

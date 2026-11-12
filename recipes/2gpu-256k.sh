@@ -1,6 +1,9 @@
 # 2gpu-256k.sh -- two RTX PRO 6000 (96 GB each, peer-to-peer), 256K context.
-# Decode and prompt as 2gpu-128k.  The cache's shares on the two cards are fixed (LLAMA_MOE_CACHE_SPLIT), not taken from the free
-# memory of each.
+# Decode: both cards work on every layer; each computes half the attention heads and the experts it caches.
+# Prompt: 129 to 8,191 new tokens run both cards on every layer; from 8,192 the layer-major graph (each layer's experts go up once
+# for 4K-token attention blocks, both cards pipelined).  Up to 128 new tokens stay on the decode path.  The sparse-attention indexer
+# runs on both cards, with the fused q8_0 kernel.  The cache's shares on the two cards are fixed (LLAMA_MOE_CACHE_SPLIT), not taken
+# from the free memory of each.
 CTX=262144
 CACHE_MIB=72600          # the MoE cache's own budget, as measured with every card whole
 NEED_RAM_GIB=354         # host memory in use at this preset's peak on the test host, the OS included

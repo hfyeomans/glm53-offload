@@ -3,7 +3,7 @@
 # context asked for, sizes the MoE cache and starts llama-server on port 8080 (OpenAI-compatible: /v1/chat/completions).
 #
 #   serve.sh --model /models/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [options] [-- extra llama-server args]
-#     --ctx 64k            context preset: 64k (default), 128k, 256k, 512k or 1m
+#     --ctx 256k           context preset: 256k (default), 512k or 1m
 #     --route-bias V       0 (default): the model's own routing.  0.03: the measured speed option; it changes the output (README.md)
 #     --cache-mib N        MoE cache size in MiB over all GPUs (default: the preset's measured size, less when a card is not whole)
 #     --threads N          CPU threads (default: the physical cores)
@@ -11,7 +11,7 @@
 #     --force              start even if a check fails (RAM, GPU model, peer-to-peer, a bias above 0.03, a card with too little free)
 #     --dry-run            print the command and the environment, start nothing
 set -u
-MODEL=; PRESET=64k; BIAS=; CACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; PASS=()
+MODEL=; PRESET=256k; BIAS=; CACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; PASS=()
 while [ $# -gt 0 ]; do case $1 in
   --model) MODEL=$2; shift 2;;
   --ctx) PRESET=${2,,}; shift 2;;
