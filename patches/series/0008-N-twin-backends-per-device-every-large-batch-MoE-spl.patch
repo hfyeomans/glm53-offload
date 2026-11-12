@@ -1,7 +1,7 @@
 From 065d1a7855e5fed453cf3c52ec1497081fb3c752 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:06:08 -0600
-Subject: [PATCH 008/141] N twin backends per device: every large-batch MoE
+Subject: [PATCH 008/211] N twin backends per device: every large-batch MoE
  split rotates over the twins
 
 LLAMA_TWIN_BACKENDS=N creates N twins per GPU (ggml_backend_cuda_init_twin(device, k)); the primary keeps attention and

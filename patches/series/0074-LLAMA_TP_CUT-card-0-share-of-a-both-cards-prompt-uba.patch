@@ -1,7 +1,7 @@
 From 8d23bf7391329fa7242f8a04d4505805341aa8e4 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 06:56:49 -0600
-Subject: [PATCH 074/141] LLAMA_TP_CUT: card 0 share of a both-cards prompt
+Subject: [PATCH 074/211] LLAMA_TP_CUT: card 0 share of a both-cards prompt
  ubatch (earlier positions attend over fewer keys)
 
 ---

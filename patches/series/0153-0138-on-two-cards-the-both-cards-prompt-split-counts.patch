@@ -1,0 +1,40 @@
+From 234e1d9d8e65e12c5c0b0194bfb36bf5fb076e7c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:12:08 -0600
+Subject: [PATCH 153/211] 0138 on two cards: the both-cards prompt split counts
+ borrowed slots as uncached (they are emptied before the graph runs)
+
+---
+ src/llama-moe-cache.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 02fb024b2..63fc05ead 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1896,10 +1896,12 @@ struct llama_moe_cache::impl {
+             const group & g = groups[l.ig];
+             const int32_t * slots = il < g.slru.slot_map.size() ? g.slru.slot_map[il] : nullptr;
+             const bool on_home = llama_moe_cache_same_device(devices[g.id].backend, be[H]);
++            // 0149: the borrowed slots are emptied after this plan, before the prompt graph runs; the lent ones are gone
++            const int32_t ep_lim = devices[g.id].borrow_bytes > 0 ? g.n_base : g.n_top;
+             cached.clear();
+             uncached.clear();
+             for (int64_t e = 0; e < n; ++e) {
+-                (on_home && slots != nullptr && slots[e] < g.n_slots ? cached : uncached).push_back((int32_t) e);
++                (on_home && slots != nullptr && slots[e] < ep_lim ? cached : uncached).push_back((int32_t) e);
+             }
+             const int64_t nc = (int64_t) cached.size();
+             const int64_t nu = (int64_t) uncached.size();
+@@ -1938,7 +1940,7 @@ struct llama_moe_cache::impl {
+             // the fixed halves: card c experts [c*n/2, (c + 1)*n/2), the home card's half from its banks where cached
+             int64_t hu = 0;
+             for (int64_t e = H*(n/2); e < (H + 1)*(n/2); ++e) {
+-                hu += on_home && slots != nullptr && slots[e] < g.n_slots ? 0 : 1;
++                hu += on_home && slots != nullptr && slots[e] < ep_lim ? 0 : 1;
+             }
+             worst_fixed += std::max((double) hu*S, (double) (n/2)*S + W);
+             n_layers++;
+-- 
+2.43.0
+

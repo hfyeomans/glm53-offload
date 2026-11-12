@@ -1,7 +1,7 @@
 From 3323e89d05663d8c4f66cc7c8f595725c886598e Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 20:10:23 -0600
-Subject: [PATCH 097/141] tiled CPU matmul: iq3_xxs unpack in AVX-512
+Subject: [PATCH 097/211] tiled CPU matmul: iq3_xxs unpack in AVX-512
  (GGML_CPU_TILED_IQ3_SIMD, default on): gathers for the grid, vpmultishiftqb +
  vpermi2b for the signs, byte-identical
 

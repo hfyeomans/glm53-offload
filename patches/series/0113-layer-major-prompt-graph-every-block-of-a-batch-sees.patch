@@ -1,7 +1,7 @@
 From 9cbda09f046c2e0ff69d8a273b0ac6d6d3e3eed0 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 12:08:17 -0600
-Subject: [PATCH 113/141] layer-major prompt graph: every block of a batch sees
+Subject: [PATCH 113/211] layer-major prompt graph: every block of a batch sees
  the keys to the batch end (cparams.lm_kv_end), one size for all its ubatches,
  so consecutive ubatches fit the allocator plan instead of re-planning (and
  synchronizing) each time; the staircase is wider by a batch

@@ -1,7 +1,7 @@
 From 0ba38effa2519e07f578fbf11a800534751bc5ec Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 16:06:32 -0600
-Subject: [PATCH 092/141] moe prompt prefetch part two capped at the next
+Subject: [PATCH 092/211] moe prompt prefetch part two capped at the next
  attention (LLAMA_MOE_PROMPT_POST_US, 5 us a token): the next plan s read-back
  queued behind it
 

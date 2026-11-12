@@ -1,0 +1,104 @@
+From 5f285d7d77af9c7442f438f7957e06aac0676275 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:18:46 -0600
+Subject: [PATCH 147/211] LLAMA_MOE_ZERO_SKIP=1: the multi-token MoE matvec
+ writes 0 for the cache zero slots (the CPU experts) without reading them
+
+---
+ ggml/include/ggml.h           |  3 +++
+ ggml/src/ggml-cuda/common.cuh |  1 +
+ ggml/src/ggml-cuda/mmvq.cu    | 11 +++++++++++
+ ggml/src/ggml.c               |  5 +++++
+ src/llama-moe-cache.cpp       |  5 +++++
+ 5 files changed, 25 insertions(+)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 33f2ef466..a49fd997e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1532,6 +1532,9 @@ extern "C" {
+     GGML_API void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset);
+     // the same range, the rows of ids outside it left undefined instead of zeroed (for results only the range's rows are read from)
+     GGML_API void ggml_mul_mat_id_set_id_offset_undef(struct ggml_tensor * a, int32_t offset);
++    // 0143: a MUL_MAT_ID over `as` may compute the rows whose expert index is zero_from or more as 0, without reading the weights
++    // (the MoE cache's zero slots); kept in op param 8 of `as` (a view keeps its offset in params 0-1)
++    GGML_API void ggml_mul_mat_id_mark_zero_slots(struct ggml_tensor * as, int32_t zero_from);
+ 
+     // A: m columns, n rows,
+     // B: p columns, n rows,
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b1fe5f68f..cf5c2853d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1617,6 +1617,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * shared_gate = nullptr;
+     float * shared_dst = nullptr;
+     uint32_t shared_stride_col_dst = 0;
++    uint32_t zero_from = 0xffffffffu; // 0143: experts from here compute as 0 (no weight reads)
+ };
+ 
+ struct ggml_cuda_kernel_launch_params {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 5e5f73100..8f8340736 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -943,6 +943,14 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    // 0143: an expert the CPU computes sits in a zero slot: its rows are 0, without reading the weights
++    if (!shared_expert && channel_x >= fusion.zero_from) {
++        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
++            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
++        }
++        return;
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+ 
+@@ -1507,6 +1515,9 @@ void ggml_cuda_mul_mat_vec_q(
+     float         *  dst_d =       (float         *)  dst->data;
+ 
+     ggml_cuda_mm_fusion_args_device fusion_local{};
++    if (ids != nullptr && ggml_get_op_params_i32(src0, 8) > 0) {
++        fusion_local.zero_from = (uint32_t) ggml_get_op_params_i32(src0, 8); // 0143: the cache's zero slots start here
++    }
+ 
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3124b75d8..efa5e019d 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3483,6 +3483,11 @@ void ggml_mul_mat_id_set_id_offset(struct ggml_tensor * a, int32_t offset) {
+     ggml_set_op_params_i32(a, 7, 1);      // ids may fall outside the range: the result is zeroed first
+ }
+ 
++void ggml_mul_mat_id_mark_zero_slots(struct ggml_tensor * as, int32_t zero_from) {
++    GGML_ASSERT(zero_from > 0);
++    ggml_set_op_params_i32(as, 8, zero_from);
++}
++
+ void ggml_mul_mat_id_set_id_offset_undef(struct ggml_tensor * a, int32_t offset) {
+     GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+     ggml_set_op_params_i32(a, 6, offset);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 5e10101c6..fbeced253 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1243,6 +1243,11 @@ struct llama_moe_cache::impl {
+                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                     ggml_tensor * bank   = g.banks[ip];
+                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
++                    // 0143 LLAMA_MOE_ZERO_SKIP=1: the device computes the CPU's experts (zero slots from n_slots) as 0, reading nothing
++                    static const bool zero_skip = getenv("LLAMA_MOE_ZERO_SKIP") != nullptr && atoi(getenv("LLAMA_MOE_ZERO_SKIP")) != 0;
++                    if (zero_skip && n_zero > 0) {
++                        ggml_mul_mat_id_mark_zero_slots(cached, g.n_slots);
++                    }
+                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                 }
+-- 
+2.43.0
+

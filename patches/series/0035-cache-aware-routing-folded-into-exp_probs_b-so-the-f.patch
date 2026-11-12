@@ -1,7 +1,7 @@
 From c1442c1c9b48262ee4078363081cfb761cc2b566 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 12:35:12 -0600
-Subject: [PATCH 035/141] cache-aware routing folded into exp_probs_b, so the
+Subject: [PATCH 035/211] cache-aware routing folded into exp_probs_b, so the
  fused topk-moe router kernel still matches
 
 ---

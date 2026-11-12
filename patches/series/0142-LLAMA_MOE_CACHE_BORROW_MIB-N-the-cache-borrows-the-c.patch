@@ -1,0 +1,783 @@
+From 6c70c4485898354989a460f9c99b9a85296da8e6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:43:01 -0600
+Subject: [PATCH 142/211] LLAMA_MOE_CACHE_BORROW_MIB=N: the cache borrows the
+ compute buffer (and with LLAMA_MOE_CACHE_BORROW_RING=1 the upload ring)
+ through CUDA VMM pages shared with an arena; slots given up before a graph
+ that reaches past LLAMA_MOE_CACHE_BORROW_HEAD_MIB
+
+---
+ ggml/include/ggml-alloc.h       |   2 +
+ ggml/include/ggml-backend.h     |   2 +
+ ggml/include/ggml-cuda.h        |  13 ++
+ ggml/src/ggml-alloc.c           |  13 ++
+ ggml/src/ggml-backend.cpp       |   9 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 263 +++++++++++++++++++++++++++++++-
+ src/llama-context.cpp           |  11 ++
+ src/llama-moe-cache.cpp         | 191 ++++++++++++++++++++++-
+ src/llama-moe-cache.h           |   9 ++
+ 9 files changed, 502 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
+index 81cce2e2a..f7192d7ea 100644
+--- a/ggml/include/ggml-alloc.h
++++ b/ggml/include/ggml-alloc.h
+@@ -72,6 +72,8 @@ GGML_API bool ggml_gallocr_reserve_n(
+ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+ 
+ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
++// 0138: the end of the bytes of buffer_id that the graph of the last reservation uses (SIZE_MAX when it spans several chunks)
++GGML_API size_t ggml_gallocr_get_peak(ggml_gallocr_t galloc, int buffer_id);
+ 
+ // Utils
+ // Create a buffer and allocate all the tensors in a ggml_context
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 4a64dfc80..b5a1e1c11 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -354,6 +354,8 @@ extern "C" {
+ 
+     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
+     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
++    // 0138: the end of the bytes of the backend's compute buffer that the current graph's allocation uses
++    GGML_API size_t                     ggml_backend_sched_get_peak(ggml_backend_sched_t sched, ggml_backend_t backend);
+ 
+     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
+     // the inputs that splits copy from another GPU are allocated and freed like intermediates, not kept for the whole graph in every
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index ffba7447f..ffde16877 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -63,6 +63,19 @@ GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend)
+ // records the event behind the side uploads issued so far (0045), for a wait on just those
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_record(ggml_backend_t backend, ggml_backend_event_t event);
+ 
++// 0138 LLAMA_MOE_CACHE_BORROW_MIB: the device's VMM granularity, 0 without VMM
++GGML_BACKEND_API size_t ggml_backend_cuda_vmm_granularity(ggml_backend_t backend);
++// a buffer of `size` bytes whose ranges [off[i], off[i] + len[i]) (ascending, granularity multiples) are the same physical pages as the
++// device's arena after its private head of `head` bytes, in that order; the rest of the buffer has pages of its own.  Creates the arena
++// (once per device); nullptr without VMM or when the device has one already
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_alloc_borrowed(ggml_backend_t backend, size_t size, const size_t * off, const size_t * len, int n, size_t head);
++// the arena's buffer type, for the device's compute buffer (nullptr without an arena); the upload ring's slots come from the arena too
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_arena_buffer_type(ggml_backend_t backend);
++// the arena's layout, as offsets from its base: the head, the largest compute buffer, the ring's range and the bytes mapped
++GGML_BACKEND_API void ggml_backend_cuda_arena_info(ggml_backend_t backend, size_t * head, size_t * compute, size_t * ring_lo, size_t * ring_hi, size_t * mapped);
++// waits for every stream of the backend's device (the main stream, the upload ring, the side uploads)
++GGML_BACKEND_API void ggml_backend_cuda_synchronize_device(ggml_backend_t backend);
++
+ // upload ring without the gather: reserve `bytes` in the current slot (`first_of_split` starts the next slot) and return its device
+ // address, the main stream ordered after the ring stream; copy_commit fills it from the host on the ring stream and makes the main
+ // stream wait for that copy
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 11a4d04a0..902815032 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -1278,6 +1278,19 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+     return true;
+ }
+ 
++// 0138: the end of the bytes of buffer_id that the graph of the last reservation uses (SIZE_MAX when it spans several chunks)
++size_t ggml_gallocr_get_peak(ggml_gallocr_t galloc, int buffer_id) {
++    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
++    const struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
++    if (alloc == NULL || alloc->n_chunks == 0) {
++        return 0;
++    }
++    if (alloc->n_chunks > 1) {
++        return SIZE_MAX;
++    }
++    return alloc->chunks[0]->max_size;
++}
++
+ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
+     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 07d3da296..1a3bbcdde 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2827,6 +2827,15 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
+     return sched->bufts[backend_index];
+ }
+ 
++size_t ggml_backend_sched_get_peak(ggml_backend_sched_t sched, ggml_backend_t backend) {
++    GGML_ASSERT(sched);
++    const int backend_index = ggml_backend_sched_backend_id(sched, backend);
++    if (backend_index < 0 || sched->galloc == NULL) {
++        return 0;
++    }
++    return ggml_gallocr_get_peak(sched->galloc, backend_index);
++}
++
+ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+     GGML_ASSERT(sched);
+     int backend_index = ggml_backend_sched_backend_id(sched, backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 781d234ee..595647eb9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -771,6 +771,10 @@ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
+     std::string name;
++    // 0138: memory the buffer does not own (an arena's pages): release(release_ud) instead of cudaFree, nothing when release is null
++    bool   external   = false;
++    void (*release)(void *) = nullptr;
++    void * release_ud = nullptr;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+@@ -778,6 +782,12 @@ struct ggml_backend_cuda_buffer_context {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
++        if (external) {
++            if (release != nullptr) {
++                release(release_ud);
++            }
++            return;
++        }
+         CUDA_CHECK(cudaFree(dev_ptr));
+     }
+ };
+@@ -7166,6 +7176,247 @@ void ggml_backend_cuda_gather_copy_async(ggml_backend_t backend, void * dst, con
+     }
+ }
+ 
++// 0138 LLAMA_MOE_CACHE_BORROW_MIB: per device, an arena of virtual memory whose pages after a private head are the same physical pages as
++// the MoE cache's borrowed slots (ggml_backend_cuda_alloc_borrowed maps them at both places).  The device's compute buffer and upload
++// ring take their memory from the arena, so the memory only prompt graphs use holds experts between prompts; the cache empties those
++// slots before a graph that reaches past the head and takes them back after (llama_moe_cache::borrow_update).
++struct ggml_cuda_arena {
++    uintptr_t va      = 0; // the reserved range [va, va + va_size)
++    size_t    va_size = 0;
++    size_t    mapped  = 0; // bytes mapped from va: the head, the shared pages, then pages of its own
++    size_t    head    = 0;
++    size_t    shared  = 0;
++    size_t    compute = 0; // the largest compute buffer handed out, from va
++    size_t    ring_lo = 0; // the upload ring's memory [ring_lo, ring_hi), after the compute buffer
++    size_t    ring_hi = 0;
++    int       live    = 0; // compute buffers from the arena not freed yet
++    ggml_backend_buffer_type buft = {};
++};
++static ggml_cuda_arena g_cuda_arena[GGML_CUDA_MAX_DEVICES];
++
++#if defined(GGML_USE_VMM)
++// as the VMM pool: the device, and its peers when peer access is on
++static void ggml_cuda_vmm_access(int device, CUdeviceptr ptr, size_t size) {
++    const int physical_device = ggml_cuda_get_physical_device(device);
++    bool use_peer_access = ggml_cuda_p2p_enabled();
++#if defined(GGML_USE_NCCL)
++    use_peer_access = true;
++#endif // defined(GGML_USE_NCCL)
++    std::vector<CUmemAccessDesc> access_descs;
++    bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
++    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
++        const int id_physical = ggml_cuda_get_physical_device(id);
++        if (id_physical != physical_device) {
++            int can_access_peer = 0;
++            if (!use_peer_access || cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device) != cudaSuccess || !can_access_peer) {
++                continue;
++            }
++        }
++        if (physical_seen[id_physical]) {
++            continue;
++        }
++        physical_seen[id_physical] = true;
++        CUmemAccessDesc access = {};
++        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        access.location.id   = id_physical;
++        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        access_descs.push_back(access);
++    }
++    CU_CHECK(cuMemSetAccess(ptr, size, access_descs.data(), access_descs.size()));
++}
++
++static CUmemGenericAllocationHandle ggml_cuda_vmm_create(int device, size_t size) {
++    CUmemAllocationProp prop = {};
++    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id   = ggml_cuda_get_physical_device(device);
++    CUmemGenericAllocationHandle handle;
++    CU_CHECK(cuMemCreate(&handle, size, &prop, 0));
++    return handle;
++}
++
++// pages of their own at [ptr, ptr + size) (the handle is released: the pages live while a mapping does)
++static void ggml_cuda_vmm_map_new(int device, CUdeviceptr ptr, size_t size) {
++    if (size == 0) {
++        return;
++    }
++    CUmemGenericAllocationHandle handle = ggml_cuda_vmm_create(device, size);
++    CU_CHECK(cuMemMap(ptr, size, 0, handle, 0));
++    CU_CHECK(cuMemRelease(handle));
++    ggml_cuda_vmm_access(device, ptr, size);
++}
++
++// the arena mapped up to `end` bytes, with pages of its own past what is mapped
++static bool ggml_cuda_arena_grow(int device, size_t end) {
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    end = GGML_PAD(end, ggml_cuda_info().devices[device].vmm_granularity);
++    if (end <= a.mapped) {
++        return true;
++    }
++    if (end > a.va_size) {
++        return false;
++    }
++    ggml_cuda_set_device(device);
++    ggml_cuda_vmm_map_new(device, (CUdeviceptr) (a.va + a.mapped), end - a.mapped);
++    a.mapped = end;
++    return true;
++}
++#endif // defined(GGML_USE_VMM)
++
++static void ggml_cuda_arena_release(void * ud) {
++    g_cuda_arena[(int) (intptr_t) ud].live--;
++}
++
++// the arena's buffer type: one compute buffer at a time from the arena's base; once the ring sits after it, it cannot grow in place
++static ggml_backend_buffer_t ggml_backend_cuda_arena_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
++    ggml_cuda_arena & a = g_cuda_arena[device];
++#if defined(GGML_USE_VMM)
++    if (a.live == 0 && (a.ring_hi == 0 || size <= a.ring_lo) && ggml_cuda_arena_grow(device, size)) {
++        a.compute = std::max(a.compute, size);
++        a.live++;
++        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) a.va);
++        ctx->external   = true;
++        ctx->release    = ggml_cuda_arena_release;
++        ctx->release_ud = (void *) (intptr_t) device;
++        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
++    }
++#endif // defined(GGML_USE_VMM)
++    GGML_LOG_WARN("%s: device %d: a compute buffer of %.1f MiB outside the arena (live %d, ring at %.1f MiB)\n", __func__, device,
++        size/1024.0/1024.0, a.live, a.ring_lo/1024.0/1024.0);
++    return ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_cuda_buffer_type(device), size);
++}
++
++// LLAMA_MOE_CACHE_BORROW_RING=1: the upload ring's slots also come from the arena (after the compute buffer).  Every graph of more than
++// the cache's max_batch tokens uses the ring, so the borrowed slots are given up for every prompt then; off, only a prompt graph that
++// reaches past the head gives them up
++static bool ggml_cuda_borrow_ring(void) {
++    static const bool v = getenv("LLAMA_MOE_CACHE_BORROW_RING") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_RING")) != 0;
++    return v;
++}
++
++// the upload ring's slots: from the device's arena after its compute buffer, when it has one and LLAMA_MOE_CACHE_BORROW_RING=1
++static void ggml_cuda_ring_malloc(void ** ptr, size_t size, int device, bool arena_ok) {
++#if defined(GGML_USE_VMM)
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    if (arena_ok && a.va != 0 && ggml_cuda_borrow_ring()) {
++        const size_t lo = a.ring_hi > 0 ? a.ring_hi : GGML_PAD(a.compute, 4096);
++        if (ggml_cuda_arena_grow(device, lo + size)) {
++            if (a.ring_hi == 0) {
++                a.ring_lo = lo;
++            }
++            a.ring_hi = GGML_PAD(lo + size, 4096);
++            *ptr = (void *) (a.va + lo);
++            return;
++        }
++    }
++#else
++    GGML_UNUSED(arena_ok);
++#endif // defined(GGML_USE_VMM)
++    ggml_cuda_set_device(device);
++    CUDA_CHECK(cudaMalloc(ptr, size));
++}
++
++static void ggml_cuda_ring_free(void * ptr, int device) {
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    if (a.va != 0 && (uintptr_t) ptr >= a.va && (uintptr_t) ptr < a.va + a.va_size) {
++        a.ring_lo = a.ring_hi = 0; // the ring frees every slot before it takes bigger ones
++        return;
++    }
++    CUDA_CHECK(cudaFree(ptr));
++}
++
++size_t ggml_backend_cuda_vmm_granularity(ggml_backend_t backend) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    const auto & info = ggml_cuda_info().devices[device];
++    return info.vmm ? info.vmm_granularity : 0;
++#else
++    GGML_UNUSED(backend);
++    return 0;
++#endif // defined(GGML_USE_VMM)
++}
++
++ggml_backend_buffer_t ggml_backend_cuda_alloc_borrowed(ggml_backend_t backend, size_t size, const size_t * off, const size_t * len, int n, size_t head) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    const auto & info = ggml_cuda_info().devices[device];
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    if (!info.vmm || a.va != 0) {
++        return nullptr;
++    }
++    const size_t gran = info.vmm_granularity;
++    size = GGML_PAD(size, gran);
++    head = GGML_PAD(head, gran);
++    size_t shared = 0;
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(off[i] % gran == 0 && len[i] % gran == 0 && off[i] + len[i] <= size);
++        GGML_ASSERT(i == 0 || off[i] >= off[i - 1] + len[i - 1]);
++        shared += len[i];
++    }
++    ggml_cuda_set_device(device);
++    CUdeviceptr bank = 0;
++    CU_CHECK(cuMemAddressReserve(&bank, size, 0, 0, 0));
++    CUdeviceptr va = 0;
++    a.va_size = head + shared + ((size_t) 512 << 30); // room for the compute buffer and the ring past the shared pages
++    CU_CHECK(cuMemAddressReserve(&va, a.va_size, 0, 0, 0));
++    a.va = (uintptr_t) va;
++    ggml_cuda_vmm_map_new(device, va, head);
++    size_t pos  = 0;    // in the bank buffer
++    size_t apos = head; // in the arena
++    for (int i = 0; i < n; ++i) {
++        ggml_cuda_vmm_map_new(device, bank + pos, off[i] - pos);
++        if (len[i] > 0) {
++            CUmemGenericAllocationHandle handle = ggml_cuda_vmm_create(device, len[i]);
++            CU_CHECK(cuMemMap(bank + off[i], len[i], 0, handle, 0));
++            CU_CHECK(cuMemMap(va + apos, len[i], 0, handle, 0));
++            CU_CHECK(cuMemRelease(handle));
++            ggml_cuda_vmm_access(device, bank + off[i], len[i]);
++            ggml_cuda_vmm_access(device, va + apos, len[i]);
++        }
++        pos   = off[i] + len[i];
++        apos += len[i];
++    }
++    ggml_cuda_vmm_map_new(device, bank + pos, size - pos);
++    a.mapped = apos;
++    a.head   = head;
++    a.shared = shared;
++    a.buft   = {
++        /* .iface   = */ ggml_backend_cuda_buffer_type_interface,
++        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
++        /* .context = */ new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device)},
++    };
++    a.buft.iface.alloc_buffer = ggml_backend_cuda_arena_alloc_buffer;
++    GGML_LOG_INFO("%s: device %d: %.1f MiB of a %.1f MiB buffer share their pages with the arena (head %.1f MiB)\n", __func__, device,
++        shared/1024.0/1024.0, size/1024.0/1024.0, head/1024.0/1024.0);
++    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) bank);
++    ctx->external = true; // mapped for the life of the process
++    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
++#else
++    GGML_UNUSED(backend); GGML_UNUSED(size); GGML_UNUSED(off); GGML_UNUSED(len); GGML_UNUSED(n); GGML_UNUSED(head);
++    return nullptr;
++#endif // defined(GGML_USE_VMM)
++}
++
++ggml_backend_buffer_type_t ggml_backend_cuda_arena_buffer_type(ggml_backend_t backend) {
++    ggml_cuda_arena & a = g_cuda_arena[((ggml_backend_cuda_context *) backend->context)->device];
++    return a.va != 0 ? &a.buft : nullptr;
++}
++
++void ggml_backend_cuda_arena_info(ggml_backend_t backend, size_t * head, size_t * compute, size_t * ring_lo, size_t * ring_hi, size_t * mapped) {
++    const ggml_cuda_arena & a = g_cuda_arena[((ggml_backend_cuda_context *) backend->context)->device];
++    *head    = a.head;
++    *compute = a.compute;
++    *ring_lo = a.ring_lo;
++    *ring_hi = a.ring_hi;
++    *mapped  = a.mapped;
++}
++
++void ggml_backend_cuda_synchronize_device(ggml_backend_t backend) {
++    ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
++    CUDA_CHECK(cudaDeviceSynchronize());
++}
++
+ // expert upload ring (see ggml-cuda.h): two slots per device, an upload stream, and the events that order it against the main stream
+ struct ggml_cuda_upload_ring {
+     cudaStream_t stream     = nullptr;
+@@ -7244,12 +7495,12 @@ static void * ggml_cuda_ring_gather_impl(ggml_cuda_upload_ring * rings, ggml_bac
+         CUDA_CHECK(cudaDeviceSynchronize());
+         for (int i = 0; i < 4; ++i) {
+             if (r.slot[i] != nullptr) {
+-                CUDA_CHECK(cudaFree(r.slot[i]));
++                ggml_cuda_ring_free(r.slot[i], dev);
+                 r.slot[i] = nullptr;
+             }
+         }
+         for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
+-            CUDA_CHECK(cudaMalloc(&r.slot[i], need));
++            ggml_cuda_ring_malloc(&r.slot[i], need, dev, &r == &g_cuda_upload_ring[dev]);
+         }
+         r.slot_bytes = need;
+         GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), need/1024.0/1024.0);
+@@ -7418,12 +7669,12 @@ void * ggml_backend_cuda_upload_ring_ahead_gather(ggml_backend_t backend, int sl
+         CUDA_CHECK(cudaDeviceSynchronize());
+         for (int i = 0; i < 4; ++i) {
+             if (r.slot[i] != nullptr) {
+-                CUDA_CHECK(cudaFree(r.slot[i]));
++                ggml_cuda_ring_free(r.slot[i], dev);
+                 r.slot[i] = nullptr;
+             }
+         }
+         for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
+-            CUDA_CHECK(cudaMalloc(&r.slot[i], slot_bytes));
++            ggml_cuda_ring_malloc(&r.slot[i], slot_bytes, dev, &r == &g_cuda_upload_ring[dev]);
+         }
+         r.slot_bytes = slot_bytes;
+         GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), slot_bytes/1024.0/1024.0);
+@@ -7578,12 +7829,12 @@ void * ggml_backend_cuda_upload_ring_reserve(ggml_backend_t backend, bool first_
+         CUDA_CHECK(cudaDeviceSynchronize());
+         for (int i = 0; i < 4; ++i) {
+             if (r.slot[i] != nullptr) {
+-                CUDA_CHECK(cudaFree(r.slot[i]));
++                ggml_cuda_ring_free(r.slot[i], dev);
+                 r.slot[i] = nullptr;
+             }
+         }
+         for (int i = 0; i < ggml_cuda_ring_slots(); ++i) {
+-            CUDA_CHECK(cudaMalloc(&r.slot[i], need));
++            ggml_cuda_ring_malloc(&r.slot[i], need, dev, &r == &g_cuda_upload_ring[dev]);
+         }
+         r.slot_bytes = need;
+         GGML_LOG_INFO("%s: device %d: %d upload slots of %.1f MiB\n", __func__, dev, ggml_cuda_ring_slots(), need/1024.0/1024.0);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 93b27e4e3..ae79ea5c7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -654,6 +654,12 @@ llama_context::llama_context(
+             if (!model.no_alloc()) {
+                 moe_cache->init_prompt_cpu(cparams.n_ubatch); // 0085, LLAMA_MOE_PROMPT_CPU
+             }
++            // 0138 LLAMA_MOE_CACHE_BORROW_MIB: the compute buffer of a device whose cache borrows from its arena comes from the arena
++            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++                if (ggml_backend_buffer_type_t ab = moe_cache->borrow_buft(backend_ptrs[i])) {
++                    backend_buft[i] = ab;
++                }
++            }
+         }
+ 
+         sched_reserve();
+@@ -1873,6 +1879,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     {
+         //const auto t_start_us = ggml_time_us();
+ 
++        // 0138: the borrowed cache slots are given up before a graph that needs their memory (before its inputs land there)
++        if (moe_cache) {
++            moe_cache->borrow_update(sched.get(), ubatch.n_tokens);
++        }
++
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 4e4aac70a..c50d6c703 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -40,6 +40,7 @@ struct moe_cache_slru {
+     std::vector<bool> is_protected;
+     int32_t n_protected = 0;
+     int32_t n_filled    = 0; // slots that hold an expert
++    int32_t n_active    = 0; // 0138: the slots in use, [0, n_active); the rest are given up (their memory is borrowed by a graph)
+ 
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+@@ -59,6 +60,7 @@ struct moe_cache_slru {
+         this->n_expert = n_expert;
+         this->n_slots  = n_slots;
+         this->empty    = n_slots;
++        this->n_active = n_slots;
+         slot_map.assign(n_layer, nullptr);
+         key_of.assign(n_slots, -1);
+         prev.resize(n_slots);
+@@ -131,6 +133,24 @@ struct moe_cache_slru {
+         GGML_ABORT("no SLRU victim");
+     }
+ 
++    // 0138: the slots from s0 on are emptied and no longer used (n_active = s0); the LFU fills slots in order and never empties one
++    // otherwise, so the filled slots stay [0, n_filled).  Returns the experts emptied
++    int32_t give_up(int32_t s0) {
++        int32_t n = 0;
++        for (int32_t s = s0; s < n_slots; ++s) {
++            const int32_t key = key_of[s];
++            if (key >= 0) {
++                slot_map[key / n_expert][key % n_expert] = empty;
++                key_of[s] = -1;
++                n_filled--;
++                n++;
++            }
++        }
++        GGML_ASSERT(n_filled <= s0);
++        n_active = s0;
++        return n;
++    }
++
+     struct fill {
+         int32_t expert;
+         int32_t slot;
+@@ -138,14 +158,14 @@ struct moe_cache_slru {
+ 
+     // 0053: an empty slot in slot order, else the lowest count of lfu_sample random slots that do not hold an expert of this lookup
+     int32_t lfu_victim(int32_t il, uint64_t & rng) const {
+-        if (n_filled < n_slots) {
++        if (n_filled < n_active) {
+             return n_filled;
+         }
+         int32_t best = -1;
+         float   bf   = 0.0f;
+         for (int32_t i = 0; i < lfu_sample || best < 0; ++i) {
+             rng = rng*6364136223846793005ull + 1442695040888963407ull;
+-            const int32_t s   = (int32_t) ((rng >> 33) % (uint64_t) n_slots);
++            const int32_t s   = (int32_t) ((rng >> 33) % (uint64_t) n_active);
+             const int32_t key = key_of[s];
+             if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                 continue;
+@@ -193,7 +213,7 @@ struct moe_cache_slru {
+                 uniq.push_back(ids[i]);
+             }
+         }
+-        if (uniq.size() > (size_t) n_slots) {
++        if (uniq.size() > (size_t) n_active) {
+             return false;
+         }
+         if (lfu_half > 0.0f) {
+@@ -362,6 +382,11 @@ struct llama_moe_cache::impl {
+         ggml_context_ptr ctx;
+         ggml_backend_buffer_ptr buf;
+         size_t buf_size = 0;
++
++        size_t   borrow_bytes = 0;    // 0138: LLAMA_MOE_CACHE_BORROW_MIB for this device, 0: none
++        size_t   borrow_head  = 0;    // the arena's private head: a graph that reaches past it needs the borrowed pages
++        bool     borrow_on    = true; // the borrowed slots are in use
++        uint32_t borrow_n     = 0;    // transitions
+     };
+ 
+     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
+@@ -372,6 +397,7 @@ struct llama_moe_cache::impl {
+         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
+         size_t host_bytes = 0;
+         int32_t n_slots = 0;
++        int32_t n_base  = 0;              // 0138: slots [n_base, n_slots) are borrowed (pages of the device's arena); n_base = n_slots: none
+         moe_cache_slru slru;
+     };
+ 
+@@ -925,6 +951,30 @@ struct llama_moe_cache::impl {
+             }
+             write_trace_header(split_sum);
+         }
++        // 0138 LLAMA_MOE_CACHE_BORROW_MIB: the largest group of each CUDA device with VMM gets the borrowed slots
++        std::vector<int32_t> borrow_group(devices.size(), -1);
++#ifdef GGML_USE_CUDA
++        if (const char * s = getenv("LLAMA_MOE_CACHE_BORROW_MIB"); s != nullptr && atoll(s) > 0 && !no_alloc) {
++            const char * h   = getenv("LLAMA_MOE_CACHE_BORROW_HEAD_MIB");
++            const char * lfu = getenv("LLAMA_MOE_CACHE_LFU");
++            if (lfu == nullptr || atof(lfu) <= 0.0) {
++                LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_BORROW_MIB needs LLAMA_MOE_CACHE_LFU (the SLRU lists cannot give slots up), not borrowing\n", __func__);
++            } else {
++                for (size_t ig = 0; ig < groups.size(); ++ig) {
++                    device & d = devices[groups[ig].id];
++                    if (!ggml_backend_is_cuda(d.backend) || ggml_backend_cuda_vmm_granularity(d.backend) == 0) {
++                        continue;
++                    }
++                    int32_t & bg = borrow_group[groups[ig].id];
++                    if (bg < 0 || groups[ig].host_bytes > groups[bg].host_bytes) {
++                        bg = (int32_t) ig;
++                    }
++                    d.borrow_bytes = (size_t) atoll(s)*1024*1024;
++                    d.borrow_head  = (size_t) (h != nullptr ? atoll(h) : 2048)*1024*1024;
++                }
++            }
++        }
++#endif
+         std::vector<size_t> n_tensors(devices.size(), 0);
+         size_t n_tensors_host = 0;
+         for (group & g : groups) {
+@@ -940,6 +990,15 @@ struct llama_moe_cache::impl {
+                 g.n_slots = 0;
+                 continue;
+             }
++            g.n_base = g.n_slots;
++            if (borrow_group[g.id] == (int32_t) (&g - groups.data())) {
++                // 0138: the borrowed slots after the budget's
++                size_t slot_bytes = 0;
++                for (const ggml_tensor * t : g.ref) {
++                    slot_bytes += t->nb[2];
++                }
++                g.n_slots += (int32_t) std::min<int64_t>(max_slots - g.n_slots, (int64_t) (d.borrow_bytes/slot_bytes));
++            }
+             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
+@@ -1010,10 +1069,76 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
++#ifdef GGML_USE_CUDA
++        // 0138: the banks laid out by hand, so the borrowed slots of each bank of the group are whole pages shared with the arena
++        auto alloc_borrowed = [&](device & d) -> bool {
++            const size_t gran = ggml_backend_cuda_vmm_granularity(d.backend);
++            std::vector<std::pair<ggml_tensor *, size_t>> place;
++            std::vector<size_t> offs;
++            std::vector<size_t> lens;
++            size_t pos = 0;
++            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    continue;
++                }
++                pos = GGML_PAD(pos, gran);
++                place.push_back({ t, pos });
++                for (const group & g : groups) {
++                    if (g.n_base < g.n_slots && std::find(g.banks.begin(), g.banks.end(), t) != g.banks.end()) {
++                        const size_t lo = GGML_PAD(pos + (size_t) g.n_base*t->nb[2], gran);
++                        const size_t hi = (pos + (size_t) g.n_slots*t->nb[2])/gran*gran;
++                        if (hi > lo) {
++                            offs.push_back(lo);
++                            lens.push_back(hi - lo);
++                        }
++                    }
++                }
++                pos += ggml_backend_buft_get_alloc_size(d.buft, t);
++            }
++            if (offs.empty()) {
++                return false;
++            }
++            ggml_backend_buffer_t buf = ggml_backend_cuda_alloc_borrowed(d.backend, GGML_PAD(pos, gran), offs.data(), lens.data(), (int) offs.size(), d.borrow_head);
++            if (buf == nullptr) {
++                throw std::runtime_error("LLAMA_MOE_CACHE_BORROW_MIB: the device has no arena for the borrowed slots");
++            }
++            d.buf.reset(buf);
++            char * base = (char *) ggml_backend_buffer_get_base(buf);
++            for (const auto & p : place) {
++                GGML_ASSERT(ggml_backend_tensor_alloc(buf, p.first, base + p.second) == GGML_STATUS_SUCCESS);
++            }
++            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    GGML_ASSERT(ggml_backend_view_init(t) == GGML_STATUS_SUCCESS);
++                }
++            }
++            ggml_backend_buffer_clear(buf, 0);
++            d.buf_size = ggml_backend_buffer_get_size(buf);
++            size_t shared = 0;
++            for (size_t l : lens) {
++                shared += l;
++            }
++            for (const group & g : groups) {
++                if (&devices[g.id] == &d && g.n_base < g.n_slots) {
++                    LLAMA_LOG_INFO("%s: 0138: %s: %d of %d slots borrowed, %.1f MiB of pages shared with the arena (head %.0f MiB)\n", __func__,
++                        ggml_backend_name(d.backend), g.n_slots - g.n_base, g.n_slots, shared/1024.0/1024.0, d.borrow_head/1024.0/1024.0);
++                }
++            }
++            return true;
++        };
++#endif
+         for (device & d : devices) {
+             if (!d.ctx) {
+                 continue;
+             }
++#ifdef GGML_USE_CUDA
++            // LLAMA_MOE_CACHE_BORROW_PLAIN=1: the same slots in memory of their own (a test of the layout: the same math, no arena)
++            static const bool plain = getenv("LLAMA_MOE_CACHE_BORROW_PLAIN") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_PLAIN")) != 0;
++            if (d.borrow_bytes > 0 && !no_alloc && !plain && alloc_borrowed(d)) {
++                continue;
++            }
++            d.borrow_bytes = 0;
++#endif
+             d.buf = llama_memory_bufs::alloc_buf(d.ctx.get(), d.buft, no_alloc, "MoE cache");
+             if (!no_alloc) {
+                 ggml_backend_buffer_clear(d.buf.get(), 0);
+@@ -1477,7 +1602,7 @@ struct llama_moe_cache::impl {
+         }
+         // the usual share of the misses is left to the CPU (not cached) and the rest is uploaded for the next token; all of them
+         // are computed on the CPU for this one, since the lookup ran on the map as it was
+-        const uint32_t share_q = g.slru.n_filled == g.slru.n_slots ? cpu_share_q : 0;
++        const uint32_t share_q = g.slru.n_filled == g.slru.n_active ? cpu_share_q : 0;
+         auto n_cpu = [&](size_t n_miss) {
+             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
+             l.cpu_acc = acc & 0xffff;
+@@ -2355,7 +2480,7 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
+-        const uint32_t share_q = has_cpu && g.slru.n_filled == g.slru.n_slots ? cpu_share_q : 0;
++        const uint32_t share_q = has_cpu && g.slru.n_filled == g.slru.n_active ? cpu_share_q : 0;
+         auto n_cpu = [&](size_t n_miss) {
+             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
+             l.cpu_acc = acc & 0xffff;
+@@ -2900,6 +3025,62 @@ void llama_moe_cache::set_prompt_out(int32_t il, ggml_tensor * out) {
+     pimpl->set_prompt_out(il, out);
+ }
+ 
++ggml_backend_buffer_type_t llama_moe_cache::borrow_buft(ggml_backend_t backend) const {
++#ifdef GGML_USE_CUDA
++    for (const auto & d : pimpl->devices) {
++        if (d.backend == backend && d.borrow_bytes > 0) {
++            return ggml_backend_cuda_arena_buffer_type(backend);
++        }
++    }
++#endif
++    GGML_UNUSED(backend);
++    return nullptr;
++}
++
++void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens) {
++#ifdef GGML_USE_CUDA
++    impl & p = *pimpl;
++    for (size_t id = 0; id < p.devices.size(); ++id) {
++        auto & d = p.devices[id];
++        if (d.borrow_bytes == 0) {
++            continue;
++        }
++        // LLAMA_MOE_CACHE_BORROW_RING=1: the ring (any graph of more than max_batch tokens) uses the arena too
++        static const bool ring = getenv("LLAMA_MOE_CACHE_BORROW_RING") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_RING")) != 0;
++        const size_t peak = ggml_backend_sched_get_peak(sched, d.backend);
++        const bool   want = (!ring || n_tokens <= impl::max_batch) && peak <= d.borrow_head;
++        if (want == d.borrow_on) {
++            continue;
++        }
++        // nothing may still read or write the borrowed slots (the hits, the side fills) or the memory the graph puts there (the ring)
++        ggml_backend_cuda_synchronize_device(d.backend);
++        int32_t n_given = 0;
++        for (auto & g : p.groups) {
++            if (g.id != (int32_t) id || g.n_base == g.n_slots) {
++                continue;
++            }
++            if (want) {
++                g.slru.n_active = g.n_slots;
++            } else {
++                n_given += g.slru.give_up(g.n_base);
++            }
++        }
++        d.borrow_on = want;
++        if (d.borrow_n++ < 4 || d.borrow_n % 64 == 0) {
++            size_t head, compute, ring_lo, ring_hi, mapped;
++            ggml_backend_cuda_arena_info(d.backend, &head, &compute, &ring_lo, &ring_hi, &mapped);
++            LLAMA_LOG_INFO("llama_moe_cache: 0138 %s: borrowed slots %s (transition %u): %lld tokens, graph peak %.1f MiB, head %.0f, compute %.1f, "
++                "ring %.1f-%.1f, mapped %.1f MiB, %d experts emptied\n", ggml_backend_name(d.backend), want ? "back in use" : "given up", d.borrow_n,
++                (long long) n_tokens, peak == SIZE_MAX ? -1.0 : peak/1024.0/1024.0, head/1024.0/1024.0, compute/1024.0/1024.0,
++                ring_lo/1024.0/1024.0, ring_hi/1024.0/1024.0, mapped/1024.0/1024.0, n_given);
++        }
++    }
++#else
++    GGML_UNUSED(sched);
++    GGML_UNUSED(n_tokens);
++#endif
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index e295ac6a0..bc9af81fe 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -114,6 +114,15 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
++    // 0138 LLAMA_MOE_CACHE_BORROW_MIB=N (with LLAMA_MOE_CACHE_LFU, CUDA VMM): each device's largest group gets N MiB more slots whose
++    // pages are the device's compute buffer and upload ring (an arena: ggml_backend_cuda_alloc_borrowed), so the memory only prompts use
++    // holds experts between them; LLAMA_MOE_CACHE_BORROW_HEAD_MIB (default 2048) of the arena stay private for the decode graphs.
++    // The buffer type of the backend's compute buffer, nullptr when its device has no arena
++    ggml_backend_buffer_type_t borrow_buft(ggml_backend_t backend) const;
++    // before a graph's inputs are set: the borrowed slots are emptied before a graph of more than max_batch tokens or one whose
++    // allocation reaches past the head, and taken back before the next other graph (after a full synchronization of the device)
++    void borrow_update(ggml_backend_sched_t sched, int64_t n_tokens);
++
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+-- 
+2.43.0
+

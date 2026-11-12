@@ -1,0 +1,58 @@
+From a295e8cff90697deb8446f03e2dea21f7b8d2cbe Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 02:43:25 -0600
+Subject: [PATCH 207/211] 0200: LLAMA_UB_TAIL_MIN=n (default 32): no tiny last
+ ubatch on a prompt (a TD graph behind its graphs timed out; a cached one
+ could abort on a small cache); a TD graph behind any other waits for it
+
+---
+ src/llama-context.cpp | 13 +++++++++++++
+ src/llama-context.h   |  1 +
+ 2 files changed, 14 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 468cfc3cd..4a0829446 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2078,6 +2078,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     const int64_t t_ub2 = ubatch_timing ? ggml_time_us() : 0;
+     const int64_t t_d2 = dtim ? ggml_time_us() : 0; // 0186
+ 
++    // 0200 LLAMA_TP_DECODE: a TD graph behind any other waits for it
++    if (res->td_rep_reads && !td_graph_prev) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++    td_graph_prev = res->td_rep_reads;
+     // 0173 LLAMA_TP_DECODE: the cells earlier graphs wrote only into the home caches, into the replicas before this graph reads them
+     if (res->td_rep_reads && mctx != nullptr) {
+         mctx->td_rep_flush(sched.get());
+@@ -2504,6 +2509,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     if (short_ub > 0 && moe_cache && !lm_try && balloc->get_n_tokens() <= short_max) {
+         n_ub = std::min(n_ub, short_ub);
+     }
++    // 0200 LLAMA_UB_TAIL_MIN=n: no last ubatch of n tokens or fewer on a prompt: it would run the decode paths, behind the prompt's graphs
++    static const uint32_t tail_min = getenv("LLAMA_UB_TAIL_MIN") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_UB_TAIL_MIN"))) : 32;
++    if (tail_min > 0 && moe_cache && !(short_ub > 0 && !lm_try && balloc->get_n_tokens() <= short_max)) {
++        const uint32_t n_all = balloc->get_n_tokens();
++        while (n_all > n_ub && n_ub > 2*(tail_min + 64) && n_all % n_ub != 0 && n_all % n_ub <= tail_min) {
++            n_ub -= 64;
++        }
++    }
+ 
+     while (true) {
+         mctx = memory->init_batch(*balloc, n_ub, embd_all);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ac6cf52bf..64b327266 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -389,6 +389,7 @@ private:
+     uint64_t graph_slot_clock = 0;
+ 
+     bool sync_pending = true; // 0193 LLAMA_SYNC_SKIP_IDLE: work was issued since the last synchronize()
++    bool td_graph_prev = false; // 0200: the previous graph of this context was a TD graph
+ 
+     bool sched_need_reserve = true;
+ 
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 91c497d5187ad32a877a508241e8b3867b0122c8 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 11:06:07 -0600
-Subject: [PATCH 079/141] LLAMA_PP_ONE_DEVICE=1: pipeline parallelism on one
+Subject: [PATCH 079/211] LLAMA_PP_ONE_DEVICE=1: pipeline parallelism on one
  GPU with every layer offloaded (the host runs ahead, prompts take the
  upload-all path)
 

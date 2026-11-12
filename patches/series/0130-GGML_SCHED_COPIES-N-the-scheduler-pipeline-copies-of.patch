@@ -1,7 +1,7 @@
 From 9e893a6a8f1e2fdc4891f4a56bddc7b130f6c4b6 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:41:00 -0600
-Subject: [PATCH 130/141] GGML_SCHED_COPIES=N: the scheduler pipeline copies of
+Subject: [PATCH 130/211] GGML_SCHED_COPIES=N: the scheduler pipeline copies of
  the split inputs (default 4)
 
 ---

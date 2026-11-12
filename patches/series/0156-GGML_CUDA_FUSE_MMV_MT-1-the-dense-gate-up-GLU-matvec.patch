@@ -1,0 +1,95 @@
+From 133b1dfba296c6a483d650d5ab585b2ba40f78a4 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 02:32:15 -0600
+Subject: [PATCH 156/211] GGML_CUDA_FUSE_MMV_MT=1: the dense gate / up / GLU
+ matvec fuses at 2-4 tokens (a verify step shared expert and dense FFN); test
+ cases
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 17 +++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cu      |  2 +-
+ tests/test-backend-ops.cpp      | 13 +++++++++++++
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index acda6b512..05fca1b88 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2081,6 +2081,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_f;
+ }
+ 
++// GGML_CUDA_FUSE_MMV_MT=1 (0152): the dense gate / up / GLU matvec fuses at 2-4 tokens too (upstream: one token)
++static bool ggml_cuda_fuse_mmv_mt() {
++    static const bool v = [] {
++        const char * s = getenv("GGML_CUDA_FUSE_MMV_MT");
++        const bool on = s != nullptr && atoi(s) != 0;
++        if (on) {
++            GGML_LOG_INFO("%s: dense gate / up / GLU matvec fusion at 2-4 tokens\n", __func__);
++        }
++        return on;
++    }();
++    return v;
++}
++
+ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+@@ -2098,8 +2111,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    //we only support fusion for ncols_dst = 1 (0152: and 2-4 with GGML_CUDA_FUSE_MMV_MT)
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !(ggml_cuda_fuse_mmv_mt() && dst->ne[1] <= 4)) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 155cfbc4c..cc5da53e0 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1068,7 +1068,7 @@ static void mul_mat_vec_q_switch_fusion(
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+-    if constexpr (c_ncols_dst == 1) {
++    if constexpr (c_ncols_dst <= 4) { // 0152: 2-4 tokens with GGML_CUDA_FUSE_MMV_MT
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e56adea66..12b9577ea 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10203,6 +10203,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, n, 192, {64, 1}, {1, 1}));
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2048, n, 6144, {1, 1}, {1, 1}));
+         }
++        // 0152: the dense gate / up / GLU fusion at 1-5 tokens (5 stays unfused), small K (0151's launch) and large
++        for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS }) {
++            for (int n : { 1, 2, 3, 4, 5 }) {
++                for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
++                    test_cases.emplace_back(new test_mul_mat_vec_fusion(t, op, n,  33,  256, false, 1, 1, false, false, true, false, {1, 1}));
++                    test_cases.emplace_back(new test_mul_mat_vec_fusion(t, op, n, 256, 2048, false, 1, 1, false, false, true, false, {1, 1}));
++                    test_cases.emplace_back(new test_mul_mat_vec_fusion(t, op, n, 256,  512, false, 1, 1, false, true,  true, false, {1, 1}));
++                }
++            }
++        }
+         return test_cases;
+     }
+ 
+@@ -12860,6 +12870,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   128, n,  6144, { 1, 1}, {1, 1}));
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,    32, n,  6144, { 1, 1}, {1, 1}));
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   256, n,  6144, { 1, 1}, {1, 1}));
++            // 0152: the shared expert's gate / up / SwiGLU (and the dense FFN's), fused or not
++            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K, GGML_GLU_OP_SWIGLU, n,  2048, 6144, false, 1, 1, false, false, true, false, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q5_K, GGML_GLU_OP_SWIGLU, n, 12288, 6144, false, 1, 1, false, false, true, false, {1, 1}));
+         }
+         return test_cases;
+     }
+-- 
+2.43.0
+

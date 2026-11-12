@@ -1,0 +1,39 @@
+From 5f90cb2397650a91eaf7a38343bc24c31528ef7c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 10:57:25 -0600
+Subject: [PATCH 167/211] 0160: 0156 counts the indexer cells from the indexer
+ mask row (it read ne[1] of the [128, 1, n_kv] key view = 1: dense at every
+ context)
+
+---
+ src/models/glm-dsa.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 046b3f6aa..670db6e8d 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -941,7 +941,19 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
+ 
+                 // 0156: the key is written above; with no more cells than the top-k keeps, nothing else of the indexer is needed
+-                top_k_dense = dsa_short_dense && mctx_lid->get_k(ctx0, il)->ne[1] <= (int64_t) n_indexer_top_k;
++                // 0160: the cells the indexer scores are the indexer mask's row (the key view is [128, 1, n_kv])
++                const int64_t n_lid_cells = inp_attn_dsa->self_attn_mask_lid.cnv->ne[0];
++                top_k_dense = dsa_short_dense && n_lid_cells <= (int64_t) n_indexer_top_k;
++                if (dsa_short_dense) {
++                    static int n_logged = 0;
++                    static int64_t last_cells = -1;
++                    if (n_logged < 8 && n_lid_cells != last_cells) {
++                        n_logged++;
++                        last_cells = n_lid_cells;
++                        LLAMA_LOG_INFO("%s: 0156: %lld indexer cells, %s attention\n", __func__, (long long) n_lid_cells,
++                            top_k_dense ? "dense" : "sparse (top-k)");
++                    }
++                }
+                 if (top_k_dense) {
+                     prev_top_k = nullptr;
+                 } else {
+-- 
+2.43.0
+

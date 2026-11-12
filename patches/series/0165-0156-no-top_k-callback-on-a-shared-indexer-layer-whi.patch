@@ -1,0 +1,28 @@
+From d50b83d1407196cf1e8040aafbf922a329fa79e5 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:08:12 -0600
+Subject: [PATCH 165/211] 0156: no top_k callback on a shared indexer layer
+ while dense (it named a null tensor)
+
+---
+ src/models/glm-dsa.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index eb02f7cb4..046b3f6aa 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1012,7 +1012,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 // "shared" indexer layer - reuse top-k from a previous full layer
+                 GGML_ASSERT((prev_top_k != nullptr || top_k_dense) && "shared indexer layer must follow a previous full indexer layer");
+                 top_k = prev_top_k;
+-                cb(top_k, "top_k", il);
++                if (top_k != nullptr) { // 0156: none while dense
++                    cb(top_k, "top_k", il);
++                }
+             }
+ 
+             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
+-- 
+2.43.0
+

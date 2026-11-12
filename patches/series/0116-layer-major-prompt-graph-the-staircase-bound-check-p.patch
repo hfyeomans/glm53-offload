@@ -1,7 +1,7 @@
 From 7cbe52691a6a0fa0f9d174792ddd2bc717a443cd Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 13:25:42 -0600
-Subject: [PATCH 116/141] layer-major prompt graph: the staircase bound check
+Subject: [PATCH 116/211] layer-major prompt graph: the staircase bound check
  prints its values (ubatch positions, block, batch extent, staircase shape)
 
 ---

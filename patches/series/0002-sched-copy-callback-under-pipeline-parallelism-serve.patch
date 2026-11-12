@@ -1,7 +1,7 @@
 From 1d58552e6406754cf5661e6eb6af36582b03475a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 12:53:43 -0600
-Subject: [PATCH 002/141] sched copy callback: under pipeline parallelism,
+Subject: [PATCH 002/211] sched copy callback: under pipeline parallelism,
  serve the cached experts from the device banks
 
 With #29963 the large-batch path never reads the ids, so the whole expert tensor went back to a host upload and the MoE

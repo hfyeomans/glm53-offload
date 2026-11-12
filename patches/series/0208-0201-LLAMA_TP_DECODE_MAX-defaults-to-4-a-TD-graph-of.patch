@@ -1,0 +1,35 @@
+From 6675d4b04226909f2d753264f24cd9e31e2a549e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 03:30:44 -0600
+Subject: [PATCH 208/211] 0201: LLAMA_TP_DECODE_MAX defaults to 4: a TD graph
+ of 8 tokens times out in the pair all-reduce every time
+
+---
+ src/models/glm-dsa.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index e5bbc53a3..b9c11fb88 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -280,7 +280,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     const bool tp = tp_min > 0 && model.tp_devs.size() == 2 && n_tokens >= tp_min && (tp_any || cparams.tp_batch_single);
+     ggml_backend_sched_set_transient_inputs(sched, tp);
+     // 0198: before the branch, which returns: that graph too writes only the home caches
+-    static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 8;
++    static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 4; // 0201: 8 tokens time out in the all-reduce
+     const bool td = cparams.td && !tp && cparams.lm_rows == 0 && n_tokens <= td_max && moe_cache != nullptr;
+     res->td_rep_sync  = cparams.td && !td;
+     res->td_rep_reads = td; // 0173
+@@ -620,7 +620,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         return;
+     }
+ 
+-    // 0166 LLAMA_TP_DECODE=1 (docs/20261107-two-card-tp-decode-design.md): a batch of up to LLAMA_TP_DECODE_MAX tokens (default 8) runs every
++    // 0166 LLAMA_TP_DECODE=1 (docs/20261107-two-card-tp-decode-design.md): a batch of up to LLAMA_TP_DECODE_MAX tokens (default 4) runs every
+     // layer on both cards.  Both hold the residual stream (the same bits); card c computes heads 32c..32c+31 (wq_b rows, wk_b / wv_b heads,
+     // wo input columns) over its own latent KV (the home cache or its replica, 0165); ggml_pair_allreduce (0164) sums the partials.  Both run
+     // the router; the home card computes its cached experts, the CPU part and the shared expert, the other card the cached experts of the
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 4dc4876db394c40cfdb34796202b7a5194a910e7 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:17:13 -0600
-Subject: [PATCH 089/141] moe prompt prefetch (LLAMA_MOE_PROMPT_PREFETCH=N):
+Subject: [PATCH 089/211] moe prompt prefetch (LLAMA_MOE_PROMPT_PREFETCH=N):
  the next layer s guessed experts go up into a staging area behind this layer
  s uploads; its plan counts them as on the card
 

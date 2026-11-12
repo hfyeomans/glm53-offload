@@ -1,12 +1,13 @@
 #!/bin/bash
 # run.sh -- serve GLM-5.3 on one or two RTX PRO 6000 from this repo's image.
 #
-#   ./run.sh --model /path/to/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [--gpus 0 | 0,1] [--port 8080] [--bind 127.0.0.1]
-#            [--image glm53-offload:latest] [serve.sh options, e.g. --cache-mib N --threads N --dry-run] [-- llama-server args]
+#   ./run.sh --model /path/to/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [--gpus 0 | 0,1] [--ctx 64k|128k|256k|512k|1m]
+#            [--route-bias 0.03] [--port 8080] [--bind 127.0.0.1] [--detach] [--image glm53-offload:latest]
+#            [more serve.sh options: --cache-mib N --threads N --alias NAME --force --dry-run] [-- llama-server args]
 #
-# Default GPUs: 0 (one card); --gpus 0,1 for two; --detach runs it in the background (container --name glm53-offload).
-# The API comes up at http://<bind>:<port>/v1 once the model has loaded (1-3 min
-# from a warm page cache, longer from disk).  Ctrl-C stops it.
+# Default GPUs: 0 (one card); --gpus 0,1 for two.  Default context 64k.  Default route bias 0, the model's own routing; 0.03 is the
+# measured speed option, and it changes the output (README.md, "The route bias").  --detach runs it in the background (container
+# --name glm53-offload).  The API comes up at http://<bind>:<port>/v1 once the model has loaded.  Ctrl-C stops it.
 set -u
 MODEL=; GPUS=0; PORT=8080; BIND=127.0.0.1; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; NAME=glm53-offload; DETACH=0; REST=()
 while [ $# -gt 0 ]; do case $1 in
@@ -17,7 +18,7 @@ while [ $# -gt 0 ]; do case $1 in
   --image) IMAGE=$2; shift 2;;
   --name) NAME=$2; shift 2;;
   --detach) DETACH=1; shift;;
-  -h|--help) sed -n 2,9p "$0"; exit 0;;
+  -h|--help) sed -n 2,10p "$0"; exit 0;;
   *) REST+=("$1"); shift;;
 esac; done
 [ -n "$MODEL" ] || { echo "run.sh: --model is required (see --help)"; exit 2; }

@@ -1,0 +1,899 @@
+From 91aec43d107246bd6bdce908478d2d3bc41a10a7 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:03:29 -0600
+Subject: [PATCH 145/211] LLAMA_KV_LAZY=1 + LLAMA_MOE_CACHE_LEND_MIB=N: KV
+ pages mapped as cells are used, from lendable chunks of the MoE cache banks
+ (CUDA VMM), given back past 64K unused cells
+
+---
+ ggml/include/ggml-cuda.h        |  18 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 379 ++++++++++++++++++++++++++++++++
+ src/llama-kv-cache.cpp          | 103 ++++++++-
+ src/llama-kv-cache.h            |  11 +
+ src/llama-moe-cache.cpp         | 204 ++++++++++++++++-
+ 5 files changed, 713 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index ffde16877..6ce4b4c41 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -76,6 +76,24 @@ GGML_BACKEND_API void ggml_backend_cuda_arena_info(ggml_backend_t backend, size_
+ // waits for every stream of the backend's device (the main stream, the upload ring, the side uploads)
+ GGML_BACKEND_API void ggml_backend_cuda_synchronize_device(ggml_backend_t backend);
+ 
++// 0141 LLAMA_KV_LAZY / LLAMA_MOE_CACHE_LEND_MIB.  A bank buffer by segments (ascending, covering [0, size), granularity multiples):
++// kind 0 pages of its own, 1 shared with the arena (as 0138, in order after `head`), 2 a piece of lendable chunk `chunk` at chunk_off
++struct ggml_cuda_bank_seg { size_t off; size_t len; int kind; int chunk; size_t chunk_off; };
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_alloc_banks(ggml_backend_t backend, size_t size, const struct ggml_cuda_bank_seg * segs, int n, size_t head);
++// the cache's callback for a lazy commit that found no free page: it gives chunks up (ggml_backend_cuda_lend_give), true if it gave any
++GGML_BACKEND_API void ggml_backend_cuda_lend_set_need(ggml_backend_t backend, bool (*need)(void * ud, size_t bytes), void * ud);
++// chunk k leaves the banks (the caller emptied its slots); its pages serve lazy buffers
++GGML_BACKEND_API void ggml_backend_cuda_lend_give(ggml_backend_t backend, int k);
++// chunk k back into the banks if it is the most recently given and all of its pages are free; false otherwise
++GGML_BACKEND_API bool ggml_backend_cuda_lend_take(ggml_backend_t backend, int k);
++// a buffer of n tensors of len[i] bytes at off[i] (set here, granularity-aligned) with nothing mapped; nullptr without VMM
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_alloc_lazy(ggml_backend_buffer_type_t buft, int n, const size_t * len, size_t * off);
++// maps zeroed pages so tensor i has at least want[i] bytes from its start; false if the buffer is not lazy
++GGML_BACKEND_API bool ggml_backend_cuda_lazy_commit(ggml_backend_buffer_t buf, const size_t * want, int n);
++// unmaps the pages of tensor i past keep[i] bytes (after a device synchronization); chunk pages go back to their chunk
++GGML_BACKEND_API void ggml_backend_cuda_lazy_decommit(ggml_backend_buffer_t buf, const size_t * keep, int n);
++GGML_BACKEND_API bool ggml_backend_buffer_is_cuda_lazy(ggml_backend_buffer_t buf);
++
+ // upload ring without the gather: reserve `bytes` in the current slot (`first_of_split` starts the next slot) and return its device
+ // address, the main stream ordered after the ring stream; copy_commit fills it from the host on the ring stream and makes the main
+ // stream wait for that copy
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 595647eb9..843be131c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -775,6 +775,8 @@ struct ggml_backend_cuda_buffer_context {
+     bool   external   = false;
+     void (*release)(void *) = nullptr;
+     void * release_ud = nullptr;
++    void * lazy       = nullptr;                // 0141: a lazy buffer's mappings (its clear touches only the mapped pages)
++    void (*lazy_clear)(void *, uint8_t) = nullptr;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+@@ -987,6 +989,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer,
+ 
+ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    if (ctx->lazy_clear != nullptr) {
++        ctx->lazy_clear(ctx->lazy, value);
++        return;
++    }
+ 
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+@@ -7417,6 +7423,379 @@ void ggml_backend_cuda_synchronize_device(ggml_backend_t backend) {
+     CUDA_CHECK(cudaDeviceSynchronize());
+ }
+ 
++// 0141 LLAMA_KV_LAZY / LLAMA_MOE_CACHE_LEND_MIB: pages that move between the MoE cache and the KV cache.  The cache's lendable chunks
++// (whole pages of its banks, one handle each) are mapped into the banks while the cache has them; a lazy buffer (the KV cache) reserves
++// its virtual range and maps pages as its cells are used: from the chunks the cache has given up, the oldest first, else after asking the
++// cache for more (ggml_backend_cuda_lend_set_need), else pages of its own.  A chunk goes back into the banks once all of its pages are free
++// again, the most recently given first (ggml_backend_cuda_lend_take).
++struct ggml_cuda_lend_chunk {
++#if defined(GGML_USE_VMM)
++    CUmemGenericAllocationHandle h = 0;
++#endif
++    size_t bytes = 0;
++    std::vector<uintptr_t> va; // its pieces in the banks: address, length, offset in the chunk
++    std::vector<size_t>    len;
++    std::vector<size_t>    off;
++    bool in_bank = true;
++    std::vector<uint8_t> out;  // per page: mapped by a lazy buffer
++    size_t n_out = 0;
++};
++struct ggml_cuda_lend {
++    std::vector<ggml_cuda_lend_chunk> chunks;
++    std::vector<int> given;    // the chunks the cache has given up, in order
++    bool (*need)(void * ud, size_t bytes) = nullptr;
++    void * need_ud = nullptr;
++};
++static ggml_cuda_lend g_cuda_lend[GGML_CUDA_MAX_DEVICES];
++
++// a lazy buffer's mapping: [va, va + len) from page `page` of chunk `chunk` (-1: one page of its own, handle h)
++struct ggml_cuda_lazy_map {
++    uintptr_t va;
++    size_t    len;
++    int       chunk;
++    size_t    page;
++#if defined(GGML_USE_VMM)
++    CUmemGenericAllocationHandle h;
++#endif
++};
++struct ggml_cuda_lazy {
++    int       device = 0;
++    uintptr_t va     = 0;
++    size_t    size   = 0;
++    std::vector<size_t> t_off;    // per tensor: its start (a page), its length, the bytes mapped from its start
++    std::vector<size_t> t_len;
++    std::vector<size_t> t_mapped;
++    std::vector<std::vector<ggml_cuda_lazy_map>> t_maps;
++};
++
++static void ggml_cuda_lazy_clear(void * p, uint8_t value) {
++    ggml_cuda_lazy * z = (ggml_cuda_lazy *) p;
++    ggml_cuda_set_device(z->device);
++    for (size_t i = 0; i < z->t_off.size(); ++i) {
++        if (z->t_mapped[i] > 0) {
++            CUDA_CHECK(cudaMemsetAsync((void *) (z->va + z->t_off[i]), value, z->t_mapped[i], cudaStreamPerThread));
++        }
++    }
++    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++}
++
++bool ggml_backend_buffer_is_cuda_lazy(ggml_backend_buffer_t buf) {
++    return buf != nullptr && ggml_backend_buffer_is_cuda(buf) && ((ggml_backend_cuda_buffer_context *) buf->context)->lazy != nullptr;
++}
++
++ggml_backend_buffer_t ggml_backend_cuda_alloc_lazy(ggml_backend_buffer_type_t buft, int n, const size_t * len, size_t * off) {
++#if defined(GGML_USE_VMM)
++    if (!ggml_backend_buft_is_cuda(buft) || n <= 0) {
++        return nullptr;
++    }
++    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
++    const auto & info = ggml_cuda_info().devices[device];
++    if (!info.vmm) {
++        return nullptr;
++    }
++    const size_t gran = info.vmm_granularity;
++    ggml_cuda_lazy * z = new ggml_cuda_lazy();
++    z->device = device;
++    size_t pos = 0;
++    for (int i = 0; i < n; ++i) {
++        off[i] = pos;
++        z->t_off.push_back(pos);
++        z->t_len.push_back(len[i]);
++        z->t_mapped.push_back(0);
++        z->t_maps.emplace_back();
++        pos = GGML_PAD(pos + len[i], gran);
++    }
++    z->size = std::max(pos, gran);
++    ggml_cuda_set_device(device);
++    CUdeviceptr va = 0;
++    CU_CHECK(cuMemAddressReserve(&va, z->size, 0, 0, 0));
++    z->va = (uintptr_t) va;
++    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) va);
++    ctx->external   = true; // its pages live for the process (an unmap returns them earlier)
++    ctx->lazy       = z;
++    ctx->lazy_clear = ggml_cuda_lazy_clear;
++    GGML_LOG_INFO("%s: device %d: %d tensors, %.1f MiB reserved, mapped as the cells are used\n", __func__, device, n, z->size/1024.0/1024.0);
++    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, z->size);
++#else
++    GGML_UNUSED(buft); GGML_UNUSED(n); GGML_UNUSED(len); GGML_UNUSED(off);
++    return nullptr;
++#endif // defined(GGML_USE_VMM)
++}
++
++#if defined(GGML_USE_VMM)
++// a run of up to `want` free pages of the oldest given chunk that has one
++static bool ggml_cuda_lend_pages(int device, size_t want, int & chunk, size_t & page, size_t & n) {
++    ggml_cuda_lend & L = g_cuda_lend[device];
++    for (int k : L.given) {
++        const ggml_cuda_lend_chunk & c = L.chunks[k];
++        if (c.n_out == c.out.size()) {
++            continue;
++        }
++        for (size_t p = 0; p < c.out.size(); ++p) {
++            if (!c.out[p]) {
++                size_t q = p;
++                while (q < c.out.size() && !c.out[q] && q - p < want) {
++                    q++;
++                }
++                chunk = k;
++                page  = p;
++                n     = q - p;
++                return true;
++            }
++        }
++    }
++    return false;
++}
++#endif // defined(GGML_USE_VMM)
++
++bool ggml_backend_cuda_lazy_commit(ggml_backend_buffer_t buf, const size_t * want, int n) {
++#if defined(GGML_USE_VMM)
++    ggml_cuda_lazy * z = (ggml_cuda_lazy *) ((ggml_backend_cuda_buffer_context *) buf->context)->lazy;
++    if (z == nullptr) {
++        return false;
++    }
++    const int device = z->device;
++    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
++    ggml_cuda_lend & L = g_cuda_lend[device];
++    size_t total = 0;
++    for (int i = 0; i < n && i < (int) z->t_off.size(); ++i) {
++        const size_t need = std::min(GGML_PAD(want[i], gran), GGML_PAD(z->t_len[i], gran));
++        total += need > z->t_mapped[i] ? need - z->t_mapped[i] : 0;
++    }
++    if (total == 0) {
++        return true;
++    }
++    bool asked = false;
++    for (int i = 0; i < n && i < (int) z->t_off.size(); ++i) {
++        const size_t need = std::min(GGML_PAD(want[i], gran), GGML_PAD(z->t_len[i], gran));
++        while (z->t_mapped[i] < need) {
++            const size_t pages = (need - z->t_mapped[i])/gran;
++            int    k = -1;
++            size_t p = 0;
++            size_t r = 0;
++            bool got = ggml_cuda_lend_pages(device, pages, k, p, r);
++            if (!got && !asked && L.need != nullptr) {
++                asked = true; // once a commit: the cache gives all it can for the whole commit
++                if (L.need(L.need_ud, total)) {
++                    got = ggml_cuda_lend_pages(device, pages, k, p, r);
++                }
++            }
++            ggml_cuda_set_device(device);
++            const CUdeviceptr at = (CUdeviceptr) (z->va + z->t_off[i] + z->t_mapped[i]);
++            ggml_cuda_lazy_map m = {};
++            if (got) {
++                ggml_cuda_lend_chunk & c = L.chunks[k];
++                CU_CHECK(cuMemMap(at, r*gran, p*gran, c.h, 0));
++                for (size_t q = p; q < p + r; ++q) {
++                    c.out[q] = 1;
++                }
++                c.n_out += r;
++                m = { (uintptr_t) at, r*gran, k, p, 0 };
++            } else {
++                r = 1;
++                CUmemGenericAllocationHandle h = ggml_cuda_vmm_create(device, gran);
++                CU_CHECK(cuMemMap(at, gran, 0, h, 0));
++                m = { (uintptr_t) at, gran, -1, 0, h };
++            }
++            ggml_cuda_vmm_access(device, at, r*gran);
++            CUDA_CHECK(cudaMemsetAsync((void *) at, 0, r*gran, cudaStreamPerThread));
++            z->t_maps[i].push_back(m);
++            z->t_mapped[i] += r*gran;
++        }
++    }
++    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    return true;
++#else
++    GGML_UNUSED(buf); GGML_UNUSED(want); GGML_UNUSED(n);
++    return false;
++#endif // defined(GGML_USE_VMM)
++}
++
++void ggml_backend_cuda_lazy_decommit(ggml_backend_buffer_t buf, const size_t * keep, int n) {
++#if defined(GGML_USE_VMM)
++    ggml_cuda_lazy * z = (ggml_cuda_lazy *) ((ggml_backend_cuda_buffer_context *) buf->context)->lazy;
++    if (z == nullptr) {
++        return;
++    }
++    const int device = z->device;
++    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
++    ggml_cuda_lend & L = g_cuda_lend[device];
++    ggml_cuda_set_device(device);
++    CUDA_CHECK(cudaDeviceSynchronize()); // no graph may still read the cells given up
++    for (int i = 0; i < n && i < (int) z->t_off.size(); ++i) {
++        const size_t k_bytes = std::min(GGML_PAD(keep[i], gran), GGML_PAD(z->t_len[i], gran));
++        while (z->t_mapped[i] > k_bytes && !z->t_maps[i].empty()) {
++            ggml_cuda_lazy_map & m = z->t_maps[i].back();
++            const size_t m_lo = z->t_mapped[i] - m.len;     // the mapping's start, from the tensor's
++            const size_t cut  = std::max(k_bytes, m_lo);    // unmapped: [cut, t_mapped)
++            const size_t ulen = z->t_mapped[i] - cut;
++            CU_CHECK(cuMemUnmap((CUdeviceptr) (m.va + (cut - m_lo)), ulen));
++            if (m.chunk >= 0) {
++                ggml_cuda_lend_chunk & c = L.chunks[m.chunk];
++                const size_t p0 = m.page + (cut - m_lo)/gran;
++                for (size_t q = p0; q < p0 + ulen/gran; ++q) {
++                    c.out[q] = 0;
++                }
++                c.n_out -= ulen/gran;
++            } else {
++                CU_CHECK(cuMemRelease(m.h)); // one page, unmapped whole
++            }
++            m.len -= ulen;
++            z->t_mapped[i] = cut;
++            if (m.len == 0) {
++                z->t_maps[i].pop_back();
++            }
++        }
++    }
++#else
++    GGML_UNUSED(buf); GGML_UNUSED(keep); GGML_UNUSED(n);
++#endif // defined(GGML_USE_VMM)
++}
++
++ggml_backend_buffer_t ggml_backend_cuda_alloc_banks(ggml_backend_t backend, size_t size, const struct ggml_cuda_bank_seg * segs, int n, size_t head) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    const auto & info = ggml_cuda_info().devices[device];
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    ggml_cuda_lend  & L = g_cuda_lend[device];
++    if (!info.vmm || a.va != 0 || !L.chunks.empty()) {
++        return nullptr;
++    }
++    const size_t gran = info.vmm_granularity;
++    size = GGML_PAD(size, gran);
++    head = GGML_PAD(head, gran);
++    size_t shared = 0;
++    int n_chunks = 0;
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(segs[i].off % gran == 0 && segs[i].len % gran == 0 && segs[i].off + segs[i].len <= size);
++        GGML_ASSERT(segs[i].off == (i == 0 ? 0 : segs[i - 1].off + segs[i - 1].len));
++        shared  += segs[i].kind == 1 ? segs[i].len : 0;
++        n_chunks = segs[i].kind == 2 ? std::max(n_chunks, segs[i].chunk + 1) : n_chunks;
++    }
++    ggml_cuda_set_device(device);
++    L.chunks.resize(n_chunks);
++    for (int i = 0; i < n; ++i) {
++        if (segs[i].kind == 2) {
++            ggml_cuda_lend_chunk & c = L.chunks[segs[i].chunk];
++            c.bytes = std::max(c.bytes, segs[i].chunk_off + segs[i].len);
++        }
++    }
++    for (ggml_cuda_lend_chunk & c : L.chunks) {
++        GGML_ASSERT(c.bytes > 0 && c.bytes % gran == 0);
++        c.h = ggml_cuda_vmm_create(device, c.bytes); // kept: its pages move between the banks and the lazy buffers
++        c.out.assign(c.bytes/gran, 0);
++    }
++    CUdeviceptr bank = 0;
++    CU_CHECK(cuMemAddressReserve(&bank, size, 0, 0, 0));
++    CUdeviceptr va = 0;
++    if (shared > 0) {
++        a.va_size = head + shared + ((size_t) 512 << 30);
++        CU_CHECK(cuMemAddressReserve(&va, a.va_size, 0, 0, 0));
++        a.va = (uintptr_t) va;
++        ggml_cuda_vmm_map_new(device, va, head);
++    }
++    size_t pos  = 0;
++    size_t apos = head;
++    for (int i = 0; i < n; ++i) {
++        const CUdeviceptr at = bank + segs[i].off;
++        if (segs[i].kind == 0) {
++            ggml_cuda_vmm_map_new(device, at, segs[i].len);
++        } else if (segs[i].kind == 1) {
++            CUmemGenericAllocationHandle handle = ggml_cuda_vmm_create(device, segs[i].len);
++            CU_CHECK(cuMemMap(at, segs[i].len, 0, handle, 0));
++            CU_CHECK(cuMemMap(va + apos, segs[i].len, 0, handle, 0));
++            CU_CHECK(cuMemRelease(handle));
++            ggml_cuda_vmm_access(device, at, segs[i].len);
++            ggml_cuda_vmm_access(device, va + apos, segs[i].len);
++            apos += segs[i].len;
++        } else {
++            ggml_cuda_lend_chunk & c = L.chunks[segs[i].chunk];
++            CU_CHECK(cuMemMap(at, segs[i].len, segs[i].chunk_off, c.h, 0));
++            ggml_cuda_vmm_access(device, at, segs[i].len);
++            c.va.push_back((uintptr_t) at);
++            c.len.push_back(segs[i].len);
++            c.off.push_back(segs[i].chunk_off);
++        }
++        pos = segs[i].off + segs[i].len;
++    }
++    ggml_cuda_vmm_map_new(device, bank + pos, size - pos);
++    if (shared > 0) {
++        a.mapped = apos;
++        a.head   = head;
++        a.shared = shared;
++        a.buft   = {
++            /* .iface   = */ ggml_backend_cuda_buffer_type_interface,
++            /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
++            /* .context = */ new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device)},
++        };
++        a.buft.iface.alloc_buffer = ggml_backend_cuda_arena_alloc_buffer;
++    }
++    size_t lend = 0;
++    for (const ggml_cuda_lend_chunk & c : L.chunks) {
++        lend += c.bytes;
++    }
++    GGML_LOG_INFO("%s: device %d: a %.1f MiB bank buffer: %.1f MiB shared with the arena (head %.1f MiB), %d lendable chunks of %.1f MiB in all\n",
++        __func__, device, size/1024.0/1024.0, shared/1024.0/1024.0, head/1024.0/1024.0, n_chunks, lend/1024.0/1024.0);
++    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) bank);
++    ctx->external = true;
++    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
++#else
++    GGML_UNUSED(backend); GGML_UNUSED(size); GGML_UNUSED(segs); GGML_UNUSED(n); GGML_UNUSED(head);
++    return nullptr;
++#endif // defined(GGML_USE_VMM)
++}
++
++void ggml_backend_cuda_lend_set_need(ggml_backend_t backend, bool (*need)(void * ud, size_t bytes), void * ud) {
++    ggml_cuda_lend & L = g_cuda_lend[((ggml_backend_cuda_context *) backend->context)->device];
++    L.need    = need;
++    L.need_ud = ud;
++}
++
++void ggml_backend_cuda_lend_give(ggml_backend_t backend, int k) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    ggml_cuda_lend & L = g_cuda_lend[device];
++    ggml_cuda_lend_chunk & c = L.chunks[k];
++    GGML_ASSERT(c.in_bank);
++    ggml_cuda_set_device(device);
++    CUDA_CHECK(cudaDeviceSynchronize());
++    for (size_t i = 0; i < c.va.size(); ++i) {
++        CU_CHECK(cuMemUnmap((CUdeviceptr) c.va[i], c.len[i]));
++    }
++    c.in_bank = false;
++    std::fill(c.out.begin(), c.out.end(), 0);
++    c.n_out = 0;
++    L.given.push_back(k);
++#else
++    GGML_UNUSED(backend); GGML_UNUSED(k);
++#endif // defined(GGML_USE_VMM)
++}
++
++bool ggml_backend_cuda_lend_take(ggml_backend_t backend, int k) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    ggml_cuda_lend & L = g_cuda_lend[device];
++    if (k < 0 || k >= (int) L.chunks.size() || L.given.empty() || L.given.back() != k) {
++        return false;
++    }
++    ggml_cuda_lend_chunk & c = L.chunks[k];
++    if (c.in_bank || c.n_out > 0) {
++        return false;
++    }
++    ggml_cuda_set_device(device);
++    for (size_t i = 0; i < c.va.size(); ++i) {
++        CU_CHECK(cuMemMap((CUdeviceptr) c.va[i], c.len[i], c.off[i], c.h, 0));
++        ggml_cuda_vmm_access(device, (CUdeviceptr) c.va[i], c.len[i]);
++    }
++    c.in_bank = true;
++    L.given.pop_back();
++    return true;
++#else
++    GGML_UNUSED(backend); GGML_UNUSED(k);
++    return false;
++#endif // defined(GGML_USE_VMM)
++}
++
+ // expert upload ring (see ggml-cuda.h): two slots per device, an upload stream, and the events that order it against the main stream
+ struct ggml_cuda_upload_ring {
+     cudaStream_t stream     = nullptr;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 11db7d318..83b79b9ad 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -14,6 +14,10 @@
+ #include <stdexcept>
+ #include <unordered_map>
+ 
++#ifdef GGML_USE_CUDA
++#include "ggml-cuda.h"
++#endif
++
+ static bool ggml_is_power_of_2(int n) {
+     return (n & (n - 1)) == 0;
+ }
+@@ -62,6 +66,44 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
+ // llama_kv_cache
+ //
+ 
++// 0141 LLAMA_KV_LAZY=1: before cells are written, the lazy KV tensors are mapped to the cells in use + 4096 (a graph reads up to its n_kv,
++// padded to 256), in steps of 8192 cells; 64K cells unused past that are unmapped and their pages go back to the MoE cache's chunks
++static void llama_kv_lazy_commit(std::vector<llama_kv_lazy_buf> & lazy_bufs, uint32_t & lazy_cells, uint32_t need) {
++#ifdef GGML_USE_CUDA
++    if (lazy_bufs.empty()) {
++        return;
++    }
++    const uint32_t want = GGML_PAD(need + 4096, 8192);
++    if (want > lazy_cells) {
++        for (auto & lb : lazy_bufs) {
++            std::vector<size_t> w(lb.row.size());
++            for (size_t i = 0; i < w.size(); ++i) {
++                w[i] = std::min(lb.len[i], (size_t) want*lb.row[i]);
++            }
++            if (!ggml_backend_cuda_lazy_commit(lb.buf, w.data(), (int) w.size())) {
++                GGML_ABORT("0141: could not map the KV cache's pages for %u cells", want);
++            }
++        }
++        lazy_cells = want;
++    } else if (lazy_cells > want + 65536) {
++        for (auto & lb : lazy_bufs) {
++            std::vector<size_t> w(lb.row.size());
++            for (size_t i = 0; i < w.size(); ++i) {
++                w[i] = std::min(lb.len[i], (size_t) want*lb.row[i]);
++            }
++            ggml_backend_cuda_lazy_decommit(lb.buf, w.data(), (int) w.size());
++        }
++        LLAMA_LOG_INFO("%s: 0141: KV pages unmapped past %u cells (were %u)\n", __func__, want, lazy_cells);
++        lazy_cells = want;
++    }
++#else
++    GGML_UNUSED(lazy_bufs);
++    GGML_UNUSED(lazy_cells);
++    GGML_UNUSED(need);
++#endif
++}
++
++
+ llama_kv_cache::llama_kv_cache(
+         const llama_model & model,
+                      bool   no_alloc,
+@@ -274,7 +316,42 @@ llama_kv_cache::llama_kv_cache(
+ 
+     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
+     for (auto & [buft, ctx] : ctx_map) {
+-        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
++        ggml_backend_buffer_t buf = nullptr;
++#ifdef GGML_USE_CUDA
++        // 0141 LLAMA_KV_LAZY=1: the tensors in virtual memory, pages mapped as the cells are used (llama_kv_lazy_commit)
++        static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
++        if (kv_lazy && !no_alloc && n_stream == 1) {
++            std::vector<ggml_tensor *> ts;
++            std::vector<size_t> lens;
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->view_src == nullptr) {
++                    ts.push_back(t);
++                    lens.push_back(ggml_backend_buft_get_alloc_size(buft, t));
++                }
++            }
++            std::vector<size_t> offs(ts.size());
++            buf = ts.empty() ? nullptr : ggml_backend_cuda_alloc_lazy(buft, (int) ts.size(), lens.data(), offs.data());
++            if (buf != nullptr) {
++                char * base = (char *) ggml_backend_buffer_get_base(buf);
++                llama_kv_lazy_buf lb = { buf, {}, {} };
++                for (size_t i = 0; i < ts.size(); ++i) {
++                    GGML_ASSERT(ggml_backend_tensor_alloc(buf, ts[i], base + offs[i]) == GGML_STATUS_SUCCESS);
++                    lb.row.push_back(ts[i]->nb[1]);
++                    lb.len.push_back(lens[i]);
++                }
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                    if (t->view_src != nullptr) {
++                        GGML_ASSERT(ggml_backend_view_init(t) == GGML_STATUS_SUCCESS);
++                    }
++                }
++                lazy_bufs.push_back(lb);
++                ctxs_bufs.bufs.emplace_back(std::move(ctx), ggml_backend_buffer_ptr(buf));
++            }
++        }
++#endif
++        if (buf == nullptr) {
++            buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
++        }
+ 
+         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+     }
+@@ -1146,6 +1223,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ }
+ 
+ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
++    {
++        // 0141: the cells this ubatch writes and every cell in use are mapped first
++        uint32_t need = 0;
++        for (const auto & idxs : sinfo.idxs) {
++            for (uint32_t i : idxs) {
++                need = std::max(need, i + 1);
++            }
++        }
++        for (const auto & c : (other ? other->v_cells : v_cells)) {
++            need = std::max(need, c.used_max_p1());
++        }
++        llama_kv_lazy_commit(lazy_bufs, lazy_cells, need);
++    }
++
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -2659,6 +2750,16 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+ 
+ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+     auto & cells = v_cells[strm];
++    {
++        // 0141: the cells the state writes are mapped first
++        uint32_t need = cells.used_max_p1();
++        for (const auto & idxs : sinfo.idxs) {
++            for (uint32_t i : idxs) {
++                need = std::max(need, i + 1);
++            }
++        }
++        llama_kv_lazy_commit(lazy_bufs, lazy_cells, need);
++    }
+ 
+     // batch the scatter reads per contiguous run of destination indices
+     // from inclusive, to exclusive - same convention as cell_ranges_t
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 2aac939ad..00d879d58 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -17,6 +17,13 @@ struct llama_context;
+ // llama_kv_cache
+ //
+ 
++// 0141 LLAMA_KV_LAZY=1: a lazily mapped KV buffer, with the bytes per cell and the length of each of its tensors
++struct llama_kv_lazy_buf {
++    ggml_backend_buffer_t buf;
++    std::vector<size_t> row;
++    std::vector<size_t> len;
++};
++
+ class llama_kv_cache : public llama_memory_i {
+ public:
+     struct stream_copy_info {
+@@ -312,6 +319,10 @@ private:
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     llama_memory_bufs ctxs_bufs;
+ 
++    // 0141 LLAMA_KV_LAZY=1: the lazily mapped buffers and the cells mapped so far
++    std::vector<llama_kv_lazy_buf> lazy_bufs;
++    uint32_t lazy_cells = 0;
++
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+     std::vector<uint32_t> v_heads;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 5dcf197a6..86aa32b83 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -16,6 +16,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
++#include <numeric>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -387,6 +388,8 @@ struct llama_moe_cache::impl {
+         size_t   borrow_head  = 0;    // the arena's private head: a graph that reaches past it needs the borrowed pages
+         bool     borrow_on    = true; // the borrowed slots are in use
+         uint32_t borrow_n     = 0;    // transitions
++        size_t   lend_bytes   = 0;    // 0141: LLAMA_MOE_CACHE_LEND_MIB for this device, 0: none
++        uint32_t lend_n       = 0;    // chunks given and taken back
+         size_t   borrow_peak  = 0;    // 0139: the largest graph peak seen
+         uint32_t borrow_logs  = 0;
+     };
+@@ -400,6 +403,11 @@ struct llama_moe_cache::impl {
+         size_t host_bytes = 0;
+         int32_t n_slots = 0;
+         int32_t n_base  = 0;              // 0138: slots [n_base, n_slots) are borrowed (pages of the device's arena); n_base = n_slots: none
++        int32_t n_top   = 0;              // 0141: slots [n_top, n_slots) are lent (their chunks hold KV pages); n_top = n_slots: none
++        int32_t lend_s0 = 0;              // 0141: the chunks: n_lend of lend_c slots from lend_s0, the top n_lent of them lent
++        int32_t lend_c  = 0;
++        int32_t n_lend  = 0;
++        int32_t n_lent  = 0;
+         moe_cache_slru slru;
+     };
+ 
+@@ -685,6 +693,55 @@ struct llama_moe_cache::impl {
+ #endif
+     }
+ 
++    // 0141: the lazy KV buffers' callback for pages: the top chunks of the device's groups leave the cache
++    struct lend_ud {
++        impl * p;
++        size_t id;
++    };
++    std::vector<lend_ud> lend_uds;
++    static bool lend_need_cb(void * ud, size_t bytes) {
++        const lend_ud * u = (const lend_ud *) ud;
++        return u->p->lend_out(u->id, bytes);
++    }
++    bool lend_out(size_t id, size_t bytes) {
++#ifdef GGML_USE_CUDA
++        device & d = devices[id];
++        size_t freed = 0;
++        bool   any   = false;
++        for (group & g : groups) {
++            if (g.id != (int32_t) id || g.n_lend == 0) {
++                continue;
++            }
++            size_t slot_bytes = 0;
++            for (const ggml_tensor * t : g.ref) {
++                slot_bytes += t->nb[2];
++            }
++            while (freed < bytes && g.n_lent < g.n_lend) {
++                const int32_t j       = g.n_lend - 1 - g.n_lent;
++                const int32_t new_top = g.lend_s0 + j*g.lend_c;
++                ggml_backend_cuda_synchronize_device(d.backend); // nothing may still read or fill its slots
++                if (g.slru.n_active > new_top) {
++                    g.slru.give_up(new_top);
++                }
++                ggml_backend_cuda_lend_give(d.backend, j);
++                g.n_lent++;
++                g.n_top = new_top;
++                freed  += (size_t) g.lend_c*slot_bytes;
++                any     = true;
++                if (d.lend_n++ < 4 || d.lend_n % 64 == 0) {
++                    LLAMA_LOG_INFO("llama_moe_cache: 0141 %s: chunk %d lent to the KV cache (%d of %d lent, slots in use %d of %d)\n",
++                        ggml_backend_name(d.backend), j, g.n_lent, g.n_lend, g.slru.n_active, g.n_slots);
++                }
++            }
++        }
++        return any;
++#else
++        GGML_UNUSED(id);
++        GGML_UNUSED(bytes);
++        return false;
++#endif
++    }
++
+     std::unordered_map<ggml_backend_t, ggml_backend_event_t> ev_ids; // one per backend: an event belongs to its device
+     std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
+     std::vector<uint8_t> fill_async; // per fill of the last plan: uploaded on the side stream (0045)
+@@ -1072,6 +1129,27 @@ struct llama_moe_cache::impl {
+                 }
+             }
+         }
++#endif
++#ifdef GGML_USE_CUDA
++        // 0141 LLAMA_MOE_CACHE_LEND_MIB: the same group gets lendable chunks at the top of its slots
++        if (const char * s = getenv("LLAMA_MOE_CACHE_LEND_MIB"); s != nullptr && atoll(s) > 0 && !no_alloc) {
++            const char * lfu = getenv("LLAMA_MOE_CACHE_LFU");
++            if (lfu == nullptr || atof(lfu) <= 0.0) {
++                LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_LEND_MIB needs LLAMA_MOE_CACHE_LFU, not lending\n", __func__);
++            } else {
++                for (size_t ig = 0; ig < groups.size(); ++ig) {
++                    device & d = devices[groups[ig].id];
++                    if (!ggml_backend_is_cuda(d.backend) || ggml_backend_cuda_vmm_granularity(d.backend) == 0) {
++                        continue;
++                    }
++                    int32_t & bg = borrow_group[groups[ig].id];
++                    if (bg < 0 || groups[ig].host_bytes > groups[bg].host_bytes) {
++                        bg = (int32_t) ig;
++                    }
++                    d.lend_bytes = (size_t) atoll(s)*1024*1024;
++                }
++            }
++        }
+ #endif
+         std::vector<size_t> n_tensors(devices.size(), 0);
+         size_t n_tensors_host = 0;
+@@ -1096,7 +1174,25 @@ struct llama_moe_cache::impl {
+                     slot_bytes += t->nb[2];
+                 }
+                 g.n_slots += (int32_t) std::min<int64_t>(max_slots - g.n_slots, (int64_t) (d.borrow_bytes/slot_bytes));
++#ifdef GGML_USE_CUDA
++                if (d.lend_bytes > 0) {
++                    // 0141: chunks of lend_c slots that start on a page in every bank, after the slots so far (rounded down to a chunk)
++                    const size_t gran = ggml_backend_cuda_vmm_granularity(d.backend);
++                    int64_t c = 1;
++                    for (const ggml_tensor * t : g.ref) {
++                        const int64_t cb = (int64_t) (gran/std::gcd(gran, (size_t) t->nb[2]));
++                        c = c/std::gcd(c, cb)*cb;
++                    }
++                    const int64_t s0 = g.n_slots/c*c;
++                    g.n_base  = (int32_t) std::min<int64_t>(g.n_base, s0);
++                    g.lend_s0 = (int32_t) s0;
++                    g.lend_c  = (int32_t) c;
++                    g.n_lend  = (int32_t) std::min<int64_t>((max_slots - s0)/c, (int64_t) (d.lend_bytes/(slot_bytes*(size_t) c)));
++                    g.n_slots = (int32_t) (s0 + (int64_t) g.n_lend*c);
++                }
++#endif
+             }
++            g.n_top = g.n_slots;
+             g.slru.init(model.layers.size(), n_expert, g.n_slots);
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
+@@ -1224,11 +1320,99 @@ struct llama_moe_cache::impl {
+             }
+             return true;
+         };
++        // 0141: the banks by segments: base slots on pages of their own, 0138's borrowed ones on the arena's, the chunks one handle each
++        auto alloc_lent = [&](size_t id) -> bool {
++            device & d = devices[id];
++            const size_t gran = ggml_backend_cuda_vmm_granularity(d.backend);
++            std::vector<std::pair<ggml_tensor *, size_t>> place;
++            std::vector<ggml_cuda_bank_seg> segs;
++            std::vector<size_t> chunk_pos;
++            size_t end = 0;
++            auto add = [&](size_t off, size_t len, int kind, int chunk, size_t coff) {
++                if (len == 0) {
++                    return;
++                }
++                if (off > end) {
++                    segs.push_back({ end, off - end, 0, -1, 0 });
++                }
++                segs.push_back({ off, len, kind, chunk, coff });
++                end = off + len;
++            };
++            size_t pos = 0;
++            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    continue;
++                }
++                pos = GGML_PAD(pos, gran);
++                place.push_back({ t, pos });
++                for (const group & g : groups) {
++                    if (g.n_lend == 0 || std::find(g.banks.begin(), g.banks.end(), t) == g.banks.end()) {
++                        continue;
++                    }
++                    const size_t nb = t->nb[2];
++                    if (d.borrow_bytes > 0 && g.n_base < g.lend_s0) {
++                        const size_t lo = GGML_PAD(pos + (size_t) g.n_base*nb, gran);
++                        const size_t hi = (pos + (size_t) g.lend_s0*nb)/gran*gran;
++                        if (hi > lo) {
++                            add(lo, hi - lo, 1, -1, 0);
++                        }
++                    }
++                    for (int32_t j = 0; j < g.n_lend; ++j) {
++                        if ((int32_t) chunk_pos.size() <= j) {
++                            chunk_pos.resize(j + 1, 0);
++                        }
++                        const size_t l = (size_t) g.lend_c*nb;
++                        add(pos + (size_t) (g.lend_s0 + (int64_t) j*g.lend_c)*nb, l, 2, j, chunk_pos[j]);
++                        chunk_pos[j] += l;
++                    }
++                }
++                pos += ggml_backend_buft_get_alloc_size(d.buft, t);
++            }
++            if (chunk_pos.empty()) {
++                return false;
++            }
++            const size_t total = GGML_PAD(pos, gran);
++            if (total > end) {
++                segs.push_back({ end, total - end, 0, -1, 0 });
++            }
++            ggml_backend_buffer_t buf = ggml_backend_cuda_alloc_banks(d.backend, total, segs.data(), (int) segs.size(), d.borrow_head);
++            if (buf == nullptr) {
++                throw std::runtime_error("LLAMA_MOE_CACHE_LEND_MIB: the device has no virtual memory for the lendable chunks");
++            }
++            d.buf.reset(buf);
++            char * base = (char *) ggml_backend_buffer_get_base(buf);
++            for (const auto & p : place) {
++                GGML_ASSERT(ggml_backend_tensor_alloc(buf, p.first, base + p.second) == GGML_STATUS_SUCCESS);
++            }
++            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    GGML_ASSERT(ggml_backend_view_init(t) == GGML_STATUS_SUCCESS);
++                }
++            }
++            ggml_backend_buffer_clear(buf, 0);
++            d.buf_size = ggml_backend_buffer_get_size(buf);
++            lend_uds[id] = { this, id };
++            ggml_backend_cuda_lend_set_need(d.backend, lend_need_cb, &lend_uds[id]);
++            for (const group & g : groups) {
++                if (g.id == (int32_t) id && g.n_lend > 0) {
++                    LLAMA_LOG_INFO("%s: 0141: %s: %d chunks of %d slots lendable to the KV cache (slots %d-%d of %d; %d borrowed from the arena)\n", __func__,
++                        ggml_backend_name(d.backend), g.n_lend, g.lend_c, g.lend_s0, g.n_slots, g.n_slots, g.lend_s0 - g.n_base);
++                }
++            }
++            return true;
++        };
++        lend_uds.resize(devices.size());
+ #endif
+         for (device & d : devices) {
+             if (!d.ctx) {
+                 continue;
+             }
++#ifdef GGML_USE_CUDA
++            if (d.lend_bytes > 0 && !no_alloc && alloc_lent((size_t) (&d - devices.data()))) {
++                continue;
++            }
++            d.lend_bytes = 0;
++#endif
+ #ifdef GGML_USE_CUDA
+             // LLAMA_MOE_CACHE_BORROW_PLAIN=1: the same slots in memory of their own (a test of the layout: the same math, no arena)
+             static const bool plain = getenv("LLAMA_MOE_CACHE_BORROW_PLAIN") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_PLAIN")) != 0;
+@@ -3156,6 +3340,24 @@ ggml_backend_buffer_type_t llama_moe_cache::borrow_buft(ggml_backend_t backend)
+ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens) {
+ #ifdef GGML_USE_CUDA
+     impl & p = *pimpl;
++    // 0141: lent chunks whose pages the KV cache has given back return to the banks, the most recently lent first
++    for (auto & g : p.groups) {
++        auto & d = p.devices[g.id];
++        while (g.n_lent > 0) {
++            const int32_t j = g.n_lend - g.n_lent;
++            if (!ggml_backend_cuda_lend_take(d.backend, j)) {
++                break;
++            }
++            g.n_lent--;
++            g.n_top = g.lend_s0 + (j + 1)*g.lend_c;
++            if (d.borrow_bytes == 0 || d.borrow_on) {
++                g.slru.n_active = g.n_top;
++            }
++            if (d.lend_n++ < 4 || d.lend_n % 64 == 0) {
++                LLAMA_LOG_INFO("llama_moe_cache: 0141 %s: chunk %d back in the cache (%d of %d lent)\n", ggml_backend_name(d.backend), j, g.n_lent, g.n_lend);
++            }
++        }
++    }
+     for (size_t id = 0; id < p.devices.size(); ++id) {
+         auto & d = p.devices[id];
+         if (d.borrow_bytes == 0) {
+@@ -3182,7 +3384,7 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+                 continue;
+             }
+             if (want) {
+-                g.slru.n_active = g.n_slots;
++                g.slru.n_active = g.n_top;
+             } else {
+                 n_given += g.slru.give_up(g.n_base);
+             }
+-- 
+2.43.0
+

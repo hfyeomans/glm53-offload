@@ -1,0 +1,183 @@
+From 4e478dc658ae11f1af7f20125cbe1a0309242989 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:04:37 -0600
+Subject: [PATCH 193/211] 0186: LLAMA_DECODE_TIMING=1 -- host time around the
+ small decodes per context and batch shape (gap before, build + alloc
+ rebuilt/reused, set_inputs, issue, syncs)
+
+---
+ src/llama-context.cpp | 103 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bcac094dd..b49de3b0b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -26,6 +26,9 @@
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
++#include <map>   // 0186
++#include <mutex> // 0186
++#include <tuple> // 0186
+ 
+ //
+ // llama_context
+@@ -1160,12 +1163,90 @@ void llama_context::sched_reserve() {
+             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+ }
+ 
++// 0186 LLAMA_DECODE_TIMING=1: the host's time around the small decodes, per context and batch shape (tokens, outputs), every 2,000
++struct llama_dt_acc {
++    int64_t n = 0, n_build = 0;
++    double gap = 0, in = 0, build_rb = 0, build_ru = 0, inputs = 0, issue = 0;
++};
++struct llama_dt_state {
++    std::mutex mtx;
++    std::map<std::tuple<const void *, int, int>, llama_dt_acc> acc;
++    std::map<const void *, std::pair<int64_t, double>> sync; // per context: calls, us
++    int64_t t_last_exit = 0;
++    int64_t n = 0;
++    std::tuple<const void *, int, int> cur{nullptr, 0, 0};
++    bool cur_set = false;
++    bool rebuilt = false;
++    double build = 0, inputs = 0, issue = 0;
++};
++static bool llama_dt_on() {
++    static const bool on = getenv("LLAMA_DECODE_TIMING") != nullptr && atoi(getenv("LLAMA_DECODE_TIMING")) != 0;
++    return on;
++}
++static llama_dt_state & llama_dt() {
++    static llama_dt_state s;
++    return s;
++}
++struct llama_dt_guard {
++    int64_t t0;
++    llama_dt_guard() : t0(llama_dt_on() ? ggml_time_us() : 0) {
++        if (t0) {
++            std::lock_guard<std::mutex> lk(llama_dt().mtx);
++            llama_dt().cur_set = false;
++        }
++    }
++    ~llama_dt_guard() {
++        if (!t0) {
++            return;
++        }
++        auto & s = llama_dt();
++        std::lock_guard<std::mutex> lk(s.mtx);
++        const int64_t t1 = ggml_time_us();
++        if (s.cur_set) {
++            auto & a = s.acc[s.cur];
++            a.n++;
++            a.n_build += s.rebuilt;
++            a.in += t1 - t0;
++            if (s.t_last_exit) {
++                a.gap += t0 - s.t_last_exit;
++            }
++            (s.rebuilt ? a.build_rb : a.build_ru) += s.build;
++            a.inputs += s.inputs;
++            a.issue += s.issue;
++            if (++s.n % 2000 == 0) {
++                for (const auto & [k, v] : s.acc) {
++                    const auto & sy = s.sync[std::get<0>(k)];
++                    LLAMA_LOG_INFO("decode timing: ctx %p %d tok %d out: %lld calls, rebuilt %.0f %%, gap before %.0f us, in decode %.0f us "
++                        "(build + alloc %.0f us a rebuilt call, %.0f a reused one; set_inputs %.0f, issue %.0f); the context's syncs %.0f us a decode\n",
++                        std::get<0>(k), std::get<1>(k), std::get<2>(k), (long long) v.n, 100.0 * v.n_build / v.n, v.gap / v.n, v.in / v.n,
++                        v.n_build ? v.build_rb / v.n_build : 0.0, v.n > v.n_build ? v.build_ru / (v.n - v.n_build) : 0.0,
++                        v.inputs / v.n, v.issue / v.n, sy.second / v.n);
++                }
++                for (const auto & [c, sy] : s.sync) {
++                    LLAMA_LOG_INFO("decode timing: ctx %p synchronize(): %lld calls, %.0f us in all\n", c, (long long) sy.first, sy.second);
++                }
++                s.acc.clear();
++                s.sync.clear();
++            }
++        }
++        s.t_last_exit = t1;
++    }
++};
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
++    const int64_t t_dts0 = llama_dt_on() ? ggml_time_us() : 0; // 0186
+     ggml_backend_sched_synchronize(sched.get());
++    if (t_dts0) {
++        auto & s = llama_dt();
++        std::lock_guard<std::mutex> lk(s.mtx);
++        auto & sy = s.sync[this];
++        sy.first++;
++        sy.second += ggml_time_us() - t_dts0;
++    }
+     copy_experts.in_flight = false;
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+@@ -1841,6 +1922,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     static const bool ubatch_timing = getenv("GGML_SCHED_TIMING") != nullptr && atoi(getenv("GGML_SCHED_TIMING")) > 0;
+     static int64_t t_ubatch_prev_end = 0;
+     const int64_t t_ub0 = ubatch_timing ? ggml_time_us() : 0;
++    const bool dtim = llama_dt_on() && ubatch.n_tokens <= 32; // 0186
++    const int64_t t_d0 = dtim ? ggml_time_us() : 0;
++    bool d_rebuilt = false;
+ 
+     // under pipeline parallelism a reused graph forces a full synchronization before set_inputs (below), which drains the pipeline
+     // between the ubatches of a prompt: build a fresh graph for large batches, keep the reuse for decode
+@@ -1859,6 +1943,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         n_reused++;
+     } else {
++        d_rebuilt = true; // 0186
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
+@@ -1887,6 +1972,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const int64_t t_ub1 = ubatch_timing ? ggml_time_us() : 0;
++    const int64_t t_d1 = dtim ? ggml_time_us() : 0; // 0186
+ 
+     // set the input data for the input tensors
+     {
+@@ -1905,6 +1991,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const int64_t t_ub2 = ubatch_timing ? ggml_time_us() : 0;
++    const int64_t t_d2 = dtim ? ggml_time_us() : 0; // 0186
+ 
+     // 0173 LLAMA_TP_DECODE: the cells earlier graphs wrote only into the home caches, into the replicas before this graph reads them
+     if (res->td_rep_reads && mctx != nullptr) {
+@@ -1912,6 +1999,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (dtim) { // 0186
++        const int64_t t_d3 = ggml_time_us();
++        int n_out = 0;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            n_out += ubatch.output[i] ? 1 : 0;
++        }
++        auto & s = llama_dt();
++        std::lock_guard<std::mutex> lk(s.mtx);
++        s.cur = { (const void *) this, (int) ubatch.n_tokens, n_out };
++        s.cur_set = true;
++        s.rebuilt = d_rebuilt;
++        s.build = t_d1 - t_d0;
++        s.inputs = t_d2 - t_d1;
++        s.issue = t_d3 - t_d2;
++    }
+     if (ubatch_timing) {
+         const int64_t t_ub3 = ggml_time_us();
+         if (ubatch.n_tokens > 32) {
+@@ -2180,6 +2282,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    llama_dt_guard dt_guard; // 0186
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+-- 
+2.43.0
+

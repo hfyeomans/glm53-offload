@@ -1,7 +1,7 @@
 From 56105d19be28fff3ff9740445b88ad3308162f39 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 13:43:49 -0600
-Subject: [PATCH 006/141] cuda: twin device objects for twin backends
+Subject: [PATCH 006/211] cuda: twin device objects for twin backends
 
 ggml_backend_sched decides copy-or-in-place by the buffer type device object, so a second backend on the same ggml device
 read the primary activations in place with no event ordering. A twin backend now has its own device object (same CUDA

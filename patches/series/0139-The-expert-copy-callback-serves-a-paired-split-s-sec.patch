@@ -1,7 +1,7 @@
 From 2fad675a8f1e28f07fe71dfc508cfcb19ed819b3 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 13:50:17 -0600
-Subject: [PATCH 139/141] The expert copy callback serves a paired split's
+Subject: [PATCH 139/211] The expert copy callback serves a paired split's
  second MUL_MAT_ID (same ids as the first), not only node 0
 
 ---

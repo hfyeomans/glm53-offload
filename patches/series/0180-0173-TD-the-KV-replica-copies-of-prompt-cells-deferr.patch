@@ -1,0 +1,183 @@
+From 838c2c66d1b8a26e2f00b67894f189ef17020415 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:27:54 -0600
+Subject: [PATCH 180/211] 0173: TD -- the KV replica copies of prompt cells
+ deferred to before the next TD graph (they stalled the prompt pipeline)
+
+---
+ src/llama-context.cpp      |  5 +++++
+ src/llama-graph.cpp        |  1 +
+ src/llama-graph.h          |  1 +
+ src/llama-kv-cache-dsa.cpp |  6 ++++++
+ src/llama-kv-cache-dsa.h   |  1 +
+ src/llama-kv-cache.cpp     | 16 +++++++++++++++-
+ src/llama-kv-cache.h       |  4 ++++
+ src/llama-memory.h         |  2 ++
+ src/models/glm-dsa.cpp     |  3 ++-
+ 9 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c311aa733..bcac094dd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1906,6 +1906,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+     const int64_t t_ub2 = ubatch_timing ? ggml_time_us() : 0;
+ 
++    // 0173 LLAMA_TP_DECODE: the cells earlier graphs wrote only into the home caches, into the replicas before this graph reads them
++    if (res->td_rep_reads && mctx != nullptr) {
++        mctx->td_rep_flush(sched.get());
++    }
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (ubatch_timing) {
+         const int64_t t_ub3 = ggml_time_us();
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 588eb2f3d..d748c7205 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1410,6 +1410,7 @@ int64_t llm_graph_result::get_max_nodes() const {
+ 
+ void llm_graph_result::reset() {
+     td_rep_sync   = false; // 0165
++    td_rep_reads  = false; // 0173
+     t_inp_tokens  = nullptr;
+     t_inp_embd    = nullptr;
+     t_logits      = nullptr;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b78bdf2b5..284a210cd 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -962,6 +962,7 @@ public:
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+ 
+     bool td_rep_sync = false; // 0165 LLAMA_TP_DECODE: the graph wrote only the home KV caches; the replicas copy its cells after it
++    bool td_rep_reads = false; // 0173: the graph reads the replicas (the TD graph): the recorded cells are copied before it
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+diff --git a/src/llama-kv-cache-dsa.cpp b/src/llama-kv-cache-dsa.cpp
+index dc25bdc74..ece9d69c1 100644
+--- a/src/llama-kv-cache-dsa.cpp
++++ b/src/llama-kv-cache-dsa.cpp
+@@ -285,6 +285,12 @@ void llama_kv_cache_dsa_context::td_rep_sync(ggml_backend_sched_t sched) const {
+     }
+ }
+ 
++void llama_kv_cache_dsa_context::td_rep_flush(ggml_backend_sched_t sched) const {
++    if (status == LLAMA_MEMORY_STATUS_SUCCESS) {
++        get_mla()->td_rep_flush(sched);
++    }
++}
++
+ bool llama_kv_cache_dsa_context::lm_positional() const {
+     return status == LLAMA_MEMORY_STATUS_SUCCESS && get_mla()->lm_positional() && get_lid()->lm_positional();
+ }
+diff --git a/src/llama-kv-cache-dsa.h b/src/llama-kv-cache-dsa.h
+index 4dac3dcfd..9feb13651 100644
+--- a/src/llama-kv-cache-dsa.h
++++ b/src/llama-kv-cache-dsa.h
+@@ -129,6 +129,7 @@ public:
+ 
+     // 0165 LLAMA_TP_DECODE: the MLA cache's replica (the indexer cache has none)
+     void td_rep_sync(ggml_backend_sched_t sched) const override;
++    void td_rep_flush(ggml_backend_sched_t sched) const override;
+ 
+ private:
+     //llama_kv_cache_dsa * kv;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index f3804887b..9248979c9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1633,10 +1633,20 @@ ggml_tensor * llama_kv_cache::cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur,
+ }
+ 
+ void llama_kv_cache::td_rep_sync(ggml_backend_sched_t sched, const slot_info & sinfo) const {
++    GGML_UNUSED(sched);
+     if (td_rep_bufs.empty() || sinfo.empty() || sinfo.idxs.size() != 1 || sinfo.idxs[0].empty()) {
+         return;
+     }
+-    std::vector<uint32_t> idx = sinfo.idxs[0];
++    // 0173: recorded only; td_rep_flush copies them before the next graph that reads the replicas
++    td_rep_pending.insert(td_rep_pending.end(), sinfo.idxs[0].begin(), sinfo.idxs[0].end());
++}
++
++void llama_kv_cache::td_rep_flush(ggml_backend_sched_t sched) const {
++    if (td_rep_bufs.empty() || td_rep_pending.empty()) {
++        return;
++    }
++    std::vector<uint32_t> idx;
++    idx.swap(td_rep_pending);
+     std::sort(idx.begin(), idx.end());
+     idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+     std::vector<std::pair<uint32_t, uint32_t>> runs; // [first, end)
+@@ -3282,6 +3292,10 @@ void llama_kv_cache_context::td_rep_sync(ggml_backend_sched_t sched) const {
+     }
+ }
+ 
++void llama_kv_cache_context::td_rep_flush(ggml_backend_sched_t sched) const {
++    kv->td_rep_flush(sched);
++}
++
+ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index dcc26f6d9..e5f99a290 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -222,6 +222,8 @@ public:
+     ggml_tensor * get_k_rep(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+     void td_rep_sync(ggml_backend_sched_t sched, const slot_info & sinfo) const;
++    // 0173: the cells waiting for a copy into the replicas (td_rep_sync records them, td_rep_flush copies them)
++    void td_rep_flush(ggml_backend_sched_t sched) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+ 
+     //
+@@ -356,6 +358,7 @@ private:
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
+     llama_memory_bufs td_rep_bufs { false }; // 0165
++    mutable std::vector<uint32_t> td_rep_pending; // 0173: cells written since the last replica copy
+ 
+     size_t total_size() const;
+ 
+@@ -459,6 +462,7 @@ public:
+     ggml_tensor * get_k_rep(ggml_context * ctx, int32_t il) const;
+     ggml_tensor * cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+     void td_rep_sync(ggml_backend_sched_t sched) const override;
++    void td_rep_flush(ggml_backend_sched_t sched) const override;
+ 
+     // create destination indices for each head of the current batch for where it would be written in the KV cache
+     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 8a0b38887..f0fbc0152 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -102,6 +102,8 @@ struct llama_memory_context_i {
+ 
+     // 0165 LLAMA_TP_DECODE: copy the cells the current ubatch wrote into the KV replicas (after a graph that wrote only the home caches)
+     virtual void td_rep_sync(ggml_backend_sched_t sched) const { GGML_UNUSED(sched); }
++    // 0173: copy the recorded cells into the replicas (before a graph that reads them)
++    virtual void td_rep_flush(ggml_backend_sched_t sched) const { GGML_UNUSED(sched); }
+ };
+ 
+ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index e2af591d7..bfe87e085 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -576,7 +576,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     // blocks the host only once the other card's all-reduces are queued).  Any other graph writes only the home caches: the replicas follow
+     static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 8;
+     const bool td = cparams.td && !tp && cparams.lm_rows == 0 && n_tokens <= td_max && moe_cache != nullptr;
+-    res->td_rep_sync = cparams.td && !td;
++    res->td_rep_sync  = cparams.td && !td;
++    res->td_rep_reads = td; // 0173
+     ggml_backend_sched_set_gpu_switch_nosync(sched, td);
+     if (td) {
+         GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
+-- 
+2.43.0
+

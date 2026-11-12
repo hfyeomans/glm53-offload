@@ -1,7 +1,7 @@
 From 34e5943da40fa798f11c6fc24ac88c3da2aa32d3 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 17:01:45 -0600
-Subject: [PATCH 042/141] glm-dsa MTP: LLAMA_MTP_HEAD_VOCAB=K scores the draft
+Subject: [PATCH 042/211] glm-dsa MTP: LLAMA_MTP_HEAD_VOCAB=K scores the draft
  head over the first K token ids only (the rest -inf)
 
 ---

@@ -1,7 +1,7 @@
 From c025268ec991ba9aac905249fc4c9cf38ec98257 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 12:17:11 -0600
-Subject: [PATCH 032/141] ring-only: define the switch before sched_new uses it
+Subject: [PATCH 032/211] ring-only: define the switch before sched_new uses it
 
 ---
  src/llama-context.cpp | 20 ++++++++++----------

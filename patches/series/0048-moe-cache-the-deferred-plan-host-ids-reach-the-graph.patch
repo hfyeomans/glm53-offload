@@ -1,7 +1,7 @@
 From 3b5648d41a07676a0af849f6dda37a00fcc4baae Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 20:37:49 -0600
-Subject: [PATCH 048/141] moe-cache: the deferred plan host ids reach the graph
+Subject: [PATCH 048/211] moe-cache: the deferred plan host ids reach the graph
  only for batches whose plan is deferred (up to 8 tokens); a 9-32 token batch
  read stale ids
 

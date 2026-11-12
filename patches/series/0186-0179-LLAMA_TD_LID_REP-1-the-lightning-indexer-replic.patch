@@ -1,0 +1,274 @@
+From 49e473e9f482aadbd70200353a39a81d1b3284c6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 21:24:02 -0600
+Subject: [PATCH 186/211] 0179: LLAMA_TD_LID_REP=1 -- the lightning indexer
+ replicated on both TD cards (weights, key cache replica, rotation), no top-k
+ copy
+
+---
+ src/llama-kv-cache-dsa.cpp |  7 ++++++
+ src/llama-kv-cache.cpp     | 41 ++++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.h       |  5 ++++-
+ src/llama-model.cpp        |  7 ++++++
+ src/models/glm-dsa.cpp     | 44 ++++++++++++++++++++++++--------------
+ 5 files changed, 86 insertions(+), 18 deletions(-)
+
+diff --git a/src/llama-kv-cache-dsa.cpp b/src/llama-kv-cache-dsa.cpp
+index ece9d69c1..3be43143d 100644
+--- a/src/llama-kv-cache-dsa.cpp
++++ b/src/llama-kv-cache-dsa.cpp
+@@ -60,6 +60,11 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
+             model, no_alloc, hparams_lid, type_k, type_v,
+             v_trans, offload, unified, kv_size, n_seq_max,
+             n_swa, swa_type, nullptr, filter_lid, nullptr, nullptr);
++
++    // 0179 LLAMA_TD_LID_REP=1: the indexer keys of each full-indexer layer on its other card too
++    if (!no_alloc && model.td_ready && getenv("LLAMA_TD_LID_REP") != nullptr && atoi(getenv("LLAMA_TD_LID_REP")) != 0) {
++        kv_lid->td_rep_alloc(true);
++    }
+ }
+ 
+ void llama_kv_cache_dsa::clear(bool data) {
+@@ -282,12 +287,14 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
+ void llama_kv_cache_dsa_context::td_rep_sync(ggml_backend_sched_t sched) const {
+     if (status == LLAMA_MEMORY_STATUS_SUCCESS) {
+         get_mla()->td_rep_sync(sched);
++        get_lid()->td_rep_sync(sched); // 0179
+     }
+ }
+ 
+ void llama_kv_cache_dsa_context::td_rep_flush(ggml_backend_sched_t sched) const {
+     if (status == LLAMA_MEMORY_STATUS_SUCCESS) {
+         get_mla()->td_rep_flush(sched);
++        get_lid()->td_rep_flush(sched); // 0179
+     }
+ }
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index b9b9eb5d9..972c07e3c 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1560,7 +1560,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+ }
+ 
+ // 0165 LLAMA_TP_DECODE=1: the K replica of each trunk layer on the layer's other card
+-void llama_kv_cache::td_rep_alloc() {
++void llama_kv_cache::td_rep_alloc(bool rot) {
+     if (!model.td_ready || model.tp_devs.size() != 2 || n_stream != 1) {
+         return;
+     }
+@@ -1629,6 +1629,33 @@ void llama_kv_cache::td_rep_alloc() {
+         LLAMA_LOG_INFO("%s: LLAMA_TP_DECODE: K replica on %s, %.1f MiB\n", __func__, ggml_backend_buft_name(buft),
+             ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+     }
++    // 0179: the rotation matrices of the replicated layers on the other card too (their own buffer: the replica's pages may be unmapped)
++    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> rctxs;
++    for (auto & l : layers) {
++        if (!rot || l.k_rep == nullptr || l.k_rot == nullptr) {
++            continue;
++        }
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model.tp_devs[1 - model.tp_home((int) l.il)]);
++        auto & ctx = rctxs[buft];
++        if (!ctx) {
++            ggml_init_params params = { ggml_tensor_overhead()*(layers.size() + 1), nullptr, true };
++            ctx.reset(ggml_init(params));
++        }
++        l.k_rot_rep = ggml_dup_tensor(ctx.get(), l.k_rot);
++        ggml_format_name(l.k_rot_rep, "cache_k_rot_rep_l%d", (int) l.il);
++    }
++    for (auto & [buft, ctx] : rctxs) {
++        ggml_backend_buffer_t buf = td_rep_bufs.emplace(std::move(ctx), buft, "rotation replica");
++        if (buf == nullptr) {
++            throw std::runtime_error("LLAMA_TP_DECODE: failed to allocate the rotation replica");
++        }
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    }
++    for (auto & l : layers) {
++        if (l.k_rot_rep != nullptr) {
++            ggml_backend_tensor_set(l.k_rot_rep, attn_rot_hadamard.at(l.k_rot->ne[0]).data(), 0, ggml_nbytes(l.k_rot_rep));
++        }
++    }
+ }
+ 
+ bool llama_kv_cache::has_k_rep(int32_t il) const {
+@@ -1856,6 +1883,14 @@ std::vector<ggml_tensor *> llama_kv_cache::get_k_rot() const {
+     return res;
+ }
+ 
++std::vector<ggml_tensor *> llama_kv_cache::get_k_rot_rep() const {
++    std::vector<ggml_tensor *> res(hparams.n_layer_all, nullptr);
++    for (const auto & [il, idx] : map_layer_ids) {
++        res[il] = layers[idx].k_rot_rep;
++    }
++    return res;
++}
++
+ std::vector<ggml_tensor *> llama_kv_cache::get_v_rot() const {
+     std::vector<ggml_tensor *> res(hparams.n_layer_all, nullptr);
+     for (const auto & [il, idx] : map_layer_ids) {
+@@ -3351,6 +3386,10 @@ std::vector<ggml_tensor *> llama_kv_cache_context::get_k_rot() const {
+     return kv->get_k_rot();
+ }
+ 
++std::vector<ggml_tensor *> llama_kv_cache_context::get_k_rot_rep() const {
++    return kv->get_k_rot_rep();
++}
++
+ std::vector<ggml_tensor *> llama_kv_cache_context::get_v_rot() const {
+     return kv->get_v_rot();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index e5f99a290..2a762a456 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -217,7 +217,7 @@ public:
+ 
+     // 0165 LLAMA_TP_DECODE: a replica of each trunk layer's K on the layer's other card (td_rep_alloc), its view and write as get_k /
+     // cpy_k, and the copy of the cells a ubatch wrote from the home cache (td_rep_sync, on the home card's stream)
+-    void td_rep_alloc();
++    void td_rep_alloc(bool rot = false); // 0179 rot: the rotation matrices too (the indexer cache)
+     bool has_k_rep(int32_t il) const;
+     ggml_tensor * get_k_rep(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+@@ -252,6 +252,7 @@ public:
+     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+ 
+     std::vector<ggml_tensor *> get_k_rot() const;
++    std::vector<ggml_tensor *> get_k_rot_rep() const; // 0179: k_rot of the replicated layers on their other card
+     std::vector<ggml_tensor *> get_v_rot() const;
+ 
+     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+@@ -295,6 +296,7 @@ private:
+         ggml_tensor * v_rot = nullptr;
+ 
+         ggml_tensor * k_rep = nullptr; // 0165 LLAMA_TP_DECODE: the copy of k on the layer's other card
++        ggml_tensor * k_rot_rep = nullptr; // 0179: the copy of k_rot there
+     };
+ 
+     bool v_trans = true;  // the value tensor is transposed
+@@ -471,6 +473,7 @@ public:
+     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+ 
+     std::vector<ggml_tensor *> get_k_rot() const;
++    std::vector<ggml_tensor *> get_k_rot_rep() const; // 0179: k_rot of the replicated layers on their other card
+     std::vector<ggml_tensor *> get_v_rot() const;
+ 
+     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3ac16c739..15111ad5c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2321,6 +2321,13 @@ void llama_model_base::load_tensors_td() {
+         for (ggml_tensor * w : { L.attn_norm, L.wq_a, L.attn_q_a_norm, L.wkv_a_mqa, L.attn_kv_a_norm, L.ffn_norm, L.ffn_gate_inp, L.ffn_exp_probs_b }) {
+             add(w, -1);
+         }
++        // 0179 LLAMA_TD_LID_REP=1: a full-indexer layer's indexer weights on the other card too
++        static const bool td_lid_rep = getenv("LLAMA_TD_LID_REP") != nullptr && atoi(getenv("LLAMA_TD_LID_REP")) != 0;
++        if (td_lid_rep && hparams.is_indexer_full(il)) {
++            for (ggml_tensor * w : { L.indexer_attn_q_b, L.indexer_attn_k, L.indexer_k_norm, L.indexer_k_norm_b, L.indexer_proj }) {
++                add(w, -1);
++            }
++        }
+         add(L.wq_b, 0);
+         add(L.wk_b, 1);
+         add(L.wv_b, 1);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 20ce1dc0a..b3cd60dda 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -637,6 +637,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         auto W  = [&](ggml_tensor * w, int c) { return model.td_w(w, c); };
+         auto Wh = [&](ggml_tensor * w, int c, int kind) { return model.td_h(ctx0, w, c, kind); };
+         static const bool td_short_dense = getenv("LLAMA_DSA_SHORT_DENSE") != nullptr && atoi(getenv("LLAMA_DSA_SHORT_DENSE")) != 0;
++        static const bool td_lid_rep = getenv("LLAMA_TD_LID_REP") != nullptr && atoi(getenv("LLAMA_TD_LID_REP")) != 0; // 0179
+ 
+         ggml_tensor * inp_embd = build_inp_embd(model.tok_embd);
+         ggml_tensor * inp_pos  = build_inp_pos();
+@@ -646,6 +647,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+ 
+         const auto * mctx_mla = inp->mctx->get_mla();
+         const auto * mctx_lid = inp->mctx->get_lid();
++        const std::vector<ggml_tensor *> k_rot_rep_lid = td_lid_rep ? mctx_lid->get_k_rot_rep() : std::vector<ggml_tensor *>(); // 0179
+         ggml_tensor * kq_mask = inp->self_attn_mask_mla.cnv;
+         if (inp->self_attn_mask_lid.cnv->type == kq_mask->type) {
+             kq_mask = inp->self_attn_mask_lid.cnv;
+@@ -684,13 +686,16 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             const int H = model.tp_home(il);
+             const int O = 1 - H;
+             GGML_ASSERT(L.wo_s == nullptr && L.wq_b != nullptr && L.wk_b != nullptr && L.wv_b != nullptr);
++            // 0179: a full-indexer layer whose indexer runs on both cards (no top-k copy, the other card does not wait for the home card)
++            const bool lid_rep = td_lid_rep && hparams.is_indexer_full(il) && mctx_lid->has_k_rep(il) && model.td_rep.count(L.indexer_attn_q_b) > 0 &&
++                (inp->self_k_rot_lid[il] == nullptr || k_rot_rep_lid[il] != nullptr);
+             res->t_layer_inp[il] = x[H];
+ 
+             // pre-attention on card c: the norm, q_a, the latent key into the card's own cache; on the home card the indexer
+             ggml_tensor * qr[2] = { nullptr, nullptr };
+             auto pre = [&](int c) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+-                if (c == O && hparams.is_indexer_full(il)) {
++                if (c == O && hparams.is_indexer_full(il) && !lid_rep) {
+                     top_k_c[O] = top_k_c[H] != nullptr ? ggml_cont(ctx0, top_k_c[H]) : nullptr; // this layer's top-k, copied over now
+                     if (top_k_c[O] != nullptr) {
+                         ggml_build_forward_expand(gf, top_k_c[O]);
+@@ -703,25 +708,29 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 ggml_tensor * q_a = ggml_mul_mat(ctx0, W(L.wq_a, c), cur);
+                 q_a = build_norm(q_a, W(L.attn_q_a_norm, c), nullptr, LLM_NORM_RMS, il);
+                 qr[c] = q_a;
+-                if (c == H && hparams.is_indexer_full(il)) {
+-                    ggml_tensor * iq = ggml_mul_mat(ctx0, L.indexer_attn_q_b, q_a);
++                if ((c == H || lid_rep) && hparams.is_indexer_full(il)) { // 0179: on the other card too
++                    ggml_tensor * iq = ggml_mul_mat(ctx0, W(L.indexer_attn_q_b, c), q_a);
+                     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer_head, n_indexer_head, n_tokens);
+                     iq = ggml_rope_ext(ctx0, iq, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
+                                        ext_factor, attn_factor, beta_fast, beta_slow);
+-                    ggml_tensor * ik = ggml_mul_mat(ctx0, L.indexer_attn_k, cur);
+-                    ik = build_norm(ik, L.indexer_k_norm, L.indexer_k_norm_b, LLM_NORM, il);
++                    ggml_tensor * ik = ggml_mul_mat(ctx0, W(L.indexer_attn_k, c), cur);
++                    ik = build_norm(ik, W(L.indexer_k_norm, c), W(L.indexer_k_norm_b, c), LLM_NORM, il);
+                     ik = ggml_reshape_3d(ctx0, ik, n_embd_indexer_head, 1, n_tokens);
+                     ik = ggml_rope_ext(ctx0, ik, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
+                                        ext_factor, attn_factor, beta_fast, beta_slow);
+-                    iq = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], iq);
+-                    ik = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], ik);
+-                    ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik, inp->get_k_idxs_lid(), il));
++                    ggml_tensor * rot = c == H ? inp->self_k_rot_lid[il] : k_rot_rep_lid[il];
++                    iq = ggml_mul_mat(ctx0, rot, iq);
++                    ik = ggml_mul_mat(ctx0, rot, ik);
++                    ggml_build_forward_expand(gf, c == H ? mctx_lid->cpy_k(ctx0, ik, inp->get_k_idxs_lid(), il) :
++                                                           mctx_lid->cpy_k_rep(ctx0, ik, inp->get_k_idxs_lid(), il));
+                     if (dense) {
+-                        prev_top_k = nullptr;
+-                        top_k_c[H] = nullptr;
++                        if (c == H) {
++                            prev_top_k = nullptr;
++                        }
++                        top_k_c[c] = nullptr;
+                     } else {
+-                        ggml_tensor * iw = ggml_mul_mat(ctx0, L.indexer_proj, cur);
+-                        ggml_tensor * ikc = mctx_lid->get_k(ctx0, il);
++                        ggml_tensor * iw = ggml_mul_mat(ctx0, W(L.indexer_proj, c), cur);
++                        ggml_tensor * ikc = c == H ? mctx_lid->get_k(ctx0, il) : mctx_lid->get_k_rep(ctx0, il);
+                         const auto n_stream = ikc->ne[3];
+                         iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], iq->ne[2]/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[3]/n_stream, 0);
+                         iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream, iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
+@@ -729,10 +738,13 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                         ggml_tensor * sc = ggml_lightning_indexer(ctx0, iq, ikc, iw, inp->self_attn_mask_lid.cnv);
+                         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
+                         const uint32_t n_top = sc->ne[0] < n_indexer_top_k ? sc->ne[0] : n_indexer_top_k;
+-                        prev_top_k = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
+-                        cb(prev_top_k, "top_k", il);
+-                        ggml_build_forward_expand(gf, prev_top_k);
+-                        top_k_c[H] = prev_top_k;
++                        ggml_tensor * tk = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
++                        cb(tk, "top_k", il);
++                        ggml_build_forward_expand(gf, tk);
++                        top_k_c[c] = tk;
++                        if (c == H) {
++                            prev_top_k = tk;
++                        }
+                     }
+                 }
+                 ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, W(L.wkv_a_mqa, c), cur);
+-- 
+2.43.0
+

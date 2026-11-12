@@ -1,0 +1,504 @@
+From ebea6b946dcb1bc0da36a92478e55053999ae7f1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:29:07 -0600
+Subject: [PATCH 171/211] 0164: GGML_OP_PAIR_ALLREDUCE -- two CUDA devices sum
+ a tensor in one kernel each (pinned host staging, device call counters,
+ CUDA-graph safe); tests/test-pair-allreduce
+
+---
+ ggml/include/ggml.h                   |   8 ++
+ ggml/src/ggml-cpu/ggml-cpu.c          |   8 ++
+ ggml/src/ggml-cpu/ggml-cpu.cpp        |   2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu       |  22 ++++
+ ggml/src/ggml-cuda/pair-allreduce.cu  | 148 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/pair-allreduce.cuh |   8 ++
+ ggml/src/ggml.c                       |  27 ++++-
+ tests/CMakeLists.txt                  |   1 +
+ tests/test-pair-allreduce.cpp         | 106 ++++++++++++++++++
+ 9 files changed, 328 insertions(+), 2 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/pair-allreduce.cu
+ create mode 100644 ggml/src/ggml-cuda/pair-allreduce.cuh
+ create mode 100644 tests/test-pair-allreduce.cpp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index a49fd997e..8278756b4 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -590,6 +590,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_TOP_K_MASK,
++        GGML_OP_PAIR_ALLREDUCE, // 0164
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2798,6 +2799,13 @@ extern "C" {
+             struct ggml_tensor  * blocks,
+             struct ggml_tensor  * extra);
+ 
++    // 0164: a + the same tensor on the peer device of a two-device pair (rank 0 or 1), the same bits on both devices; F32, contiguous.
++    // The CUDA backend runs it (ggml_backend_cuda_pair_ar_init sets up the pair); both devices must run their pair ops in the same order
++    GGML_API struct ggml_tensor * ggml_pair_allreduce(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   rank);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index a454cad36..27d4af749 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2139,6 +2139,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_top_k_mask(params, tensor);
+             } break;
++        case GGML_OP_PAIR_ALLREDUCE:
++            {
++                GGML_ABORT("PAIR_ALLREDUCE runs on a pair of CUDA devices, not on the CPU"); // 0164
++            }
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2326,6 +2330,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_PAIR_ALLREDUCE:
++            {
++                n_tasks = 1; // 0164: not a CPU op
++            } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+         case GGML_OP_LEAKY_RELU:
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d79f..2d50ade2b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -481,6 +481,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_SSM_SCAN:
+             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
++        case GGML_OP_PAIR_ALLREDUCE:
++            return false; // 0164: a pair of CUDA devices
+         default:
+             return true;
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 05fca1b88..e0e03e165 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -71,6 +71,7 @@
+ #include "ggml-cuda/fill.cuh"
+ #include "ggml-cuda/lightning-indexer.cuh"
+ #include "ggml-cuda/top-k-mask.cuh"
++#include "ggml-cuda/pair-allreduce.cuh"
+ #include "ggml.h"
+ 
+ #include <algorithm>
+@@ -2874,6 +2875,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_TOP_K_MASK:
+             ggml_cuda_op_top_k_mask(ctx, dst);
+             break;
++        case GGML_OP_PAIR_ALLREDUCE:
++            ggml_cuda_op_pair_allreduce(ctx, dst); // 0164
++            break;
+         default:
+             return false;
+     }
+@@ -6788,6 +6792,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+         case GGML_OP_TOP_K_MASK:
+             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
++        case GGML_OP_PAIR_ALLREDUCE:
++            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]); // 0164
+ 
+         default:
+             return false;
+@@ -6988,8 +6994,24 @@ static void ggml_backend_cuda_host_input_upload(ggml_backend_t backend, void * d
+     CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), h.ev_upload, 0));
+ }
+ 
++// 0164: the pair of GGML_OP_PAIR_ALLREDUCE (rank 0 on d0, rank 1 on d1), tensors up to max_bytes
++static bool ggml_backend_cuda_pair_ar_init(ggml_backend_dev_t d0, ggml_backend_dev_t d1, size_t max_bytes) {
++    if (d0 == nullptr || d1 == nullptr || d0->iface.get_name != ggml_backend_cuda_device_get_name || d1->iface.get_name != ggml_backend_cuda_device_get_name) {
++        return false;
++    }
++    const auto * c0 = (const ggml_backend_cuda_device_context *) d0->context;
++    const auto * c1 = (const ggml_backend_cuda_device_context *) d1->context;
++    if (c0->twin_idx >= 0 || c1->twin_idx >= 0) {
++        return false;
++    }
++    return ggml_cuda_pair_ar_init(c0->device, c1->device, max_bytes);
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_cuda_pair_ar_init") == 0) {
++        return (void *)ggml_backend_cuda_pair_ar_init;
++    }
+     if (strcmp(name, "ggml_backend_host_input_begin") == 0) {
+         return (void *)ggml_backend_cuda_host_input_begin;
+     }
+diff --git a/ggml/src/ggml-cuda/pair-allreduce.cu b/ggml/src/ggml-cuda/pair-allreduce.cu
+new file mode 100644
+index 000000000..cd92f7950
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pair-allreduce.cu
+@@ -0,0 +1,148 @@
++#include "pair-allreduce.cuh"
++
++#include <cstring>
++#include <mutex>
++
++// 0164 GGML_OP_PAIR_ALLREDUCE, adapted from allreduce.cu's chunked kernel (upstream's two-GPU tensor-parallel reduction over PCIe): each
++// device writes its partial into its own pinned host buffer, raises a token per block, waits for the peer's token and adds the peer's
++// partial: dst = mine + peer's, the same bits on both devices (one add, which commutes).  The call number lives in device memory (each
++// device counts its own calls, a call is one kernel whose last block advances the count), so the op is an ordinary graph node and its CUDA
++// graph replays.  The two devices run their calls in the same order, one kernel at a time on a stream, and a call is a barrier: when a
++// device starts call N, its peer has finished call N-2, so PAIR_AR_POOL >= 2 slots are never overwritten while read.
++
++#define PAIR_AR_BLOCKS  8
++#define PAIR_AR_THREADS 256
++#define PAIR_AR_POOL    4
++#define PAIR_AR_STRIDE  16 // ints between two blocks' tokens (64 bytes, one line each)
++
++struct ggml_cuda_pair_ar {
++    bool    ready = false;
++    int     dev[2] = { -1, -1 };
++    size_t  slot_elems = 0;                          // floats a slot
++    float * host[2] = { nullptr, nullptr };          // rank r's staging: PAIR_AR_POOL slots (mapped pinned host memory)
++    int   * arr[2]  = { nullptr, nullptr };          // rank r's tokens: [PAIR_AR_POOL][PAIR_AR_BLOCKS][PAIR_AR_STRIDE]
++    int   * ctr[2]  = { nullptr, nullptr };          // on device r: { calls, blocks done in the current call }
++};
++
++static ggml_cuda_pair_ar g_pair_ar;
++static std::mutex        g_pair_ar_mutex;
++
++bool ggml_cuda_pair_ar_init(int dev0, int dev1, size_t max_bytes) {
++    std::lock_guard<std::mutex> lock(g_pair_ar_mutex);
++    ggml_cuda_pair_ar & p = g_pair_ar;
++    if (p.ready) {
++        return p.dev[0] == dev0 && p.dev[1] == dev1 && p.slot_elems*sizeof(float) >= max_bytes;
++    }
++    if (dev0 == dev1) {
++        return false;
++    }
++    p.dev[0] = dev0;
++    p.dev[1] = dev1;
++    p.slot_elems = (max_bytes + 15)/16*4;
++    const size_t host_bytes = (size_t) PAIR_AR_POOL*p.slot_elems*sizeof(float);
++    const size_t arr_bytes  = (size_t) PAIR_AR_POOL*PAIR_AR_BLOCKS*PAIR_AR_STRIDE*sizeof(int);
++    for (int r = 0; r < 2; ++r) {
++        ggml_cuda_set_device(p.dev[r]);
++        void * h = nullptr;
++        void * a = nullptr;
++        CUDA_CHECK(cudaHostAlloc(&h, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
++        CUDA_CHECK(cudaHostAlloc(&a, arr_bytes,  cudaHostAllocPortable | cudaHostAllocMapped));
++        memset(h, 0, host_bytes);
++        memset(a, 0, arr_bytes);
++        CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.host[r], h, 0));
++        CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.arr[r],  a, 0));
++        CUDA_CHECK(cudaMalloc((void **) &p.ctr[r], 2*sizeof(int)));
++        CUDA_CHECK(cudaMemset(p.ctr[r], 0, 2*sizeof(int)));
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
++    p.ready = true;
++    GGML_LOG_INFO("%s: 0164: pair all-reduce between CUDA%d and CUDA%d, up to %zu KiB a call\n", __func__, dev0, dev1,
++        p.slot_elems*sizeof(float)/1024);
++    return true;
++}
++
++static __global__ void pair_ar_kernel(
++        const float * __restrict__ src, float * __restrict__ dst, float * __restrict__ host_mine, const float * __restrict__ host_other,
++        const int n, int * arr_mine, const int * arr_other, int * ctr, const size_t slot_elems, const bool vec) {
++    __shared__ int s_call;
++    if (threadIdx.x == 0) {
++        s_call = *(volatile int *) ctr;
++    }
++    __syncthreads();
++    const int call  = s_call;
++    const int slot  = call % PAIR_AR_POOL;
++    const int token = call + 1;
++
++    float       * hm = host_mine  + (size_t) slot*slot_elems;
++    const float * ho = host_other + (size_t) slot*slot_elems;
++
++    const int gt = blockIdx.x*blockDim.x + threadIdx.x;
++    const int gn = gridDim.x*blockDim.x;
++    const int n4 = vec ? n/4 : 0;
++
++    // this block's stripe of my partial to host memory (the peer's same block reads it)
++    for (int i = gt; i < n4; i += gn) {
++        ((float4 *) hm)[i] = ((const float4 *) src)[i];
++    }
++    for (int i = 4*n4 + gt; i < n; i += gn) {
++        hm[i] = src[i];
++    }
++    __threadfence_system();
++    __syncthreads();
++
++    if (threadIdx.x == 0) {
++        volatile int       * am = arr_mine  + (slot*PAIR_AR_BLOCKS + blockIdx.x)*PAIR_AR_STRIDE;
++        const volatile int * ao = arr_other + (slot*PAIR_AR_BLOCKS + blockIdx.x)*PAIR_AR_STRIDE;
++        *am = token;
++        __threadfence_system();
++        while (*ao != token) {
++#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
++            __nanosleep(32);
++#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
++        }
++    }
++    __syncthreads();
++    __threadfence_system();
++
++    // mine + the peer's, the peer's read past the caches
++    for (int i = gt; i < n4; i += gn) {
++        const float4 a = ((const float4 *) src)[i];
++        const float4 b = __ldcv((const float4 *) ho + i);
++        ((float4 *) dst)[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
++    }
++    for (int i = 4*n4 + gt; i < n; i += gn) {
++        dst[i] = src[i] + __ldcv(ho + i);
++    }
++
++    // the last block of the call advances the count (the next call on this stream starts after this kernel)
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        if (atomicAdd(ctr + 1, 1) == (int) gridDim.x - 1) {
++            ctr[1] = 0;
++            *(volatile int *) ctr = call + 1;
++            __threadfence();
++        }
++    }
++}
++
++void ggml_cuda_op_pair_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src = dst->src[0];
++    const int rank = ggml_get_op_params_i32(dst, 0);
++    ggml_cuda_pair_ar & p = g_pair_ar;
++
++    GGML_ASSERT(p.ready && "ggml_pair_allreduce: the pair was not set up (ggml_backend_cuda_pair_ar_init)");
++    GGML_ASSERT(rank == 0 || rank == 1);
++    GGML_ASSERT(p.dev[rank] == ctx.device);
++    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
++
++    const int64_t n = ggml_nelements(src);
++    GGML_ASSERT(n > 0 && (size_t) n <= p.slot_elems);
++
++    const bool vec = ((uintptr_t) src->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0;
++    pair_ar_kernel<<<PAIR_AR_BLOCKS, PAIR_AR_THREADS, 0, ctx.stream()>>>(
++        (const float *) src->data, (float *) dst->data, p.host[rank], p.host[1 - rank], (int) n,
++        p.arr[rank], p.arr[1 - rank], p.ctr[rank], p.slot_elems, vec);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/pair-allreduce.cuh b/ggml/src/ggml-cuda/pair-allreduce.cuh
+new file mode 100644
+index 000000000..1b1f562e0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pair-allreduce.cuh
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "common.cuh"
++
++// 0164 GGML_OP_PAIR_ALLREDUCE (ggml_pair_allreduce): set up the pair once (devices of rank 0 and 1, the largest tensor in bytes)
++bool ggml_cuda_pair_ar_init(int dev0, int dev1, size_t max_bytes);
++
++void ggml_cuda_op_pair_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index efa5e019d..7ea6915d1 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
+     "TOP_K_MASK",
++    "PAIR_ALLREDUCE",
+ 
+     "UNARY",
+ 
+@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1218,6 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
+     "top_k_mask(mask, top_k, score, blocks, extra)",
++    "pair_allreduce(x)",
+ 
+     "unary(x)",
+ 
+@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6766,6 +6768,27 @@ struct ggml_tensor * ggml_top_k_mask(
+     return result;
+ }
+ 
++// ggml_pair_allreduce (0164)
++
++struct ggml_tensor * ggml_pair_allreduce(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   rank) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(rank == 0 || rank == 1);
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++
++    int32_t params[1] = { rank };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_PAIR_ALLREDUCE;
++    result->src[0] = a;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 4224a15ae..37ab61b57 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -354,6 +354,7 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
+ endif()
+ 
+ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
++llama_build(test-pair-allreduce.cpp LINK ggml) # 0164
+ 
+ llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+ 
+diff --git a/tests/test-pair-allreduce.cpp b/tests/test-pair-allreduce.cpp
+new file mode 100644
+index 000000000..ec66b4063
+--- /dev/null
++++ b/tests/test-pair-allreduce.cpp
+@@ -0,0 +1,106 @@
++// test-pair-allreduce (0164): GGML_OP_PAIR_ALLREDUCE on the first two CUDA devices -- the same bits on both devices, the exact sum of the
++// two partials, many calls in a row (the device call counters, the slot ring, CUDA graph replay of a reused graph), and the time of a call
++// (both devices' graphs issued, then both synchronized).
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <vector>
++
++int main() {
++    std::vector<ggml_backend_dev_t> gpus;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            gpus.push_back(d);
++        }
++    }
++    if (gpus.size() < 2) {
++        printf("need two GPUs, found %zu\n", gpus.size());
++        return 1;
++    }
++    ggml_backend_t be[2] = { ggml_backend_dev_init(gpus[0], nullptr), ggml_backend_dev_init(gpus[1], nullptr) };
++    using init_t = bool (*)(ggml_backend_dev_t, ggml_backend_dev_t, size_t);
++    init_t init = (init_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(gpus[0]), "ggml_backend_cuda_pair_ar_init");
++    if (init == nullptr || !init(gpus[0], gpus[1], 1u << 20)) {
++        printf("ggml_backend_cuda_pair_ar_init failed\n");
++        return 1;
++    }
++
++    int n_fail = 0;
++    for (const int64_t n : { (int64_t) 1, (int64_t) 7, (int64_t) 6144, (int64_t) 6144*3, (int64_t) 6144*8, (int64_t) 65536, (int64_t) 262144 }) {
++        ggml_context * ctx[2];
++        ggml_tensor  * a[2];
++        ggml_tensor  * r[2];
++        ggml_cgraph  * g[2];
++        ggml_backend_buffer_t buf[2];
++        for (int c = 0; c < 2; ++c) {
++            ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
++            ctx[c] = ggml_init(ip);
++            a[c] = ggml_new_tensor_1d(ctx[c], GGML_TYPE_F32, n);
++            r[c] = ggml_pair_allreduce(ctx[c], a[c], c);
++            g[c] = ggml_new_graph(ctx[c]);
++            ggml_build_forward_expand(g[c], r[c]);
++            buf[c] = ggml_backend_alloc_ctx_tensors(ctx[c], be[c]);
++        }
++        std::mt19937 rng((unsigned) n);
++        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++        std::vector<float> h[2] = { std::vector<float>(n), std::vector<float>(n) };
++        std::vector<float> o[2] = { std::vector<float>(n), std::vector<float>(n) };
++        const int iters = 2000;
++        int checked = 0, bad = 0;
++        double t_sum = 0.0;
++        int    t_n   = 0;
++        for (int it = 0; it < iters; ++it) {
++            const bool check = it < 3 || it % 97 == 0;
++            if (check) {
++                for (int c = 0; c < 2; ++c) {
++                    for (int64_t i = 0; i < n; ++i) {
++                        h[c][i] = dist(rng);
++                    }
++                    ggml_backend_tensor_set(a[c], h[c].data(), 0, n*sizeof(float));
++                }
++            }
++            const auto t0 = std::chrono::high_resolution_clock::now();
++            ggml_backend_graph_compute_async(be[0], g[0]);
++            ggml_backend_graph_compute_async(be[1], g[1]);
++            ggml_backend_synchronize(be[0]);
++            ggml_backend_synchronize(be[1]);
++            const auto t1 = std::chrono::high_resolution_clock::now();
++            if (it >= 10 && !check) {
++                t_sum += std::chrono::duration<double, std::micro>(t1 - t0).count();
++                t_n++;
++            }
++            if (check) {
++                checked++;
++                for (int c = 0; c < 2; ++c) {
++                    ggml_backend_tensor_get(r[c], o[c].data(), 0, n*sizeof(float));
++                }
++                for (int64_t i = 0; i < n; ++i) {
++                    const float want = h[0][i] + h[1][i];
++                    if (memcmp(&o[0][i], &o[1][i], sizeof(float)) != 0 || o[0][i] != want) {
++                        if (bad < 4) {
++                            printf("  n=%lld it=%d i=%lld: %.9g %.9g want %.9g\n", (long long) n, it, (long long) i, o[0][i], o[1][i], want);
++                        }
++                        bad++;
++                    }
++                }
++            }
++        }
++        printf("n=%7lld: %d checks, %d wrong values, %.1f us a call (both devices issued and synchronized, %d calls)\n",
++            (long long) n, checked, bad, t_n ? t_sum/t_n : 0.0, t_n);
++        n_fail += bad > 0;
++        for (int c = 0; c < 2; ++c) {
++            ggml_backend_buffer_free(buf[c]);
++            ggml_free(ctx[c]);
++        }
++    }
++    ggml_backend_free(be[0]);
++    ggml_backend_free(be[1]);
++    printf("%s\n", n_fail == 0 ? "PAIR ALLREDUCE OK" : "PAIR ALLREDUCE FAILED");
++    return n_fail == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

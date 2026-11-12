@@ -1,0 +1,174 @@
+From bd10ffbb01dd6a7bfe502756046887fb4266ee51 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:04:42 -0600
+Subject: [PATCH 168/211] 0161: GGML_CUDA_LID_Q8_FUSED=1 -- the tensor-core
+ indexer copies q8_0 key tiles raw (cp.async) and dequantizes them in shared
+ memory: no f16 copy of every key
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 78 +++++++++++++++++++++----
+ tests/test-backend-ops.cpp              |  8 +++
+ 2 files changed, 76 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 413cb21cf..0a10daa48 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -593,7 +593,9 @@ static __device__ __forceinline__ uint32_t lid_pack_h2(const float2 v) {
+     return *(const uint32_t *) &h;
+ }
+ 
+-template <bool SPLIT_ACC>
++#define LID_Q8_ROW (4*(int) sizeof(block_q8_0)) // 0161: bytes a q8_0 key row of 128
++
++template <bool SPLIT_ACC, bool KQ8 = false>
+ __launch_bounds__(LID_MMA_QPB*WARP_SIZE, 2)
+ static __global__ void lightning_indexer_kernel_mma(
+         const float * __restrict__ Q, const half * __restrict__ K16, const float * __restrict__ W, const half * __restrict__ M,
+@@ -602,7 +604,8 @@ static __global__ void lightning_indexer_kernel_mma(
+         const size_t nb1, const size_t nb3,
+         const size_t nbq1, const size_t nbq2, const size_t nbq3,
+         const size_t nbw1, const size_t nbw3,
+-        const size_t nbm1, const size_t nbm3, const int64_t nem3, const bool skip_idle) {
++        const size_t nbm1, const size_t nbm3, const int64_t nem3, const bool skip_idle,
++        const char * __restrict__ Kq, const size_t nbk3) { // 0161: KQ8 reads contiguous q8_0 keys from Kq (K16 unused)
+ #if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+     __shared__ __align__(16) half k_tile[2][LID_MMA_KT*LID_MMA_KSTR];
+ 
+@@ -616,10 +619,29 @@ static __global__ void lightning_indexer_kernel_mma(
+     const int64_t kv1  = kv0 + LID_MMA_KPB < n_kv ? kv0 + LID_MMA_KPB : n_kv;
+     const int n_tiles  = (int) ((kv1 - kv0 + LID_MMA_KT - 1)/LID_MMA_KT);
+ 
+-    const half * k_s = K16 + (int64_t) i_stream*n_kv*128;
++    const half * k_s = KQ8 ? nullptr : K16 + (int64_t) i_stream*n_kv*128;
+ 
+     // the 64-key tile t into buffer b: 1,024 16-byte pieces, 4 a thread; rows past the end read key 0 (their outputs are not written)
+     auto load_tile = [&](const int t, const int b) {
++        if constexpr (KQ8) {
++            // 0161: the tile's 64 q8_0 rows are 8,704 contiguous bytes: 544 16-byte pieces into raw buffer b (in k_tile[1]), the bytes
++            // past the cache's end zero-filled (src-size), so those rows are 0 (their outputs are not written)
++            const int64_t r0  = kv0 + (int64_t) t*LID_MMA_KT;
++            const int   valid = (int) (kv1 - r0 < LID_MMA_KT ? kv1 - r0 : LID_MMA_KT)*LID_Q8_ROW;
++            const char * src0 = Kq + r0*LID_Q8_ROW + i_stream*nbk3;
++            char * raw = (char *) k_tile[1] + b*(LID_MMA_KT*LID_Q8_ROW);
++#pragma unroll
++            for (int p = 0; p < (LID_MMA_KT*LID_Q8_ROW/16 + LID_MMA_QPB*WARP_SIZE - 1)/(LID_MMA_QPB*WARP_SIZE); ++p) {
++                const int o = (p*LID_MMA_QPB*WARP_SIZE + tid)*16;
++                if (o < LID_MMA_KT*LID_Q8_ROW) {
++                    const int n = valid - o <= 0 ? 0 : (valid - o < 16 ? valid - o : 16);
++                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
++                        : : "r"(ggml_cuda_cvta_generic_to_shared(raw + o)), "l"(n > 0 ? src0 + o : Kq), "r"(n));
++                }
++            }
++            asm volatile("cp.async.commit_group;");
++            return;
++        }
+ #pragma unroll
+         for (int p = 0; p < (LID_MMA_KT*128/8)/(LID_MMA_QPB*WARP_SIZE); ++p) {
+             const int piece = p*LID_MMA_QPB*WARP_SIZE + tid;
+@@ -674,7 +696,24 @@ static __global__ void lightning_indexer_kernel_mma(
+         }
+         __syncthreads();
+ 
+-        const uint32_t * kt = (const uint32_t *) k_tile[b];
++        if constexpr (KQ8) {
++            // 0161: raw buffer b into the f16 tile k_tile[0], 8 groups of 4 values a thread, dequantized as lightning_indexer_k_to_f16
++            // did; k_tile[0]'s last reader (tile t-1) finished before the barrier closing it
++            constexpr dequantize_V_t dequantize_k = get_dequantize_V<GGML_TYPE_Q8_0, half, 4>();
++            const char * raw = (const char *) k_tile[1] + b*(LID_MMA_KT*LID_Q8_ROW);
++#pragma unroll
++            for (int p = 0; p < (LID_MMA_KT*32)/(LID_MMA_QPB*WARP_SIZE); ++p) {
++                const int g   = p*LID_MMA_QPB*WARP_SIZE + tid;
++                const int row = g / 32;
++                const int i4  = g % 32;
++                __align__(8) half tmp[4];
++                dequantize_k((const void *) (raw + row*LID_Q8_ROW), tmp, i4*4);
++                *(int2 *) &k_tile[0][row*LID_MMA_KSTR + i4*4] = *(const int2 *) tmp;
++            }
++            __syncthreads();
++        }
++
++        const uint32_t * kt = (const uint32_t *) k_tile[KQ8 ? 0 : b];
+         // 0159: a warp with no query has loaded its share of the tile above; with skip_idle it computes nothing
+         if (q_ok || !skip_idle) {
+ #pragma unroll
+@@ -744,7 +783,7 @@ static __global__ void lightning_indexer_kernel_mma(
+         __syncthreads(); // buffer b is reloaded two tiles on
+     }
+ #else
+-    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, skip_idle);
++    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, skip_idle, Kq, nbk3);
+     NO_DEVICE_CODE;
+ #endif // defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+ }
+@@ -821,11 +860,22 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+             nbq0 == sizeof(float) && nbw0 == sizeof(float) && n_kv % 2 == 0 && nbm1 % 4 == 0 && nb1 % 8 == 0 &&
+             (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q4_1 ||
+              k->type == GGML_TYPE_Q5_0 || k->type == GGML_TYPE_Q5_1)) {
+-        ggml_cuda_pool_alloc<half> k16(ctx.pool(), (size_t) n_stream*n_kv*128);
++        // 0161 GGML_CUDA_LID_Q8_FUSED=1: contiguous q8_0 keys dequantized in the kernel's tiles, no f16 copy of every key
++        static const bool lid_q8_env = getenv("GGML_CUDA_LID_Q8_FUSED") != nullptr && atoi(getenv("GGML_CUDA_LID_Q8_FUSED")) != 0;
++        const bool lid_q8_fused = lid_q8_env && k->type == GGML_TYPE_Q8_0 && nbk2 == (size_t) LID_Q8_ROW && nbk3 % 16 == 0 &&
++            ((uintptr_t) k_d) % 16 == 0;
++        if (lid_q8_fused) {
++            static bool logged = false;
++            if (!logged) {
++                logged = true;
++                GGML_LOG_INFO("%s: 0161: q8_0 indexer keys read in the kernel (%d keys)\n", __func__, n_kv);
++            }
++        }
++        ggml_cuda_pool_alloc<half> k16(ctx.pool(), lid_q8_fused ? (size_t) 128 : (size_t) n_stream*n_kv*128);
+         const int64_t n4 = (int64_t) n_stream*n_kv*32;
+         const int nthr = 256;
+         const dim3 grid_k((unsigned) ((n4 + nthr - 1)/nthr), 1, 1);
+-        switch (k->type) {
++        if (!lid_q8_fused) switch (k->type) {
+             case GGML_TYPE_F16:  lightning_indexer_k_to_f16<GGML_TYPE_F16 ><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
+             case GGML_TYPE_Q8_0: lightning_indexer_k_to_f16<GGML_TYPE_Q8_0><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
+             case GGML_TYPE_Q4_0: lightning_indexer_k_to_f16<GGML_TYPE_Q4_0><<<grid_k, nthr, 0, ctx.stream()>>>(k_d, k16.get(), n_kv, n_stream, nbk2, nbk3); break;
+@@ -838,12 +888,20 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+         const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + LID_MMA_KPB - 1)/LID_MMA_KPB), (unsigned) n_stream);
+         // 0159 GGML_CUDA_LID_SKIP_IDLE=1: the warps past the batch compute nothing
+         static const bool lid_skip_idle = getenv("GGML_CUDA_LID_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_LID_SKIP_IDLE")) != 0;
+-        if (lid_mma_mode == 2) {
++        if (lid_q8_fused) {
++            if (lid_mma_mode == 2) {
++                lightning_indexer_kernel_mma<true, true><<<grid, block, 0, ctx.stream()>>>(q_d, nullptr, w_d, m_d, dst_d, n_batch, n_kv,
++                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3);
++            } else {
++                lightning_indexer_kernel_mma<false, true><<<grid, block, 0, ctx.stream()>>>(q_d, nullptr, w_d, m_d, dst_d, n_batch, n_kv,
++                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3);
++            }
++        } else if (lid_mma_mode == 2) {
+             lightning_indexer_kernel_mma<true><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0);
+         } else {
+             lightning_indexer_kernel_mma<false><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0);
+         }
+         return;
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 12b9577ea..face34ad8 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12900,6 +12900,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         return test_cases;
+     }
+ 
++    if (getenv("LLAMA_TEST_LID_DEC") != nullptr) {
++        // 0161: the lightning indexer at decode verify shapes (3 queries), q8_0 keys as the cache holds them
++        for (int kv : { 65536, 131072, 229376, 524288 }) {
++            test_cases.emplace_back(new test_lightning_indexer(128, 32, kv, 3, 1, 1, GGML_TYPE_Q8_0));
++        }
++        return test_cases;
++    }
++
+     if (getenv("LLAMA_TEST_LID_PP") != nullptr) {
+         // 0096: the lightning indexer at one card's prompt shapes, 32 heads x 128
+         for (ggml_type type_K : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+-- 
+2.43.0
+

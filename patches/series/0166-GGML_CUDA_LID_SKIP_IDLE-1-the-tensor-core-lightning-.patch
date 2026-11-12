@@ -1,0 +1,66 @@
+From 2c9ef7d82c9b256a18afc28031f18083f06feba1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:30:57 -0600
+Subject: [PATCH 166/211] GGML_CUDA_LID_SKIP_IDLE=1: the tensor-core lightning
+ indexer warps past the batch load their tile share and compute nothing (5 of
+ 8 at a verify step)
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index fe3ee1379..413cb21cf 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -602,7 +602,7 @@ static __global__ void lightning_indexer_kernel_mma(
+         const size_t nb1, const size_t nb3,
+         const size_t nbq1, const size_t nbq2, const size_t nbq3,
+         const size_t nbw1, const size_t nbw3,
+-        const size_t nbm1, const size_t nbm3, const int64_t nem3) {
++        const size_t nbm1, const size_t nbm3, const int64_t nem3, const bool skip_idle) {
+ #if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+     __shared__ __align__(16) half k_tile[2][LID_MMA_KT*LID_MMA_KSTR];
+ 
+@@ -675,6 +675,8 @@ static __global__ void lightning_indexer_kernel_mma(
+         __syncthreads();
+ 
+         const uint32_t * kt = (const uint32_t *) k_tile[b];
++        // 0159: a warp with no query has loaded its share of the tile above; with skip_idle it computes nothing
++        if (q_ok || !skip_idle) {
+ #pragma unroll
+         for (int ht = 0; ht < 2; ++ht) { // two passes of 32 keys: 4 n-tiles of 8
+             float c[2][4][4] = {};
+@@ -738,10 +740,11 @@ static __global__ void lightning_indexer_kernel_mma(
+                 }
+             }
+         }
++        } // 0159
+         __syncthreads(); // buffer b is reloaded two tiles on
+     }
+ #else
+-    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, skip_idle);
+     NO_DEVICE_CODE;
+ #endif // defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+ }
+@@ -833,12 +836,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+         }
+         const dim3 block(WARP_SIZE, LID_MMA_QPB, 1);
+         const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + LID_MMA_KPB - 1)/LID_MMA_KPB), (unsigned) n_stream);
++        // 0159 GGML_CUDA_LID_SKIP_IDLE=1: the warps past the batch compute nothing
++        static const bool lid_skip_idle = getenv("GGML_CUDA_LID_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_LID_SKIP_IDLE")) != 0;
+         if (lid_mma_mode == 2) {
+             lightning_indexer_kernel_mma<true><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle);
+         } else {
+             lightning_indexer_kernel_mma<false><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle);
+         }
+         return;
+     }
+-- 
+2.43.0
+

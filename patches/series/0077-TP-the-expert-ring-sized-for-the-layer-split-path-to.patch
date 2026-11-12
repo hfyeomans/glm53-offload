@@ -1,7 +1,7 @@
 From 88489caed60c8d075e68501bd98ff396f087156a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 07:37:29 -0600
-Subject: [PATCH 077/141] TP: the expert ring sized for the layer-split path
+Subject: [PATCH 077/211] TP: the expert ring sized for the layer-split path
  too (no growth sync later); host-memory weight copies through a second upload
  ring per card (LLAMA_TP_WEIGHT_RING=0 off)
 

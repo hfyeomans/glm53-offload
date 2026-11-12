@@ -1,7 +1,7 @@
 From d4d09f42bfe3611c58ad550554feddb0eb1aa52b Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 09:55:00 -0600
-Subject: [PATCH 023/141] moe cache: LLAMA_MOE_DEFERRED_PLAN=1 runs the
+Subject: [PATCH 023/211] moe cache: LLAMA_MOE_DEFERRED_PLAN=1 runs the
  small-batch slot lookup on the map as it is and plans behind an event when
  the CPU part asks for its inputs; every miss is computed on the CPU this
  token, the usual uploaded share enters the cache for the next

@@ -1,7 +1,7 @@
 From 2ab09ed19d7f83240acd590713bd63fe33d33ab9 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 14:44:39 -0600
-Subject: [PATCH 119/141] layer-major prompt graph: never the
+Subject: [PATCH 119/211] layer-major prompt graph: never the
  LLAMA_MOE_PROMPT_CPU expert split (its FFN blocks shared one layer plan made
  for another block tokens: wrong outputs on one card); it uploads the whole
  layer anyway

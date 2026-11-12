@@ -1,0 +1,684 @@
+From 91962f0f47659769998a1856291c8b513a54254f Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:47:19 -0600
+Subject: [PATCH 172/211] 0165: LLAMA_TP_DECODE=1 part 1 -- weight copies and
+ halves on the non-home card, the latent KV replica and its sync after
+ home-only graphs, the route bias twin, the pair all-reduce set up
+
+---
+ src/llama-context.cpp      |  15 ++++
+ src/llama-cparams.h        |   1 +
+ src/llama-graph.cpp        |   1 +
+ src/llama-graph.h          |   2 +
+ src/llama-kv-cache-dsa.cpp |  11 +++
+ src/llama-kv-cache-dsa.h   |   3 +
+ src/llama-kv-cache.cpp     | 139 +++++++++++++++++++++++++++++++
+ src/llama-kv-cache.h       |  18 ++++
+ src/llama-memory.h         |   3 +
+ src/llama-model.cpp        | 163 +++++++++++++++++++++++++++++++++++++
+ src/llama-model.h          |  10 +++
+ src/llama-moe-cache.cpp    |  49 +++++++++++
+ src/llama-moe-cache.h      |   2 +
+ 13 files changed, 417 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ae79ea5c7..8fd675b08 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -854,6 +854,16 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+ 
+     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+     expert_placeholders.clear();
++
++    // 0165 LLAMA_TP_DECODE=1: the pair all-reduce of the two cards (0164)
++    if (model.td_ready && !cparams.td) {
++        using pair_init_t = bool (*)(ggml_backend_dev_t, ggml_backend_dev_t, size_t);
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.tp_devs[0]);
++        pair_init_t pair_init = reg != nullptr ? (pair_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pair_ar_init") : nullptr;
++        cparams.td = pair_init != nullptr && pair_init(model.tp_devs[0], model.tp_devs[1], (size_t) 1 << 20);
++        LLAMA_LOG_INFO("%s: LLAMA_TP_DECODE: %s\n", __func__, cparams.td ? "the two-card head-split decode is ready" :
++            "the pair all-reduce could not be set up, not used");
++    }
+ #ifdef GGML_USE_CUDA
+     if (llama_moe_ring_only() && moe_cache && twins.empty()) {
+         for (ggml_backend_t b : backend_ptrs) {
+@@ -1907,6 +1917,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    // 0165 LLAMA_TP_DECODE: a graph that wrote only the home KV caches (a prompt) leaves the replicas behind: copy its cells over
++    if (res->td_rep_sync && mctx != nullptr) {
++        mctx->td_rep_sync(sched.get());
++    }
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index e8ae505be..8669020d3 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -51,6 +51,7 @@ struct llama_cparams {
+     bool fused_top_k_mask;   // use fused top-k sparse attention mask
+ 
+     bool tp_batch_single = true; // 0071 LLAMA_TP_PROMPT: the batch being decoded is one ubatch (set by decode())
++    bool td = false;             // 0165 LLAMA_TP_DECODE: the weight copies, the KV replicas and the pair all-reduce are ready
+     // 0108 LLAMA_LAYER_MAJOR: the rows of an attention block when the batch being decoded runs the layer-major prompt graph (0 = the
+     // usual graph; set by decode() and sched_reserve()); lm_reserve: a reserve graph, every block sized for the whole cache
+     uint32_t lm_rows    = 0;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 108b5793c..b8af78919 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1409,6 +1409,7 @@ int64_t llm_graph_result::get_max_nodes() const {
+ }
+ 
+ void llm_graph_result::reset() {
++    td_rep_sync   = false; // 0165
+     t_inp_tokens  = nullptr;
+     t_inp_embd    = nullptr;
+     t_logits      = nullptr;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index f0974cf23..6a45209aa 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -961,6 +961,8 @@ public:
+     ggml_tensor * t_embd_pooled = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+ 
++    bool td_rep_sync = false; // 0165 LLAMA_TP_DECODE: the graph wrote only the home KV caches; the replicas copy its cells after it
++
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+     std::vector<ggml_tensor *> t_sampled;
+diff --git a/src/llama-kv-cache-dsa.cpp b/src/llama-kv-cache-dsa.cpp
+index b4e95d270..dc25bdc74 100644
+--- a/src/llama-kv-cache-dsa.cpp
++++ b/src/llama-kv-cache-dsa.cpp
+@@ -36,6 +36,11 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
+             v_trans, offload, unified, kv_size, n_seq_max,
+             n_swa, swa_type, nullptr, filter_mla, reuse, nullptr);
+ 
++    // 0165 LLAMA_TP_DECODE=1: the latent KV of each trunk layer on its other card too
++    if (!no_alloc && model.td_ready) {
++        kv_mla->td_rep_alloc();
++    }
++
+     // we use llama_kv_cache for caching indexer keys
+     // by hand-tweaking some hparams we fool it to create
+     // indexer key cache tensors with correct dimensions
+@@ -274,6 +279,12 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
+ }
+ 
+ // 0108 LLAMA_LAYER_MAJOR
++void llama_kv_cache_dsa_context::td_rep_sync(ggml_backend_sched_t sched) const {
++    if (status == LLAMA_MEMORY_STATUS_SUCCESS) {
++        get_mla()->td_rep_sync(sched);
++    }
++}
++
+ bool llama_kv_cache_dsa_context::lm_positional() const {
+     return status == LLAMA_MEMORY_STATUS_SUCCESS && get_mla()->lm_positional() && get_lid()->lm_positional();
+ }
+diff --git a/src/llama-kv-cache-dsa.h b/src/llama-kv-cache-dsa.h
+index 2c05a858c..4dac3dcfd 100644
+--- a/src/llama-kv-cache-dsa.h
++++ b/src/llama-kv-cache-dsa.h
+@@ -127,6 +127,9 @@ public:
+     // 0108 LLAMA_LAYER_MAJOR: both caches (llama_memory_context_i)
+     bool lm_positional() const override;
+ 
++    // 0165 LLAMA_TP_DECODE: the MLA cache's replica (the indexer cache has none)
++    void td_rep_sync(ggml_backend_sched_t sched) const override;
++
+ private:
+     //llama_kv_cache_dsa * kv;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 83b79b9ad..f3804887b 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1559,6 +1559,127 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+ }
+ 
++// 0165 LLAMA_TP_DECODE=1: the K replica of each trunk layer on the layer's other card
++void llama_kv_cache::td_rep_alloc() {
++    if (!model.td_ready || model.tp_devs.size() != 2 || n_stream != 1) {
++        return;
++    }
++    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctxs;
++    for (auto & l : layers) {
++        if (l.il >= hparams.n_layer() || l.k == nullptr || l.k->buffer == nullptr || ggml_backend_buffer_is_host(l.k->buffer)) {
++            continue;
++        }
++        const int home = model.tp_home((int) l.il);
++        if (home < 0) {
++            continue;
++        }
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model.tp_devs[1 - home]);
++        auto & ctx = ctxs[buft];
++        if (!ctx) {
++            ggml_init_params params = { ggml_tensor_overhead()*(layers.size() + 1), nullptr, true };
++            ctx.reset(ggml_init(params));
++        }
++        l.k_rep = ggml_dup_tensor(ctx.get(), l.k);
++        ggml_format_name(l.k_rep, "cache_k_rep_l%d", (int) l.il);
++    }
++    for (auto & [buft, ctx] : ctxs) {
++        ggml_backend_buffer_t buf = td_rep_bufs.emplace(std::move(ctx), buft, "K replica");
++        if (buf == nullptr) {
++            throw std::runtime_error("LLAMA_TP_DECODE: failed to allocate the K replica");
++        }
++        LLAMA_LOG_INFO("%s: LLAMA_TP_DECODE: K replica on %s, %.1f MiB\n", __func__, ggml_backend_buft_name(buft),
++            ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
++    }
++}
++
++bool llama_kv_cache::has_k_rep(int32_t il) const {
++    const auto it = map_layer_ids.find(il);
++    return it != map_layer_ids.end() && layers[it->second].k_rep != nullptr;
++}
++
++ggml_tensor * llama_kv_cache::get_k_rep(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
++    const int32_t ikv = map_layer_ids.at(il);
++
++    auto * k = layers[ikv].k_rep;
++    GGML_ASSERT(k != nullptr);
++
++    const uint64_t kv_size      = get_size();
++    const uint64_t n_embd_k_gqa = k->ne[0];
++
++    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
++
++    return ggml_view_4d(ctx, k,
++            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
++            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
++            ggml_row_size(k->type, n_embd_k_gqa),
++            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
++            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
++}
++
++ggml_tensor * llama_kv_cache::cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
++    GGML_UNUSED(sinfo);
++
++    const int32_t ikv = map_layer_ids.at(il);
++
++    ggml_tensor * k = layers[ikv].k_rep;
++    GGML_ASSERT(k != nullptr && k->ne[2] == 1);
++
++    const int64_t n_embd_gqa = k_cur->ne[0]*k_cur->ne[1];
++    GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
++
++    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, k_cur->ne[2], k_cur->nb[2], 0);
++
++    return ggml_set_rows(ctx, k, k_cur, k_idxs);
++}
++
++void llama_kv_cache::td_rep_sync(ggml_backend_sched_t sched, const slot_info & sinfo) const {
++    if (td_rep_bufs.empty() || sinfo.empty() || sinfo.idxs.size() != 1 || sinfo.idxs[0].empty()) {
++        return;
++    }
++    std::vector<uint32_t> idx = sinfo.idxs[0];
++    std::sort(idx.begin(), idx.end());
++    idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
++    std::vector<std::pair<uint32_t, uint32_t>> runs; // [first, end)
++    for (uint32_t c : idx) {
++        if (!runs.empty() && runs.back().second == c) {
++            runs.back().second = c + 1;
++        } else {
++            runs.emplace_back(c, c + 1);
++        }
++    }
++    auto backend_of = [&](const ggml_backend_buffer_t buf) -> ggml_backend_t {
++        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
++            if (ggml_backend_get_device(b) == dev) {
++                return b;
++            }
++        }
++        return nullptr;
++    };
++    size_t n_views = 0;
++    for (const auto & l : layers) {
++        n_views += l.k_rep != nullptr ? 2*runs.size() : 0;
++    }
++    ggml_init_params params = { ggml_tensor_overhead()*(n_views + 1), nullptr, true };
++    ggml_context_ptr tctx { ggml_init(params) };
++    for (const auto & l : layers) {
++        if (l.k_rep == nullptr) {
++            continue;
++        }
++        ggml_backend_t bs = backend_of(l.k->buffer);
++        ggml_backend_t bd = backend_of(l.k_rep->buffer);
++        GGML_ASSERT(bs != nullptr && bd != nullptr);
++        for (const auto & r : runs) {
++            const int64_t ne = (int64_t) (r.second - r.first)*l.k->ne[0];
++            ggml_tensor * vs = ggml_view_1d(tctx.get(), l.k,     ne, (size_t) r.first*l.k->nb[1]);
++            ggml_tensor * vd = ggml_view_1d(tctx.get(), l.k_rep, ne, (size_t) r.first*l.k_rep->nb[1]);
++            GGML_ASSERT(ggml_backend_view_init(vs) == GGML_STATUS_SUCCESS && ggml_backend_view_init(vd) == GGML_STATUS_SUCCESS);
++            ggml_backend_tensor_copy_async(bs, bd, vs, vd);
++        }
++    }
++}
++
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+     GGML_UNUSED(sinfo);
+ 
+@@ -3143,6 +3264,24 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
+     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+ }
+ 
++bool llama_kv_cache_context::has_k_rep(int32_t il) const {
++    return kv->has_k_rep(il);
++}
++
++ggml_tensor * llama_kv_cache_context::get_k_rep(ggml_context * ctx, int32_t il) const {
++    return kv->get_k_rep(ctx, il, n_kv, sinfos[i_cur]);
++}
++
++ggml_tensor * llama_kv_cache_context::cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
++    return kv->cpy_k_rep(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
++}
++
++void llama_kv_cache_context::td_rep_sync(ggml_backend_sched_t sched) const {
++    if (status == LLAMA_MEMORY_STATUS_SUCCESS && !sinfos.empty()) {
++        kv->td_rep_sync(sched, sinfos[i_cur]);
++    }
++}
++
+ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 00d879d58..dcc26f6d9 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -214,6 +214,14 @@ public:
+ 
+     // store k_cur and v_cur in the cache based on the provided head location
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
++
++    // 0165 LLAMA_TP_DECODE: a replica of each trunk layer's K on the layer's other card (td_rep_alloc), its view and write as get_k /
++    // cpy_k, and the copy of the cells a ubatch wrote from the home cache (td_rep_sync, on the home card's stream)
++    void td_rep_alloc();
++    bool has_k_rep(int32_t il) const;
++    ggml_tensor * get_k_rep(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
++    ggml_tensor * cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
++    void td_rep_sync(ggml_backend_sched_t sched, const slot_info & sinfo) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+ 
+     //
+@@ -283,6 +291,8 @@ private:
+ 
+         ggml_tensor * k_rot = nullptr;
+         ggml_tensor * v_rot = nullptr;
++
++        ggml_tensor * k_rep = nullptr; // 0165 LLAMA_TP_DECODE: the copy of k on the layer's other card
+     };
+ 
+     bool v_trans = true;  // the value tensor is transposed
+@@ -345,6 +355,8 @@ private:
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
++    llama_memory_bufs td_rep_bufs { false }; // 0165
++
+     size_t total_size() const;
+ 
+     size_t size_k_bytes() const;
+@@ -442,6 +454,12 @@ public:
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+ 
++    // 0165 LLAMA_TP_DECODE: the K replica on the layer's other card (see llama_kv_cache::td_rep_alloc)
++    bool has_k_rep(int32_t il) const;
++    ggml_tensor * get_k_rep(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * cpy_k_rep(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
++    void td_rep_sync(ggml_backend_sched_t sched) const override;
++
+     // create destination indices for each head of the current batch for where it would be written in the KV cache
+     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
+     //   helps understand the implementation logic of cpy_k and cpy_v
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 7b3a02025..8a0b38887 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -99,6 +99,9 @@ struct llama_memory_context_i {
+     // 0108 LLAMA_LAYER_MAJOR: every ubatch of the batch is one sequence whose tokens sit at the cells of their positions, above cells that
+     // hold the same sequence at their own positions (the layer-major graph's masks assume it)
+     virtual bool lm_positional() const { return false; }
++
++    // 0165 LLAMA_TP_DECODE: copy the cells the current ubatch wrote into the KV replicas (after a graph that wrote only the home caches)
++    virtual void td_rep_sync(ggml_backend_sched_t sched) const { GGML_UNUSED(sched); }
+ };
+ 
+ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 313dbfcfb..f46ab3897 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2075,6 +2075,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     load_tensors_hadamard();
+     load_tensors_tp_shadow();
+     load_tensors_mtp_head();
++    load_tensors_td();
+ 
+     return true;
+ }
+@@ -2226,6 +2227,143 @@ void llama_model_base::load_tensors_mtp_head() {
+     pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+ }
+ 
++// LLAMA_TP_DECODE=1 (0165): the two-card head-split decode's weights on each layer's non-home card (docs/20261107-two-card-tp-decode-design.md)
++void llama_model_base::load_tensors_td() {
++    const char * env = getenv("LLAMA_TP_DECODE");
++    if (env == nullptr || atoi(env) == 0) {
++        return;
++    }
++    if (tp_devs.empty()) {
++        std::vector<ggml_backend_dev_t> devs;
++        for (int il = 0; il < (int) hparams.n_layer(); ++il) {
++            ggml_backend_dev_t d = dev_layer(il);
++            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU && std::find(devs.begin(), devs.end(), d) == devs.end()) {
++                devs.push_back(d);
++            }
++        }
++        if (devs.size() == 2) {
++            tp_devs = devs;
++        }
++    }
++    if (tp_devs.size() != 2) {
++        LLAMA_LOG_WARN("%s: LLAMA_TP_DECODE needs the layers on exactly two GPUs, not used\n", __func__);
++        return;
++    }
++    struct item { ggml_tensor * w; int kind; int c; }; // kind -1: a full copy; 0 rows, 1 heads, 2 columns: the half of card c
++    std::vector<item> items;
++    bool ok = true;
++    for (int il = 0; il < (int) hparams.n_layer() && ok; ++il) {
++        const int o = 1 - tp_home(il);
++        const auto & L = layers[il];
++        auto add = [&](ggml_tensor * w, int kind) {
++            if (w == nullptr) {
++                return;
++            }
++            if (w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer) || !ggml_is_contiguous(w)) {
++                LLAMA_LOG_WARN("%s: LLAMA_TP_DECODE: %s is not a contiguous GPU weight, not used\n", __func__, ggml_get_name(w));
++                ok = false;
++                return;
++            }
++            const bool fits = kind < 0 || (kind == 0 && w->ne[1] % 2 == 0 && w->ne[2] == 1 && w->ne[3] == 1) ||
++                (kind == 1 && w->ne[2] % 2 == 0 && w->ne[3] == 1) ||
++                (kind == 2 && (w->ne[0]/2) % ggml_blck_size(w->type) == 0 && w->ne[0] % 2 == 0 && w->ne[2] == 1 && w->ne[3] == 1);
++            if (!fits) {
++                LLAMA_LOG_WARN("%s: LLAMA_TP_DECODE: %s does not split in halves, not used\n", __func__, ggml_get_name(w));
++                ok = false;
++                return;
++            }
++            items.push_back({ w, kind, o });
++        };
++        for (ggml_tensor * w : { L.attn_norm, L.wq_a, L.attn_q_a_norm, L.wkv_a_mqa, L.attn_kv_a_norm, L.ffn_norm, L.ffn_gate_inp, L.ffn_exp_probs_b }) {
++            add(w, -1);
++        }
++        add(L.wq_b, 0);
++        add(L.wk_b, 1);
++        add(L.wv_b, 1);
++        add(L.wo,   2);
++        if ((uint32_t) il < hparams.n_layer_dense_lead) {
++            add(L.ffn_gate, 0);
++            add(L.ffn_up,   0);
++            add(L.ffn_down, 2);
++        }
++    }
++    if (!ok || items.empty()) {
++        return;
++    }
++    ggml_context_ptr ctx[2];
++    size_t bytes[2] = { 0, 0 };
++    for (int c = 0; c < 2; ++c) {
++        ggml_init_params params = { ggml_tensor_overhead()*(items.size() + 1), NULL, true };
++        ctx[c].reset(ggml_init(params));
++        if (!ctx[c]) {
++            throw std::runtime_error("LLAMA_TP_DECODE: failed to create the context of the weight copies");
++        }
++    }
++    std::vector<ggml_tensor *> copies(items.size());
++    for (size_t i = 0; i < items.size(); ++i) {
++        const item & it = items[i];
++        int64_t ne[4] = { it.w->ne[0], it.w->ne[1], it.w->ne[2], it.w->ne[3] };
++        if (it.kind >= 0) {
++            ne[it.kind == 0 ? 1 : it.kind == 1 ? 2 : 0] /= 2;
++        }
++        copies[i] = ggml_new_tensor(ctx[it.c].get(), it.w->type, GGML_MAX_DIMS, ne);
++        ggml_format_name(copies[i], "%s.%s", it.kind < 0 ? "td" : "tdh", ggml_get_name(it.w));
++        bytes[it.c] += ggml_nbytes(copies[i]);
++    }
++    std::vector<ggml_backend_buffer_ptr> bufs(2);
++    for (int c = 0; c < 2; ++c) {
++        if (bytes[c] == 0) {
++            continue;
++        }
++        bufs[c].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx[c].get(), ggml_backend_dev_buffer_type(tp_devs[c])));
++        if (!bufs[c]) {
++            throw std::runtime_error(format("LLAMA_TP_DECODE: unable to allocate %.1f MiB of weight copies on %s",
++                bytes[c]/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c])));
++        }
++        ggml_backend_buffer_set_usage(bufs[c].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    }
++    std::vector<uint8_t> src;
++    std::vector<uint8_t> dst;
++    for (size_t i = 0; i < items.size(); ++i) {
++        const item & it = items[i];
++        ggml_tensor * w = it.w;
++        ggml_tensor * t = copies[i];
++        src.resize(ggml_nbytes(w));
++        ggml_backend_tensor_get(w, src.data(), 0, src.size());
++        const uint8_t * p = src.data();
++        if (it.kind < 0) {
++            ggml_backend_tensor_set(t, p, 0, ggml_nbytes(t));
++            td_rep[w] = t;
++            continue;
++        }
++        if (it.kind == 0) {
++            p += (size_t) it.c*(w->ne[1]/2)*w->nb[1];
++            ggml_backend_tensor_set(t, p, 0, ggml_nbytes(t));
++        } else if (it.kind == 1) {
++            p += (size_t) it.c*(w->ne[2]/2)*w->nb[2];
++            ggml_backend_tensor_set(t, p, 0, ggml_nbytes(t));
++        } else {
++            const size_t rs = ggml_row_size(w->type, w->ne[0]/2);
++            dst.resize(rs*w->ne[1]);
++            for (int64_t r = 0; r < w->ne[1]; ++r) {
++                memcpy(dst.data() + r*rs, p + r*w->nb[1] + it.c*rs, rs);
++            }
++            ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
++        }
++        td_half[w] = t;
++    }
++    for (int c = 0; c < 2; ++c) {
++        if (!bufs[c]) {
++            continue;
++        }
++        LLAMA_LOG_INFO("%s: LLAMA_TP_DECODE: %.1f MiB of weight copies on %s\n", __func__, bytes[c]/1024.0/1024.0, ggml_backend_dev_name(tp_devs[c]));
++        std::vector<ggml_backend_buffer_ptr> buffers;
++        buffers.emplace_back(std::move(bufs[c]));
++        pimpl->ctxs_bufs.emplace_back(std::move(ctx[c]), std::move(buffers));
++    }
++    td_ready = true;
++}
++
+ ggml_tensor * llama_model::tp_w(ggml_tensor * w, int c) const {
+     if (w == nullptr || tp_devs.size() != 2 || w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer)) {
+         return w;
+@@ -2245,6 +2383,31 @@ int llama_model::tp_home(int il) const {
+     return dev_layer(il) == tp_devs[0] ? 0 : 1;
+ }
+ 
++ggml_tensor * llama_model::td_w(ggml_tensor * w, int c) const {
++    if (w == nullptr || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer)) == tp_devs[c]) {
++        return w;
++    }
++    auto it = td_rep.find(w);
++    GGML_ASSERT(it != td_rep.end() && "LLAMA_TP_DECODE: a replicated weight without a copy on the other card");
++    return it->second;
++}
++
++ggml_tensor * llama_model::td_h(ggml_context * ctx, ggml_tensor * w, int c, int kind) const {
++    if (w == nullptr) {
++        return nullptr;
++    }
++    if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer)) != tp_devs[c]) {
++        auto it = td_half.find(w);
++        GGML_ASSERT(it != td_half.end() && "LLAMA_TP_DECODE: a split weight without its half on the other card");
++        return it->second;
++    }
++    switch (kind) {
++        case 0:  return ggml_view_2d(ctx, w, w->ne[0], w->ne[1]/2, w->nb[1], (size_t) c*(w->ne[1]/2)*w->nb[1]);
++        case 1:  return ggml_view_3d(ctx, w, w->ne[0], w->ne[1], w->ne[2]/2, w->nb[1], w->nb[2], (size_t) c*(w->ne[2]/2)*w->nb[2]);
++        default: return ggml_view_2d(ctx, w, w->ne[0]/2, w->ne[1], w->nb[1], (size_t) c*ggml_row_size(w->type, w->ne[0]/2));
++    }
++}
++
+ // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+     uint32_t hadamard_version = 0;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 5903539bd..251533a0e 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -894,6 +894,15 @@ struct llama_model {
+     ggml_tensor * tp_w(ggml_tensor * w, int c) const;
+     // the card a layer's weights live on (0 or 1), -1 without the copies
+     int tp_home(int il) const;
++    // LLAMA_TP_DECODE (0165): the two-card head-split decode's weights on each layer's non-home card: full copies (td_rep) and the
++    // non-home card's half of the split tensors (td_half); td_ready when they were made
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> td_rep;
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> td_half;
++    bool td_ready = false;
++    // w as card c holds it: w on its home card, else its copy
++    ggml_tensor * td_w(ggml_tensor * w, int c) const;
++    // card c's half of w (kind 0: rows, ne1; 1: heads, ne2; 2: input columns, ne0): a view on w's home card, else the copy
++    ggml_tensor * td_h(ggml_context * ctx, ggml_tensor * w, int c, int kind) const;
+ 
+     // for keeping track of associated LoRA adapters
+     std::unordered_set<llama_adapter_lora *> loras;
+@@ -1018,6 +1027,7 @@ struct llama_model_base : public llama_model {
+     void load_tensors_hadamard();
+     void load_tensors_tp_shadow(); // LLAMA_TP_PROMPT (0059)
+     void load_tensors_mtp_head();  // LLAMA_MTP_HEAD_IDS (0155)
++    void load_tensors_td();        // LLAMA_TP_DECODE (0165)
+ 
+     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
+     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ffc2cc0d9..1027821dd 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -434,6 +434,7 @@ struct llama_moe_cache::impl {
+         uint32_t cpu_acc_xd = 0;
+         std::vector<int32_t> staged;            // 0150: this layer's experts in staging slots for its next lookup
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
++        ggml_tensor * route_bias_td = nullptr; // 0165 LLAMA_TP_DECODE: its twin on the layer's other device (ig_xd), the same values
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
+         std::vector<float> route_epb;       // the layer's exp_probs_b, folded into the route bias (empty: not folded)
+@@ -563,6 +564,8 @@ struct llama_moe_cache::impl {
+     }
+     std::vector<ggml_context_ptr>        rb_ctx; // per device
+     std::vector<ggml_backend_buffer_ptr> rb_buf;
++    std::vector<ggml_context_ptr>        rb_td_ctx; // 0165: the twins, per device
++    std::vector<ggml_backend_buffer_ptr> rb_td_buf;
+     size_t win_async = 0; // misses computed on the CPU and filled on the side stream, in the window
+ 
+     // LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, read with the ids; the uncached ones are uploaded on the side stream
+@@ -1653,6 +1656,39 @@ struct llama_moe_cache::impl {
+                     ggml_backend_tensor_set(l.route_bias, l.route_epb.data(), 0, ggml_nbytes(l.route_bias));
+                 }
+             }
++            // 0165 LLAMA_TP_DECODE=1: a twin of each layer's route bias on the layer's other device, read by the router run there
++            static const bool td_env = getenv("LLAMA_TP_DECODE") != nullptr && atoi(getenv("LLAMA_TP_DECODE")) != 0;
++            if (td_env) {
++                rb_td_ctx.resize(devices.size());
++                rb_td_buf.resize(devices.size());
++                for (size_t id = 0; id < devices.size(); ++id) {
++                    size_t n = 0;
++                    for (const layer & l : layers) {
++                        n += l.route_bias != nullptr && l.ig_xd >= 0 && groups[l.ig_xd].id == (int32_t) id ? 1 : 0;
++                    }
++                    if (n == 0) {
++                        continue;
++                    }
++                    ggml_init_params ip = { ggml_tensor_overhead()*n, nullptr, true };
++                    rb_td_ctx[id].reset(ggml_init(ip));
++                    for (size_t il = 0; il < layers.size(); ++il) {
++                        layer & l = layers[il];
++                        if (l.route_bias == nullptr || l.ig_xd < 0 || groups[l.ig_xd].id != (int32_t) id) {
++                            continue;
++                        }
++                        l.route_bias_td = ggml_new_tensor_1d(rb_td_ctx[id].get(), GGML_TYPE_F32, n_exp);
++                        ggml_format_name(l.route_bias_td, "moe_cache.route_bias_td-%d", (int) il);
++                    }
++                    rb_td_buf[id].reset(ggml_backend_alloc_ctx_tensors_from_buft(rb_td_ctx[id].get(), devices[id].buft));
++                    GGML_ASSERT(rb_td_buf[id]);
++                    ggml_backend_buffer_set_usage(rb_td_buf[id].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                    for (const layer & l : layers) {
++                        if (l.route_bias_td != nullptr && groups[l.ig_xd].id == (int32_t) id) {
++                            ggml_backend_tensor_set(l.route_bias_td, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias_td));
++                        }
++                    }
++                }
++            }
+             LLAMA_LOG_INFO("llama_moe_cache: cache-aware routing, selection bias %.4f for the cached experts\n", (double) route_bias_value());
+         }
+         if (async_fill_enabled()) {
+@@ -2232,6 +2268,9 @@ struct llama_moe_cache::impl {
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+                 stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
++                if (l.route_bias_td != nullptr) {
++                    stage_set(devices[groups[l.ig_xd].id].backend, l.route_bias_td, l.route_bias_host.data(), ggml_nbytes(l.route_bias_td)); // 0165
++                }
+                 l.route_bias_last = l.route_bias_host;
+             }
+         }
+@@ -3246,6 +3285,9 @@ struct llama_moe_cache::impl {
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+                 stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
++                if (l.route_bias_td != nullptr) {
++                    stage_set(devices[groups[l.ig_xd].id].backend, l.route_bias_td, l.route_bias_host.data(), ggml_nbytes(l.route_bias_td)); // 0165
++                }
+                 l.route_bias_last = l.route_bias_host;
+             }
+         }
+@@ -3505,6 +3547,13 @@ ggml_tensor * llama_moe_cache::get_route_bias(int32_t il, int64_t n_tokens, int6
+     return pimpl->get_slot_map(il, n_tokens, n_expert_used) != nullptr ? pimpl->layers[il].route_bias : nullptr;
+ }
+ 
++ggml_tensor * llama_moe_cache::get_route_bias_td(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++    if (il < 0 || il >= (int32_t) pimpl->layers.size() || pimpl->layers[il].route_bias_td == nullptr) {
++        return nullptr;
++    }
++    return pimpl->get_slot_map(il, n_tokens, n_expert_used) != nullptr ? pimpl->layers[il].route_bias_td : nullptr;
++}
++
+ bool llama_moe_cache::route_bias_folded(int32_t il) const {
+     return il >= 0 && il < (int32_t) pimpl->layers.size() && !pimpl->layers[il].route_epb.empty();
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index afd0fd530..85a5d9a72 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -40,6 +40,8 @@ public:
+     // LLAMA_MOE_ROUTE_BIAS=d: F32 [n_expert] on the layer's device, d for the experts cached in layer il and 0 elsewhere, to add to the
+     // selection scores; nullptr when off or when the cache does not serve batches of n_tokens
+     ggml_tensor * get_route_bias(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
++    // 0165 LLAMA_TP_DECODE: its twin on the layer's other device (nullptr without one)
++    ggml_tensor * get_route_bias_td(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+ 
+     // true when the route bias of layer il already holds the layer's exp_probs_b (it replaces exp_probs_b in the graph, see 0034)
+     bool route_bias_folded(int32_t il) const;
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From e3cc91d09b7914e2b0926740daf48f78606ba1ad Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 10:42:10 -0600
-Subject: [PATCH 107/141] layer-major prompt graph (LLAMA_LAYER_MAJOR=R): a
+Subject: [PATCH 107/211] layer-major prompt graph (LLAMA_LAYER_MAJOR=R): a
  prompt ubatch runs each layer's attention in blocks of R query rows and its
  FFN in blocks of LLAMA_LM_MOE_ROWS rows, so a layer's experts go up once a
  ubatch while the indexer's scores and masks stay [n_kv, R]; the masks are

@@ -1,0 +1,27 @@
+From 5280601f16b852fd28eaee49180bb4ec3f0811e1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 09:35:25 -0600
+Subject: [PATCH 210/211] 0202b: 0202 log strings: an escaped newline, not a
+ raw one
+
+---
+ src/llama-moe-cache.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index beb916573..ee7a5abfa 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -3859,8 +3859,7 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+             }
+             if (!want && !d.head_warned) {
+                 d.head_warned = true;
+-                LLAMA_LOG_WARN("llama_moe_cache: 0202 %s: a graph of %lld tokens needs %.1f MiB, past the head of %.0f MiB: the cache falls to its own slots while such graphs run; raise LLAMA_MOE_CACHE_BORROW_HEAD_MIB
+-",
++                LLAMA_LOG_WARN("llama_moe_cache: 0202 %s: a graph of %lld tokens needs %.1f MiB, past the head of %.0f MiB: the cache falls to its own slots while such graphs run; raise LLAMA_MOE_CACHE_BORROW_HEAD_MIB\n",
+                     ggml_backend_name(d.backend), (long long) n_tokens, peak/1024.0/1024.0, d.borrow_head/1024.0/1024.0);
+             }
+         }
+-- 
+2.43.0
+

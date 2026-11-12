@@ -1,7 +1,7 @@
 From 645cbbaec1c26d0b4e82250b0c4909dc3b373af2 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 01:26:48 -0600
-Subject: [PATCH 104/141] MUL_MAT_ID compacted grid on by default
+Subject: [PATCH 104/211] MUL_MAT_ID compacted grid on by default
  (GGML_CUDA_MMQ_MMID_COMPACT=0 turns it off): ub 12K 25K / 50K +5 %, ub 8K
  +2-3 %
 

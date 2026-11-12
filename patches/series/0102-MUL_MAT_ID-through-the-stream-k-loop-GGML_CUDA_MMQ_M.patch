@@ -1,7 +1,7 @@
 From 743a80370e7b222e67497eb7bdb03c59b03f351d Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 22:33:07 -0600
-Subject: [PATCH 102/141] MUL_MAT_ID through the stream-k loop
+Subject: [PATCH 102/211] MUL_MAT_ID through the stream-k loop
  (GGML_CUDA_MMQ_MMID_SK=1): no block launched per empty nominal tile
 
 ---

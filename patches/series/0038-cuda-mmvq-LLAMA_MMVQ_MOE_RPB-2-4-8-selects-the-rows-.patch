@@ -1,7 +1,7 @@
 From 57cc7356fdc51ef4ee04a693ac7b9f900766bf6f Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 15:31:22 -0600
-Subject: [PATCH 038/141] cuda mmvq: LLAMA_MMVQ_MOE_RPB=2|4|8 selects the rows
+Subject: [PATCH 038/211] cuda mmvq: LLAMA_MMVQ_MOE_RPB=2|4|8 selects the rows
  per block of the multi-token MoE matvec kernel at runtime (default 2)
 
 ---

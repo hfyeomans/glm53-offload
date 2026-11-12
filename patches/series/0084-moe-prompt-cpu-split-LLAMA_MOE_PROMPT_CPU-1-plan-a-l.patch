@@ -1,7 +1,7 @@
 From 98e9a273cb0953eb54685930eed3a1dfa663fbda Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 13:45:19 -0600
-Subject: [PATCH 084/141] moe prompt cpu split (LLAMA_MOE_PROMPT_CPU=1): plan a
+Subject: [PATCH 084/211] moe prompt cpu split (LLAMA_MOE_PROMPT_CPU=1): plan a
  large batch per layer from its routing; the CPU computes the uncached experts
  few tokens select, the uploads skip them and the unselected ones
 

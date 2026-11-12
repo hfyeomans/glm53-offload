@@ -1,7 +1,7 @@
 From 0fc31bf1b9977df2edd42b4a642d5f6900dd6d80 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 06:58:07 -0600
-Subject: [PATCH 075/141] mul_mat_id: an id range with the other rows undefined
+Subject: [PATCH 075/211] mul_mat_id: an id range with the other rows undefined
  (no zero fill); the TP expert branch uses it for up and gate
  (LLAMA_TP_MMID_UNDEF=0 restores the fill)
 

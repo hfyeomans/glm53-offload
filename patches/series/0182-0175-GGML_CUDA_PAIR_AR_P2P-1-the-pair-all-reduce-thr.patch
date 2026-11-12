@@ -1,0 +1,154 @@
+From a5d3d90529cc2607b047592756e9a6c0746e896f Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:20:47 -0600
+Subject: [PATCH 182/211] 0175: GGML_CUDA_PAIR_AR_P2P=1 -- the pair all-reduce
+ through the peer memory (one PCIe crossing each way, local polling)
+
+---
+ ggml/src/ggml-cuda/pair-allreduce.cu | 108 ++++++++++++++++++++++++++-
+ 1 file changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/pair-allreduce.cu b/ggml/src/ggml-cuda/pair-allreduce.cu
+index 9a0c15c6c..4d74bbc67 100644
+--- a/ggml/src/ggml-cuda/pair-allreduce.cu
++++ b/ggml/src/ggml-cuda/pair-allreduce.cu
+@@ -23,6 +23,9 @@ struct ggml_cuda_pair_ar {
+     int   * arr[2]  = { nullptr, nullptr };          // rank r's tokens: [PAIR_AR_POOL][PAIR_AR_BLOCKS][PAIR_AR_STRIDE]
+     int   * ctr[2]  = { nullptr, nullptr };          // on device r: { calls, blocks done in the current call }
+     int   * err_host = nullptr;                      // 0170: set by a kernel that gave up waiting (mapped host memory)
++    bool    p2p = false;                             // 0175 GGML_CUDA_PAIR_AR_P2P=1: the exchange through the peer's memory
++    float * recv[2] = { nullptr, nullptr };          // 0175: on device r, the slots the peer writes its partial into
++    int   * tok[2]  = { nullptr, nullptr };          // 0175: on device r, the peer's tokens [PAIR_AR_POOL][PAIR_AR_BLOCKS][PAIR_AR_STRIDE]
+     int   * err_dev  = nullptr;
+     uint64_t timeout_ns = 0;
+ };
+@@ -68,8 +71,34 @@ bool ggml_cuda_pair_ar_init(int dev0, int dev1, size_t max_bytes) {
+         const char * t = getenv("GGML_CUDA_PAIR_AR_TIMEOUT_MS");
+         p.timeout_ns = (uint64_t) (t != nullptr ? atoll(t) : 10000)*1000000ull;
+     }
++    // 0175 GGML_CUDA_PAIR_AR_P2P=1: receive slots and tokens in each device's own memory, written by the peer
++    if (getenv("GGML_CUDA_PAIR_AR_P2P") != nullptr && atoi(getenv("GGML_CUDA_PAIR_AR_P2P")) != 0) {
++        int a01 = 0;
++        int a10 = 0;
++        CUDA_CHECK(cudaDeviceCanAccessPeer(&a01, p.dev[0], p.dev[1]));
++        CUDA_CHECK(cudaDeviceCanAccessPeer(&a10, p.dev[1], p.dev[0]));
++        if (a01 && a10) {
++            const size_t tok_bytes = (size_t) PAIR_AR_POOL*PAIR_AR_BLOCKS*PAIR_AR_STRIDE*sizeof(int);
++            for (int r = 0; r < 2; ++r) {
++                ggml_cuda_set_device(p.dev[r]);
++                const cudaError_t e = cudaDeviceEnablePeerAccess(p.dev[1 - r], 0);
++                if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
++                    CUDA_CHECK(e);
++                }
++                (void) cudaGetLastError();
++                CUDA_CHECK(cudaMalloc((void **) &p.recv[r], (size_t) PAIR_AR_POOL*p.slot_elems*sizeof(float)));
++                CUDA_CHECK(cudaMalloc((void **) &p.tok[r], tok_bytes));
++                CUDA_CHECK(cudaMemset(p.tok[r], 0, tok_bytes));
++                CUDA_CHECK(cudaDeviceSynchronize());
++            }
++            p.p2p = true;
++        } else {
++            GGML_LOG_WARN("%s: 0175: no peer access between CUDA%d and CUDA%d, the exchange stays in host memory\n", __func__, dev0, dev1);
++        }
++    }
+     p.ready = true;
+-    GGML_LOG_INFO("%s: 0164: pair all-reduce between CUDA%d and CUDA%d, up to %zu KiB a call, gives up after %llu ms\n", __func__, dev0, dev1,
++    GGML_LOG_INFO("%s: 0164: pair all-reduce between CUDA%d and CUDA%d%s, up to %zu KiB a call, gives up after %llu ms\n", __func__, dev0, dev1,
++        p.p2p ? " (0175: through the peer's memory)" : "",
+         p.slot_elems*sizeof(float)/1024, (unsigned long long) (p.timeout_ns/1000000ull));
+     return true;
+ }
+@@ -149,6 +178,76 @@ static __global__ void pair_ar_kernel(
+     }
+ }
+ 
++// 0175: the exchange through the peer's memory: my partial and then my token into the peer's slot, the peer's token polled in my memory
++static __global__ void pair_ar_kernel_p2p(
++        const float * __restrict__ src, float * __restrict__ dst, float * __restrict__ peer_recv, const float * __restrict__ my_recv,
++        const int n, int * peer_tok, const int * my_tok, int * ctr, const size_t slot_elems, const bool vec,
++        int * err, const uint64_t timeout_ns) {
++    __shared__ int s_call;
++    if (threadIdx.x == 0) {
++        s_call = *(volatile int *) ctr;
++    }
++    __syncthreads();
++    const int call  = s_call;
++    const int slot  = call % PAIR_AR_POOL;
++    const int token = call + 1;
++
++    float       * pr = peer_recv + (size_t) slot*slot_elems;
++    const float * mr = my_recv   + (size_t) slot*slot_elems;
++
++    const int gt = blockIdx.x*blockDim.x + threadIdx.x;
++    const int gn = gridDim.x*blockDim.x;
++    const int n4 = vec ? n/4 : 0;
++
++    for (int i = gt; i < n4; i += gn) {
++        ((float4 *) pr)[i] = ((const float4 *) src)[i];
++    }
++    for (int i = 4*n4 + gt; i < n; i += gn) {
++        pr[i] = src[i];
++    }
++    __threadfence_system();
++    __syncthreads();
++
++    if (threadIdx.x == 0) {
++        volatile int       * pt = peer_tok + (slot*PAIR_AR_BLOCKS + blockIdx.x)*PAIR_AR_STRIDE;
++        const volatile int * mt = my_tok   + (slot*PAIR_AR_BLOCKS + blockIdx.x)*PAIR_AR_STRIDE;
++        *pt = token;
++        __threadfence_system();
++        uint64_t t0;
++        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
++        while (*mt != token) {
++            uint64_t t1;
++            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
++            if (timeout_ns > 0 && t1 - t0 > timeout_ns) {
++                *(volatile int *) err = 1;
++                __threadfence_system();
++                break;
++            }
++        }
++    }
++    __syncthreads();
++    __threadfence();
++
++    for (int i = gt; i < n4; i += gn) {
++        const float4 a = ((const float4 *) src)[i];
++        const float4 b = __ldcv((const float4 *) mr + i);
++        ((float4 *) dst)[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
++    }
++    for (int i = 4*n4 + gt; i < n; i += gn) {
++        dst[i] = src[i] + __ldcv(mr + i);
++    }
++
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        if (atomicAdd(ctr + 1, 1) == (int) gridDim.x - 1) {
++            ctr[1] = 0;
++            *(volatile int *) ctr = call + 1;
++            __threadfence();
++        }
++    }
++}
++
+ void ggml_cuda_op_pair_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src = dst->src[0];
+     const int rank = ggml_get_op_params_i32(dst, 0);
+@@ -167,6 +266,13 @@ void ggml_cuda_op_pair_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor *
+     }
+ 
+     const bool vec = ((uintptr_t) src->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0;
++    if (p.p2p) {
++        pair_ar_kernel_p2p<<<PAIR_AR_BLOCKS, PAIR_AR_THREADS, 0, ctx.stream()>>>(
++            (const float *) src->data, (float *) dst->data, p.recv[1 - rank], p.recv[rank], (int) n,
++            p.tok[1 - rank], p.tok[rank], p.ctr[rank], p.slot_elems, vec, p.err_dev, p.timeout_ns);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pair_ar_kernel<<<PAIR_AR_BLOCKS, PAIR_AR_THREADS, 0, ctx.stream()>>>(
+         (const float *) src->data, (float *) dst->data, p.host[rank], p.host[1 - rank], (int) n,
+         p.arr[rank], p.arr[1 - rank], p.ctr[rank], p.slot_elems, vec, p.err_dev, p.timeout_ns);
+-- 
+2.43.0
+

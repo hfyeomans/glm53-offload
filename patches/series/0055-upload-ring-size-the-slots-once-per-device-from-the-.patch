@@ -1,7 +1,7 @@
 From 75454c2851ef32a968570fb053b02e744fff1a2c Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 02:53:43 -0600
-Subject: [PATCH 055/141] upload ring: size the slots once per device from the
+Subject: [PATCH 055/211] upload ring: size the slots once per device from the
  largest MoE split it uploads (a growth synchronized the device inside the
  first long prompt)
 

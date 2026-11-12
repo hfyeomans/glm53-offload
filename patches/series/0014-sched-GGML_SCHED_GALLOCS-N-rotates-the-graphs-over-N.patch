@@ -1,7 +1,7 @@
 From a04675c04ba109c87ef1df1aafce4e7b522bbc1a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 15:21:22 -0600
-Subject: [PATCH 014/141] sched: GGML_SCHED_GALLOCS=N rotates the graphs over N
+Subject: [PATCH 014/211] sched: GGML_SCHED_GALLOCS=N rotates the graphs over N
  allocators, so a re-reservation waits only for the graph N steps back (the
  prefill drain)
 

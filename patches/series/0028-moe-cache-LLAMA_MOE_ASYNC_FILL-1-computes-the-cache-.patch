@@ -1,7 +1,7 @@
 From 02661442765b6ed4d52ac47a64606b39a20064f9 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 11:43:59 -0600
-Subject: [PATCH 028/141] moe cache: LLAMA_MOE_ASYNC_FILL=1 computes the cache
+Subject: [PATCH 028/211] moe cache: LLAMA_MOE_ASYNC_FILL=1 computes the cache
  fills of one-token batches on the CPU and uploads them on the side stream;
  LLAMA_MOE_ROUTE_BIAS=d adds d to the selection scores of the cached experts
  (cache-aware routing)

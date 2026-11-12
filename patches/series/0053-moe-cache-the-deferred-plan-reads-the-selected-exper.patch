@@ -1,7 +1,7 @@
 From 498a842bb0f1e82535e40a9e794e1c3187241b17 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 22:43:03 -0600
-Subject: [PATCH 053/141] moe-cache: the deferred plan reads the selected
+Subject: [PATCH 053/211] moe-cache: the deferred plan reads the selected
  experts into pinned memory (a read into pageable memory held the host until
  the router was done); the predictor uses eight accumulators
 

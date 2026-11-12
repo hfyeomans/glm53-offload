@@ -1,7 +1,7 @@
 From f4d0d7c1e53d044df186b5a9dd50f72e5b7c7c36 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 10:46:12 -0600
-Subject: [PATCH 026/141] test-backend-ops: LLAMA_TEST_MMID_BANK=1 runs the
+Subject: [PATCH 026/211] test-backend-ops: LLAMA_TEST_MMID_BANK=1 runs the
  offload cache bank MUL_MAT_ID shapes at decode for the expert formats in
  question
 

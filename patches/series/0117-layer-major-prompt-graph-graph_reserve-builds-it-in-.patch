@@ -1,7 +1,7 @@
 From ece1a2f7786dbdff995091e9136fb83e03646c9d Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 13:38:58 -0600
-Subject: [PATCH 117/141] layer-major prompt graph: graph_reserve builds it in
+Subject: [PATCH 117/211] layer-major prompt graph: graph_reserve builds it in
  reserve mode whenever lm_rows is set, and a run of layer-major ubatches keeps
  the pipeline worst-case plan, so a block views its own keys again (the 512K
  abort: the worst-case re-reserve built it with a batch state on a reserve

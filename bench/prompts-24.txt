@@ -1,0 +1,26 @@
+# prompts-24.txt -- probe.py --prompts-file: 24 distinct decode prompts, one a line (p01 ... p24), each asking for a long answer, so a
+# change that alters the drafts is read over 24 trajectories instead of two.  Lines starting with # are skipped.
+Write a long short story about a cartographer who discovers that one island on her maps moves a little every night. Use dialogue.
+Write an essay of at least 1,200 words on why medieval European cathedrals took generations to build, covering money, labour, engineering and politics.
+Write a complete C++17 implementation of an LRU cache with O(1) get and put, templated on key and value, with a small test in main(). Output only the code.
+Write a Rust program that reads a CSV file of transactions from stdin, groups them by account, and prints each account's balance sorted descending. Include error handling.
+Write a JavaScript (ES2022) module implementing a debounce and a throttle function with leading/trailing options, plus JSDoc comments and usage examples.
+Write SQL for a library database: CREATE TABLE statements for books, authors, members and loans with keys and constraints, then ten example queries with comments explaining each.
+Write a Bash script that backs up a directory to a timestamped tar.gz, keeps the newest seven archives, logs to a file, and exits non-zero on any failure. Explain each section in comments.
+Prove that there are infinitely many prime numbers in three different ways, explaining each proof step by step.
+Explain how a transformer language model works, from tokenization through attention to sampling, for a reader who knows linear algebra but not machine learning.
+Explain the causes and consequences of the 2008 financial crisis in detail, with a timeline of the key events.
+Translate the following into French, German and Spanish, then explain any idioms that do not translate literally: The early bird catches the worm, but the second mouse gets the cheese. Every cloud has a silver lining, and it is raining cats and dogs today.
+Write a detailed recipe for a three-course Italian dinner for six people, with a shopping list, a timeline for the afternoon, and tips for each dish.
+Produce a JSON array of 15 fictional employees, each with id, name, department, title, start_date, salary, manager_id and a list of skills. Output only valid JSON.
+Write a dialogue of at least 40 lines between a ship's captain and a stowaway discovered halfway across the Atlantic in 1850.
+Write a technical design document for a URL shortener service: requirements, API, data model, storage choice, caching, scaling, and failure modes.
+Write pytest unit tests for a function parse_duration(s) that accepts strings like "1h30m", "45s" and "2d" and returns seconds; cover edge cases and invalid input.
+Explain step by step how to solve the system of equations 3x + 2y - z = 1, 2x - 2y + 4z = -2, -x + 0.5y - z = 0, using Gaussian elimination, showing every row operation.
+Write a poem cycle of six poems, each in a different form (sonnet, haiku sequence, villanelle, free verse, limerick, ballad), all about the same old oak tree.
+Summarize the plot, themes and historical background of Shakespeare's Macbeth in detail, act by act.
+Write a Go HTTP server with three endpoints (health, create item, list items) backed by an in-memory store with a mutex, plus graceful shutdown. Output only the code.
+Write a cover letter of about 600 words for a senior site reliability engineer position, then list ten interview questions the candidate should prepare for, with short model answers.
+Explain how public-key cryptography works, including RSA key generation, encryption, signatures and why factoring is hard, with a small worked numeric example.
+Write a long product review comparing three fictional electric bicycles across range, comfort, build quality, price and service, ending with a recommendation for different riders.
+Write a Python class implementing a thread-safe bounded blocking queue with put, get, timeouts and close semantics, followed by a demonstration with producer and consumer threads.

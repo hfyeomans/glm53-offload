@@ -1,7 +1,7 @@
 From 57f969c157e6d4d6f55bdf6c483c2d7dd2639651 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 16:28:32 -0600
-Subject: [PATCH 041/141] moe cache: LLAMA_MOE_EXPAND_BANKS=1 expands the bank
+Subject: [PATCH 041/211] moe cache: LLAMA_MOE_EXPAND_BANKS=1 expands the bank
  views before the expert matmuls so gate, up and the GLU stay adjacent and
  fuse
 

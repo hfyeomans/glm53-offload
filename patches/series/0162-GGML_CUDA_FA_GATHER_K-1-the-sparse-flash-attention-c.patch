@@ -1,0 +1,87 @@
+From cd69083218575e7a9725f655011bff908a44f2b4 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:53:54 -0600
+Subject: [PATCH 162/211] GGML_CUDA_FA_GATHER_K=1: the sparse flash attention
+ converts only the q8_0 K rows its index lists name (and row 0), not the whole
+ K view
+
+---
+ ggml/src/ggml-cuda/fattn-common.cuh | 39 +++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index beb877941..e1e8a0dac 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -978,6 +978,28 @@ static __global__ void flash_attn_combine_results(
+     dst[tid] = VKQ_numerator / VKQ_denominator;
+ }
+ 
++// 0157 GGML_CUDA_FA_GATHER_K=1: the sparse path's K rows converted from q8_0 one row a block (block n_entries is row 0), with
++// dequantize_block_q8_0_f16's half multiply; negative entries are padding
++static __global__ void k_fattn_gather_k_q8_0(const char * __restrict__ K, const size_t nb11, half * __restrict__ K_f16,
++        const int ne0, const int32_t * __restrict__ indices, const int64_t n_entries) {
++    const int32_t row = blockIdx.x == n_entries ? 0 : indices[blockIdx.x];
++    if (row < 0) {
++        return;
++    }
++    const block_q8_0 * x = (const block_q8_0 *) (K + int64_t(row)*nb11);
++    half2 * y2 = (half2 *) (K_f16 + int64_t(row)*ne0);
++    for (int p = threadIdx.x; p < ne0/2; p += blockDim.x) {
++        const block_q8_0 * b = x + (2*p)/QK8_0;
++        const char2 qs = ((const char2 *) b->qs)[((2*p) % QK8_0)/2];
++        y2[p] = __hmul2(make_half2(qs.x, qs.y), __half2half2(b->d));
++    }
++}
++
++static bool ggml_cuda_fa_gather_k() {
++    static const bool v = getenv("GGML_CUDA_FA_GATHER_K") != nullptr && atoi(getenv("GGML_CUDA_FA_GATHER_K")) != 0;
++    return v;
++}
++
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+@@ -1034,6 +1056,14 @@ void launch_fattn(
+     size_t nb22 = V->nb[2];
+     size_t nb23 = V->nb[3];
+ 
++    // 0157: with sparse index lists, only the rows they name are converted, after the lists are built (below)
++    // (decode shapes: only while the lists name fewer rows than the view holds; a prompt's lists name more)
++    const bool gather_k = use_sparse && ggml_cuda_fa_gather_k() && need_f16_K && K->type == GGML_TYPE_Q8_0 &&
++        ggml_is_contiguously_allocated(K) && K->ne[2] == 1 && K->ne[3] == 1 && K->ne[0] % QK8_0 == 0 &&
++        mask != nullptr && mask->ne[3] == 1 &&
++        int64_t((Q->ne[1] + ncols1 - 1)/ncols1) * std::min<int64_t>(K->ne[1], int64_t(ncols1)*ggml_get_op_params_i32(KQV, 4)) < K->ne[1];
++    const char * K_q8   = K_data;
++    const size_t nb11_q8 = nb11;
+     if (need_f16_K && K->type != GGML_TYPE_F16) {
+         const size_t bs = ggml_blck_size(K->type);
+         const size_t ts = ggml_type_size(K->type);
+@@ -1041,8 +1071,10 @@ void launch_fattn(
+         GGML_ASSERT(f16_extra.K != 0);
+         half * K_f16 = (half *) f16_extra.K;
+         if (ggml_is_contiguously_allocated(K)) {
++            if (!gather_k) {
+             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
++            }
+ 
+             nb11 = nb11*bs*sizeof(half)/ts;
+             nb12 = nb12*bs*sizeof(half)/ts;
+@@ -1115,6 +1147,13 @@ void launch_fattn(
+ 
+         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
++        if (gather_k) {
++            // 0157: the rows the lists name, and row 0
++            const int64_t n_entries = int64_t(n_kv_max)*int64_t(n_lists);
++            k_fattn_gather_k_q8_0<<<dim3(unsigned(n_entries + 1)), dim3(64), 0, main_stream>>>(
++                K_q8, nb11_q8, (half *) K_data, int(K->ne[0]), KV_max.ptr, n_entries);
++            CUDA_CHECK(cudaGetLastError());
++        }
+     }
+ 
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+-- 
+2.43.0
+

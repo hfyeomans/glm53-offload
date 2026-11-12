@@ -62,7 +62,7 @@ def chat(base, model, messages, max_tokens, think):
     dec = (ct - 1) / (last - first) if (first and last and last > first and ct > 1) else None
     return {"ttft_s": (first - t0) if first else None, "decode_tps": dec, "completion_tokens": ct, "prompt_tokens": pt,
             "finish": finish, "wall_s": t1 - t0, "n_deltas": n_deltas, "timings": timings,
-            "text_head": "".join(text)[:200], "stamps": stamps}
+            "text_head": "".join(text)[:200], "text": "".join(text), "stamps": stamps}
 
 
 def main():
@@ -77,13 +77,18 @@ def main():
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--salt", action="store_true")   # a unique first line on each prefill prompt: a repeated size is a fresh prompt, not a prefix-cache hit
     ap.add_argument("--timeout", type=int, default=7200)
+    ap.add_argument("--prompts-file", default=None)   # one prompt a line: each is a decode prompt of its own (p01, p02, ...), run --reps times, instead of story + code
     a = ap.parse_args()
     global TIMEOUT; TIMEOUT = a.timeout
     out = {"url": a.url, "model": a.model, "think": a.think, "decode": {}, "prefill": [], "started": time.strftime("%F %T")}
     print("warmup", flush=True)
     w = chat(a.url, a.model, [{"role": "user", "content": PROMPTS["story"]}], 128, a.think)
     print(f"  warmup: {w['completion_tokens']} tok, ttft {w['ttft_s']:.2f}s, decode {w['decode_tps'] and round(w['decode_tps'],1)} tok/s", flush=True)
-    for name, prompt in PROMPTS.items():
+    prompts = PROMPTS
+    if a.prompts_file:   # many distinct trajectories: a change that alters the drafts is not read off two prompts' deterministic paths
+        lines = [l.strip() for l in open(a.prompts_file, encoding="utf-8") if l.strip() and not l.startswith("#")]
+        prompts = {f"p{i+1:02d}": l for i, l in enumerate(lines)}
+    for name, prompt in prompts.items():
         runs = []
         for i in range(a.reps):
             r = chat(a.url, a.model, [{"role": "user", "content": prompt}], a.max_tokens, a.think)
@@ -110,7 +115,7 @@ def main():
             tm = r["timings"] or {}
             rec = {"target_tokens": n, "prompt_tokens": r["prompt_tokens"], "ttft_s": r["ttft_s"], "prompt_tps": tm.get("prompt_per_second"),
                    "prompt_ms": tm.get("prompt_ms"), "decode_tps_after": r["decode_tps"], "after_tokens": r["completion_tokens"],
-                   "draft_n_after": tm.get("draft_n"), "draft_n_accepted_after": tm.get("draft_n_accepted")}
+                   "draft_n_after": tm.get("draft_n"), "draft_n_accepted_after": tm.get("draft_n_accepted"), "after_text": r["text"]}
             st = r["stamps"]   # per-delta timestamps: decode tok/s per successive 64-delta window = the hot-set recovery curve after a prompt
             rec["decode_curve_64"] = [round(64 / (st[k + 64] - st[k]), 1) for k in range(0, len(st) - 64, 64)]
             out["prefill"].append(rec)
@@ -118,6 +123,11 @@ def main():
                   + (f" after {rec['after_tokens']} tok: decode {r['decode_tps'] and round(r['decode_tps'],1)} curve64 {rec['decode_curve_64']}" if rec["decode_curve_64"] else "")
                   + (f" draft {rec['draft_n_after']}/{rec['draft_n_accepted_after']}" if rec["draft_n_after"] is not None else ""), flush=True)
     s = out["decode"]
+    if "story" not in s:
+        med = [v["median_decode_tps"] for v in s.values() if v["median_decode_tps"]]
+        print(f"SUMMARY {a.model}: {len(s)} prompts, median {statistics.median(med):.1f} tok/s decode (each the median of {a.reps} x {a.max_tokens})", flush=True)
+        json.dump(out, open(a.out, "w"), indent=1)
+        return
     print(f"SUMMARY {a.model}: story {s['story']['median_decode_tps'] and round(s['story']['median_decode_tps'],1)} / "
           f"code {s['code']['median_decode_tps'] and round(s['code']['median_decode_tps'],1)} tok/s decode (median of {a.reps} x {a.max_tokens}); "
           + " ".join(f"pp{p['prompt_tokens']}={p['prompt_tps'] and round(p['prompt_tps'])}" for p in out["prefill"]), flush=True)

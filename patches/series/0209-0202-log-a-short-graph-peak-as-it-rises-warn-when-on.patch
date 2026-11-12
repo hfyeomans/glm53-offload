@@ -1,0 +1,48 @@
+From 2ec2bfa0df04fb7d25e68a819eb87da1260a7fb1 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 09:30:38 -0600
+Subject: [PATCH 209/211] 0202: log a short graph peak as it rises, warn when
+ one passes the arena head
+
+---
+ src/llama-moe-cache.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index c3390a164..beb916573 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -394,6 +394,8 @@ struct llama_moe_cache::impl {
+         uint32_t lend_n       = 0;    // chunks given and taken back
+         size_t   borrow_peak  = 0;    // 0139: the largest graph peak seen
+         uint32_t borrow_logs  = 0;
++        size_t   short_peak   = 0;     // 0202: the largest peak logged of a graph of up to max_batch tokens
++        bool     head_warned  = false; // 0202
+     };
+ 
+     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
+@@ -3847,6 +3849,21 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+             LLAMA_LOG_INFO("llama_moe_cache: 0139 %s: new largest graph peak %.1f MiB (%lld tokens, head %.0f MiB)\n", ggml_backend_name(d.backend),
+                 peak/1024.0/1024.0, (long long) n_tokens, d.borrow_head/1024.0/1024.0);
+         }
++        // 0202: the peak of a short graph grows with the context
++        if (peak != SIZE_MAX && n_tokens <= impl::max_batch) {
++            if (peak > d.short_peak + 64*1024*1024) {
++                d.short_peak = peak;
++                LLAMA_LOG_INFO("llama_moe_cache: 0202 %s: largest short graph so far %.1f MiB (%lld tokens, head %.0f MiB)
++", ggml_backend_name(d.backend),
++                    peak/1024.0/1024.0, (long long) n_tokens, d.borrow_head/1024.0/1024.0);
++            }
++            if (!want && !d.head_warned) {
++                d.head_warned = true;
++                LLAMA_LOG_WARN("llama_moe_cache: 0202 %s: a graph of %lld tokens needs %.1f MiB, past the head of %.0f MiB: the cache falls to its own slots while such graphs run; raise LLAMA_MOE_CACHE_BORROW_HEAD_MIB
++",
++                    ggml_backend_name(d.backend), (long long) n_tokens, peak/1024.0/1024.0, d.borrow_head/1024.0/1024.0);
++            }
++        }
+         if (want == d.borrow_on) {
+             continue;
+         }
+-- 
+2.43.0
+

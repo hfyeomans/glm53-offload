@@ -1,0 +1,50 @@
+From 77acd624f3f6a5d745f043424b37c70136b770df Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 23:55:56 -0600
+Subject: [PATCH 191/211] 0184: LLAMA_SERVER_YIELD_INLINE=1 -- yield_to_queue
+ runs its work inline when no task is queued (four thread handoffs a
+ speculative step)
+
+---
+ tools/server/server-queue.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index c4ce90721..55b20e96b 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -4,6 +4,7 @@
+ #include "log.h"
+ 
+ #include <algorithm>
++#include <cstdlib> // 0184: getenv
+ #include <chrono>
+ #include <thread>
+ 
+@@ -222,6 +223,23 @@ void server_queue::worker_stop() {
+ void server_queue::yield_to_queue(std::function<void()> && work) {
+     GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
+ 
++    // 0184 LLAMA_SERVER_YIELD_INLINE=1: nothing queued -> the work runs here without waking the worker (two thread handoffs a call)
++    static const bool yield_inline = getenv("LLAMA_SERVER_YIELD_INLINE") != nullptr && atoi(getenv("LLAMA_SERVER_YIELD_INLINE")) != 0;
++    if (yield_inline) {
++        bool empty = false;
++        {
++            std::unique_lock<std::mutex> lock(mutex_tasks);
++            empty = queue_tasks.empty() && !worker.busy;
++            if (empty) {
++                time_last_task = ggml_time_ms();
++            }
++        }
++        if (empty) {
++            work();
++            return;
++        }
++    }
++
+     QUE_DBG("%s", "yielding to queue\n");
+ 
+     {
+-- 
+2.43.0
+

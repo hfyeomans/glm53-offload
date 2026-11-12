@@ -1,7 +1,7 @@
 From 634c120b3d5e4e97ab98149e02816d3f7dd7c2e4 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 15:47:00 -0600
-Subject: [PATCH 120/141] layer-major + LLAMA_TP_PROMPT: the both-cards prompt
+Subject: [PATCH 120/211] layer-major + LLAMA_TP_PROMPT: the both-cards prompt
  graph reserved at the fallback ubatch with the layer-major state off (the
  batches it takes), and the fallback reserve the usual layer-split graph
 

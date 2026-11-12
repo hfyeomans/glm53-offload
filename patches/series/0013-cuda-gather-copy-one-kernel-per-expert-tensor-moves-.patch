@@ -1,7 +1,7 @@
 From 6c26df90c39a60ff99248dec3253f82ba17dd974 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:48:34 -0600
-Subject: [PATCH 013/141] cuda gather copy: one kernel per expert tensor moves
+Subject: [PATCH 013/211] cuda gather copy: one kernel per expert tensor moves
  all experts into the device copy
 
 Cached experts come from the MoE cache banks, the rest from the pinned host weights through UVA. Used on twin splits

@@ -1,7 +1,7 @@
 From 05d5c55697f731bc5cc061409faa7075b2e02565 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 05:11:56 -0600
-Subject: [PATCH 066/141] sched: a transient cross-GPU input is one copy, not
+Subject: [PATCH 066/211] sched: a transient cross-GPU input is one copy, not
  flagged input/output (reserve kept every copy x4 and lost pipeline
  parallelism)
 

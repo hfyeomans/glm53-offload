@@ -1,7 +1,7 @@
 From 999ae314faef40986b0731feb0ae84e88a345dbc Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 22:15:38 -0600
-Subject: [PATCH 100/141] MUL_MAT_ID stream-k tiles expert-outermost
+Subject: [PATCH 100/211] MUL_MAT_ID stream-k tiles expert-outermost
  (GGML_CUDA_MMQ_MMID_ORDER=1): row tiles of a column tile back to back, its
  activations read once
 

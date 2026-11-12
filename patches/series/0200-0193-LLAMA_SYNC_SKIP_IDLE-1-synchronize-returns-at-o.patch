@@ -1,0 +1,70 @@
+From 53fc6ec5806a99e791f5be61b638798b932f4433 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 08:22:26 -0600
+Subject: [PATCH 200/211] 0193: LLAMA_SYNC_SKIP_IDLE=1 -- synchronize() returns
+ at once when no work was issued since the last one (~67 idle stream syncs a
+ step)
+
+---
+ src/llama-context.cpp | 10 ++++++++++
+ src/llama-context.h   |  2 ++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 83c305d40..8328ac34f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1242,6 +1242,13 @@ void llama_context::synchronize() {
+         return;
+     }
+ 
++    // 0193 LLAMA_SYNC_SKIP_IDLE=1: nothing issued since the last synchronize(), nothing to wait for
++    static const bool sync_skip_idle = getenv("LLAMA_SYNC_SKIP_IDLE") != nullptr && atoi(getenv("LLAMA_SYNC_SKIP_IDLE")) != 0;
++    if (sync_skip_idle && !sync_pending) {
++        return;
++    }
++    sync_pending = false;
++
+     const int64_t t_dts0 = llama_dt_on() ? ggml_time_us() : 0; // 0186
+     ggml_backend_sched_synchronize(sched.get());
+     if (t_dts0) {
+@@ -2117,6 +2124,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ }
+ 
+ int llama_context::encode(const llama_batch_ext & batch_inp) {
++    struct sync_pending_guard { bool & f; explicit sync_pending_guard(bool & x) : f(x) { f = true; } ~sync_pending_guard() { f = true; } } sp_guard(sync_pending); // 0193
+     if (batch_inp.tokens.empty()) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+@@ -2361,6 +2369,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     llama_dt_guard dt_guard; // 0186
++    struct sync_pending_guard { bool & f; explicit sync_pending_guard(bool & x) : f(x) { f = true; } ~sync_pending_guard() { f = true; } } sp_guard(sync_pending); // 0193
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -3366,6 +3375,7 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
+ ggml_status llama_context::graph_compute(
+             ggml_cgraph * gf,
+                    bool   batched) {
++    sync_pending = true; // 0193
+     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b91a524bc..ac6cf52bf 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -388,6 +388,8 @@ private:
+     int graph_slot_cur = -1;
+     uint64_t graph_slot_clock = 0;
+ 
++    bool sync_pending = true; // 0193 LLAMA_SYNC_SKIP_IDLE: work was issued since the last synchronize()
++
+     bool sched_need_reserve = true;
+ 
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+-- 
+2.43.0
+

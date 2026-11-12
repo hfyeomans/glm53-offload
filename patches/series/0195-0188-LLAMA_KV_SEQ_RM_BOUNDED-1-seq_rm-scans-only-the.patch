@@ -1,0 +1,48 @@
+From 1c6811f130d0b469ba4456be192b6e439af3638c Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:17:30 -0600
+Subject: [PATCH 195/211] 0188: LLAMA_KV_SEQ_RM_BOUNDED=1 -- seq_rm scans only
+ the used range of cells, not the whole cache
+
+---
+ src/llama-kv-cache.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 972c07e3c..2493e90d3 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -530,13 +530,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+         p1 = std::numeric_limits<llama_pos>::max();
+     }
+ 
++    // 0188 LLAMA_KV_SEQ_RM_BOUNDED=1: only the used range of cells can hold a position (an empty cell's is -1, p0 >= 0)
++    static const bool seq_rm_bounded = getenv("LLAMA_KV_SEQ_RM_BOUNDED") != nullptr && atoi(getenv("LLAMA_KV_SEQ_RM_BOUNDED")) != 0;
++
+     if (seq_id >= 0) {
+         auto & cells = v_cells[seq_to_stream[seq_id]];
+         auto & head  = v_heads[seq_to_stream[seq_id]];
+ 
+         uint32_t new_head = cells.size();
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
++        const uint32_t i_beg = seq_rm_bounded ? cells.used_min()    : 0; // 0188: read before the loop empties cells
++        const uint32_t i_end = seq_rm_bounded ? cells.used_max_p1() : cells.size();
++        for (uint32_t i = i_beg; i < i_end; ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+             }
+@@ -560,7 +565,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+             uint32_t new_head = cells.size();
+ 
+-            for (uint32_t i = 0; i < cells.size(); ++i) {
++            const uint32_t i_beg = seq_rm_bounded ? cells.used_min()    : 0; // 0188
++            const uint32_t i_end = seq_rm_bounded ? cells.used_max_p1() : cells.size();
++            for (uint32_t i = i_beg; i < i_end; ++i) {
+                 if (!cells.pos_in(i, p0, p1)) {
+                     continue;
+                 }
+-- 
+2.43.0
+

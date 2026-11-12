@@ -1,7 +1,7 @@
 From e31bcb9a71a7021e2e44638d6f3eb12e89d09b38 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 11:51:31 -0600
-Subject: [PATCH 029/141] LLAMA_MOE_RING_ONLY=1: the MUL_MAT_ID expert copies
+Subject: [PATCH 029/211] LLAMA_MOE_RING_ONLY=1: the MUL_MAT_ID expert copies
  of large batches get a placeholder buffer and no graph memory; the copy
  callback points them at an upload-ring slot first
 

@@ -1,7 +1,7 @@
 From 048a28b7bc84a6f1f8d1e1cf1d8b3e2369955057 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 02:44:48 -0600
-Subject: [PATCH 106/141] both-cards prompt graph: the expert split follows the
+Subject: [PATCH 106/211] both-cards prompt graph: the expert split follows the
  MoE cache (LLAMA_TP_EP_CACHE=1): the home card takes its cached experts and a
  share of the uncached ones so both cards upload about the same bytes a layer;
  per-card id tables, fixed-size views filled by position; the ring mixed path

@@ -1,7 +1,7 @@
 From c6f367381b49b973b50a2b773e87ae6ad4fb0069 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:00:21 -0600
-Subject: [PATCH 136/141] GGML_SCHED_PAIR_GATE_UP=N: pair only MUL_MAT_IDs of N
+Subject: [PATCH 136/211] GGML_SCHED_PAIR_GATE_UP=N: pair only MUL_MAT_IDs of N
  or more tokens (a small batch's selective upload remaps the shared ids)
 
 ---

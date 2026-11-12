@@ -1,0 +1,79 @@
+From 675c57aa9a3657c0c820751753d46b3b99f83ce2 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:12:08 -0600
+Subject: [PATCH 169/211] 0162: GGML_CUDA_LID_KPB=N -- the tensor-core indexer
+ keys per block for batches of one query block
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 0a10daa48..19a5e4634 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -605,7 +605,8 @@ static __global__ void lightning_indexer_kernel_mma(
+         const size_t nbq1, const size_t nbq2, const size_t nbq3,
+         const size_t nbw1, const size_t nbw3,
+         const size_t nbm1, const size_t nbm3, const int64_t nem3, const bool skip_idle,
+-        const char * __restrict__ Kq, const size_t nbk3) { // 0161: KQ8 reads contiguous q8_0 keys from Kq (K16 unused)
++        const char * __restrict__ Kq, const size_t nbk3, // 0161: KQ8 reads contiguous q8_0 keys from Kq (K16 unused)
++        const int kpb) { // 0162: keys per block, a multiple of LID_MMA_KT
+ #if defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+     __shared__ __align__(16) half k_tile[2][LID_MMA_KT*LID_MMA_KSTR];
+ 
+@@ -615,8 +616,8 @@ static __global__ void lightning_indexer_kernel_mma(
+     const int i_stream = blockIdx.z;
+     const int64_t i_q  = (int64_t) blockIdx.x*LID_MMA_QPB + warp;
+     const bool q_ok    = i_q < n_batch;
+-    const int64_t kv0  = (int64_t) blockIdx.y*LID_MMA_KPB;
+-    const int64_t kv1  = kv0 + LID_MMA_KPB < n_kv ? kv0 + LID_MMA_KPB : n_kv;
++    const int64_t kv0  = (int64_t) blockIdx.y*kpb;
++    const int64_t kv1  = kv0 + kpb < n_kv ? kv0 + kpb : n_kv;
+     const int n_tiles  = (int) ((kv1 - kv0 + LID_MMA_KT - 1)/LID_MMA_KT);
+ 
+     const half * k_s = KQ8 ? nullptr : K16 + (int64_t) i_stream*n_kv*128;
+@@ -783,7 +784,7 @@ static __global__ void lightning_indexer_kernel_mma(
+         __syncthreads(); // buffer b is reloaded two tiles on
+     }
+ #else
+-    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, skip_idle, Kq, nbk3);
++    GGML_UNUSED_VARS(Q, K16, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, skip_idle, Kq, nbk3, kpb);
+     NO_DEVICE_CODE;
+ #endif // defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+ }
+@@ -885,23 +886,26 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+             default: GGML_ABORT("fatal error");
+         }
+         const dim3 block(WARP_SIZE, LID_MMA_QPB, 1);
+-        const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + LID_MMA_KPB - 1)/LID_MMA_KPB), (unsigned) n_stream);
++        // 0162 GGML_CUDA_LID_KPB=N: the keys per block when the batch fits one query block
++        static const int lid_kpb_env = getenv("GGML_CUDA_LID_KPB") != nullptr ? atoi(getenv("GGML_CUDA_LID_KPB")) : 0;
++        const int lid_kpb = lid_kpb_env > 0 && n_batch <= LID_MMA_QPB ? std::max(LID_MMA_KT, lid_kpb_env/LID_MMA_KT*LID_MMA_KT) : LID_MMA_KPB;
++        const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + lid_kpb - 1)/lid_kpb), (unsigned) n_stream);
+         // 0159 GGML_CUDA_LID_SKIP_IDLE=1: the warps past the batch compute nothing
+         static const bool lid_skip_idle = getenv("GGML_CUDA_LID_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_LID_SKIP_IDLE")) != 0;
+         if (lid_q8_fused) {
+             if (lid_mma_mode == 2) {
+                 lightning_indexer_kernel_mma<true, true><<<grid, block, 0, ctx.stream()>>>(q_d, nullptr, w_d, m_d, dst_d, n_batch, n_kv,
+-                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3);
++                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3, lid_kpb);
+             } else {
+                 lightning_indexer_kernel_mma<false, true><<<grid, block, 0, ctx.stream()>>>(q_d, nullptr, w_d, m_d, dst_d, n_batch, n_kv,
+-                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3);
++                    nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, k_d, nbk3, lid_kpb);
+             }
+         } else if (lid_mma_mode == 2) {
+             lightning_indexer_kernel_mma<true><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0, lid_kpb);
+         } else {
+             lightning_indexer_kernel_mma<false><<<grid, block, 0, ctx.stream()>>>(q_d, k16.get(), w_d, m_d, dst_d, n_batch, n_kv,
+-                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0);
++                nb1, nb3, nbq1, nbq2, nbq3, nbw1, nbw3, nbm1, nbm3, nem3, lid_skip_idle, nullptr, 0, lid_kpb);
+         }
+         return;
+     }
+-- 
+2.43.0
+

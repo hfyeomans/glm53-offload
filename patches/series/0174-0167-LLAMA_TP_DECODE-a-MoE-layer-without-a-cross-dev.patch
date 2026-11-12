@@ -1,0 +1,51 @@
+From 182ff556f46602ab72582324b45d5652c334c25b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:19:42 -0600
+Subject: [PATCH 174/211] 0167: LLAMA_TP_DECODE -- a MoE layer without a
+ cross-device lookup at the batch: the other card adds zeros, the home card
+ computes its experts
+
+---
+ src/llama-graph.cpp    |  4 +++-
+ src/models/glm-dsa.cpp | 10 ++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d1c9e8c7f..0bb7976a4 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2761,7 +2761,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // 0166 LLAMA_TP_DECODE phase 2: the other card's hits of the layer's other-parity experts (xd), weighted and summed there
+     if (moe_td_phase == 2) {
+         ggml_tensor * slots_xd = build_moe_cache_slots_xd(selected_experts, il);
+-        GGML_ASSERT(slots_xd != nullptr && "LLAMA_TP_DECODE: a MoE layer without a cross-device lookup (LLAMA_MOE_XD=1)");
++        if (slots_xd == nullptr) {
++            return nullptr; // 0167: the cache does not serve this layer at this batch: the home card computes all of it
++        }
+         moe_xd_views = true;
+         ggml_tensor * e = build_experts(cur, selected_experts, slots_xd, true);
+         moe_xd_views = false;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 1269d2f89..69f7d9b5b 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -760,6 +760,16 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                             n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
+                             (llama_expert_gating_func_type) hparams.expert_gating_func, il, nullptr,
+                             L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
++                        if (p == nullptr) {
++                            // 0167: no cross-device lookup for this layer at this batch: the other card adds zeros
++                            static int n_logged = 0;
++                            if (n_logged < 8) {
++                                n_logged++;
++                                LLAMA_LOG_INFO("%s: 0167: layer %d at %lld tokens has no cross-device lookup, its experts on the home card\n",
++                                    __func__, il, (long long) n_tokens);
++                            }
++                            p = ggml_fill(ctx0, h, 0.0f);
++                        }
+                     } else {
+                         // the home card: its cached experts, the CPU part (build_moe_ffn places it) and the shared expert
+                         ggml_tensor * shexp = nullptr;
+-- 
+2.43.0
+

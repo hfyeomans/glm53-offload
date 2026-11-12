@@ -1,7 +1,7 @@
 From b5b05f0c97ba9dda44992ee139bebbf97c0171e9 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:43:07 -0600
-Subject: [PATCH 111/141] layer-major prompt graph: every ubatch keeps the
+Subject: [PATCH 111/211] layer-major prompt graph: every ubatch keeps the
  reserve graph structure (ceil(n_ubatch/R) attention blocks and
  ceil(n_ubatch/LLAMA_LM_MOE_ROWS) FFN blocks sharing its rows evenly), so the
  allocator plans once instead of synchronizing every backend to re-plan each

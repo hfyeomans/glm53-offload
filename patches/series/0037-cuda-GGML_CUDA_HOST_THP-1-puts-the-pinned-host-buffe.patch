@@ -1,7 +1,7 @@
 From c372d7592fe16fa8a7ceab70e2b3b921d63a8535 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 15:29:48 -0600
-Subject: [PATCH 037/141] cuda: GGML_CUDA_HOST_THP=1 puts the pinned host
+Subject: [PATCH 037/211] cuda: GGML_CUDA_HOST_THP=1 puts the pinned host
  buffers on transparent huge pages (madvise + cudaHostRegister) so CPU reads
  of host weights stop walking 4 KiB pages
 

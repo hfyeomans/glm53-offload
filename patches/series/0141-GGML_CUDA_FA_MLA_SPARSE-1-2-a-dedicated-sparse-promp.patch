@@ -1,7 +1,7 @@
 From 160da75c828e14e76c68f4f28b88e1eb6f16ffa6 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 15:29:31 -0600
-Subject: [PATCH 141/141] GGML_CUDA_FA_MLA_SPARSE=1|2: a dedicated sparse
+Subject: [PATCH 141/211] GGML_CUDA_FA_MLA_SPARSE=1|2: a dedicated sparse
  prompt kernel for 64 query heads on one MLA KV head (DKQ 576 / DV 512), one
  CTA a query, O split by dims across warps
 

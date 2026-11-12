@@ -1,0 +1,28 @@
+From c5b66c2a5320b687dd8c7e1187e4fd01ce2ccb7a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:50:33 -0600
+Subject: [PATCH 148/211] 0141: a lazy buffer skips the init_tensor padding
+ memset (nothing mapped yet; pages are zeroed when mapped)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 843be131c..947dacead 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -816,7 +816,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+         return GGML_STATUS_SUCCESS;
+     }
+ 
+-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++    // 0144: a lazy buffer (0141) has nothing mapped yet; its pages are zeroed as they are mapped
++    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++            ctx->lazy == nullptr) {
+         // initialize padding to 0 to avoid possible NaN values
+         const size_t original_size = ggml_nbytes(tensor);
+         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+-- 
+2.43.0
+

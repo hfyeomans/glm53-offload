@@ -1,7 +1,7 @@
 From 0f4e34655d3fc9cbb6a702c976f728ba2597a5a5 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 10:13:08 -0600
-Subject: [PATCH 131/141] GGML_CUDA_DENSE_CUBLAS=N: dense quantized matmuls of
+Subject: [PATCH 131/211] GGML_CUDA_DENSE_CUBLAS=N: dense quantized matmuls of
  N or more columns to cuBLAS in bf16 (f32 compute) instead of MMQ
 
 ---

@@ -1,7 +1,7 @@
 From 70df85cbff2b0d6060be393c34655c2ead469a04 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 14:07:28 -0600
-Subject: [PATCH 086/141] moe prompt cpu: LLAMA_MOE_PROMPT_CPU_MAX_TOKENS
+Subject: [PATCH 086/211] moe prompt cpu: LLAMA_MOE_PROMPT_CPU_MAX_TOKENS
  (4096), the plan only for small ubatches (an 8K ubatch loses: the next
  attention no longer overlaps an upload)
 

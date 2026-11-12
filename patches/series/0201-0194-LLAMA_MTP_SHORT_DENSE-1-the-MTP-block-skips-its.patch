@@ -1,0 +1,35 @@
+From 95d1aaa6894f53bf84ea5828bd93a02d6533b8a0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 08:58:03 -0600
+Subject: [PATCH 201/211] 0194: LLAMA_MTP_SHORT_DENSE=1 -- the MTP block skips
+ its indexer while the top-k keeps every cell (0156 for the draft graph)
+
+---
+ src/models/glm-dsa.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index b79e44130..cb1b936ed 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1858,6 +1858,9 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+             const auto * mctx_lid = inp_dsa->mctx->get_lid();
+             ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, inp_dsa->get_k_idxs_lid(), il));
+ 
++            // 0194 LLAMA_MTP_SHORT_DENSE=1: with no more cells than the top-k keeps, the key above is all the indexer has to do
++            static const bool mtp_short_dense = getenv("LLAMA_MTP_SHORT_DENSE") != nullptr && atoi(getenv("LLAMA_MTP_SHORT_DENSE")) != 0;
++            if (!(mtp_short_dense && inp_dsa->self_attn_mask_lid.cnv->ne[0] <= (int64_t) n_indexer_top_k)) {
+             ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+             indexer_k = mctx_lid->get_k(ctx0, il);
+ 
+@@ -1889,6 +1892,7 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
+             const uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
+             top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+             cb(top_k, "mtp_top_k", il);
++            } // 0194
+         }
+ 
+         q = ggml_mul_mat(ctx0, layer.wq_b, q);
+-- 
+2.43.0
+

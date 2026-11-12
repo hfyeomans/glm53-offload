@@ -1,7 +1,7 @@
 From 964c455c9885fc028deb5f64149589672e855127 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 13:26:44 -0600
-Subject: [PATCH 005/141] moe cache: admission off by default (no measured gain
+Subject: [PATCH 005/211] moe cache: admission off by default (no measured gain
  on GLM-5.3)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

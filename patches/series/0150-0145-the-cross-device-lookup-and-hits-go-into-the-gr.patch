@@ -1,0 +1,68 @@
+From 0d4ef84644f4095df5b6615df17275db25e7b6b3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:42:16 -0600
+Subject: [PATCH 150/211] 0145: the cross-device lookup and hits go into the
+ graph first, so their inputs leave the home card before its own hits are
+ queued
+
+---
+ src/llama-graph.cpp | 29 ++++++++++++++++-------------
+ 1 file changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 14aea21c5..ec164521c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2727,18 +2727,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     } else if (cpu_ids == nullptr) {
+         experts = build_experts(cur, selected_experts, slots, true);
+     } else {
+-        // the device computes the cached experts and the CPU the misses left to it, each reads the others as zero
+-        ggml_tensor * experts_dev = build_experts(cur, selected_experts, slots, true);
+-        ggml_build_forward_expand(gf, experts_dev);
+-
+-        // LLAMA_MOE_SHEXP_OVERLAP: device work that does not need the CPU part (the shared expert) goes in the hits' split
+-        if (moe_overlap_hook) {
+-            moe_overlap_hook();
+-            moe_overlap_hook = nullptr;
+-        }
+-
+-        // 0145 LLAMA_MOE_XD=1: the hits of the other device's parity, computed on that device from its banks (before the CPU part, so
+-        // both devices and the CPU work at once)
++        // 0145 LLAMA_MOE_XD=1: the hits of the other device's parity, computed on that device from its banks; 0146: FIRST in the graph, so
++        // the scheduler copies their inputs over before this device's own hits are queued on its stream, and both devices work at once
+         ggml_tensor * experts_xd = nullptr;
+         if (ggml_tensor * slots_xd = build_moe_cache_slots_xd(selected_experts, il)) {
+             const int n_nodes_xd = ggml_graph_n_nodes(gf);
+@@ -2754,6 +2744,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             }
+         }
+ 
++        // the device computes the cached experts and the CPU the misses left to it, each reads the others as zero
++        ggml_tensor * experts_dev = build_experts(cur, selected_experts, slots, true);
++        ggml_build_forward_expand(gf, experts_dev);
++
++        // LLAMA_MOE_SHEXP_OVERLAP: device work that does not need the CPU part (the shared expert) goes in the hits' split
++        if (moe_overlap_hook) {
++            moe_overlap_hook();
++            moe_overlap_hook = nullptr;
++        }
++
+         // the CPU part comes after the slot lookup, whose copy callback fills the CPU map and reads the inputs of the CPU part
+         const int n_nodes_dev = ggml_graph_n_nodes(gf);
+         ggml_tensor * experts_cpu = build_experts(cur, sel2d, cpu_ids, false);
+@@ -2969,7 +2969,10 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+     cb(slots, "ffn_moe_slots", il);
+ 
+     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
+-    ggml_build_forward_expand(gf, slots);
++    // (0146: not with a cross-device lookup, which goes into the graph first so its inputs leave this card before its hits are queued)
++    if (moe_cache->get_slot_map_xd(il, selected_experts->ne[1], selected_experts->ne[0]) == nullptr) {
++        ggml_build_forward_expand(gf, slots);
++    }
+ 
+     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+ }
+-- 
+2.43.0
+

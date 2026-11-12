@@ -1,7 +1,7 @@
 From 30a5dbff33bbbba44beb5cdb6de72a65707ac0e8 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 12:39:25 -0600
-Subject: [PATCH 082/141] upload ring mixed copy in two calls per tensor: one
+Subject: [PATCH 082/211] upload ring mixed copy in two calls per tensor: one
  cudaMemcpyBatchAsync for the host runs, one gather kernel for the cached
  experts (per-call copies blocked the host)
 

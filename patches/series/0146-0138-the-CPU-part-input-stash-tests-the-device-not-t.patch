@@ -1,0 +1,31 @@
+From 42a824d19f3d5be636b4b341cefe85ce5f5f1cfe Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:11:32 -0600
+Subject: [PATCH 146/211] 0138: the CPU part input stash tests the device, not
+ the buffer type (the arena compute buffer fell to synchronous copies)
+
+---
+ src/llama-moe-cache.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 86aa32b83..5e10101c6 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -2672,10 +2672,11 @@ struct llama_moe_cache::impl {
+         stash.clear();
+         size_t stash_size = 0;
+         if (has_cpu) {
+-            ggml_backend_buffer_type_t buft_dev = ggml_backend_dev_buffer_type(ggml_backend_get_device(backend));
++            // 0142: the device's buffers of any type (0138's arena has its own buffer type for the compute buffer)
++            ggml_backend_dev_t dev_cpu_in = ggml_backend_get_device(backend);
+             for (const ggml_tensor * t : it_cpu->second.inputs) {
+                 const ggml_tensor * base = base_of(t);
+-                if (base->buffer == nullptr || ggml_backend_buffer_is_host(base->buffer) || ggml_backend_buffer_get_type(base->buffer) != buft_dev || t->data == nullptr) {
++                if (base->buffer == nullptr || ggml_backend_buffer_is_host(base->buffer) || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) != dev_cpu_in || t->data == nullptr) {
+                     continue;
+                 }
+                 bool in_split = false;
+-- 
+2.43.0
+

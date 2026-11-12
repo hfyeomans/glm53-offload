@@ -1,0 +1,32 @@
+From 50bf5de7997b8151636fe51d25c3c4471e9596d7 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:24:43 -0600
+Subject: [PATCH 170/211] 0163: GGML_CUDA_LID_KPB=-1 -- keys per block for one
+ wave of the card (one-query-block batches)
+
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 19a5e4634..ebf5cc0f6 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -888,7 +888,13 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+         const dim3 block(WARP_SIZE, LID_MMA_QPB, 1);
+         // 0162 GGML_CUDA_LID_KPB=N: the keys per block when the batch fits one query block
+         static const int lid_kpb_env = getenv("GGML_CUDA_LID_KPB") != nullptr ? atoi(getenv("GGML_CUDA_LID_KPB")) : 0;
+-        const int lid_kpb = lid_kpb_env > 0 && n_batch <= LID_MMA_QPB ? std::max(LID_MMA_KT, lid_kpb_env/LID_MMA_KT*LID_MMA_KT) : LID_MMA_KPB;
++        int lid_kpb = lid_kpb_env > 0 && n_batch <= LID_MMA_QPB ? std::max(LID_MMA_KT, lid_kpb_env/LID_MMA_KT*LID_MMA_KT) : LID_MMA_KPB;
++        if (lid_kpb_env < 0 && n_batch <= LID_MMA_QPB) {
++            // 0163: one wave, 2 blocks a streaming multiprocessor per stream
++            const int64_t slots = std::max<int64_t>(1, 2*(int64_t) ggml_cuda_info().devices[device].nsm/std::max(1, n_stream));
++            const int64_t tiles = ((n_kv + LID_MMA_KT - 1)/LID_MMA_KT + slots - 1)/slots;
++            lid_kpb = (int) std::max<int64_t>(1, tiles)*LID_MMA_KT;
++        }
+         const dim3 grid((unsigned) ((n_batch + LID_MMA_QPB - 1)/LID_MMA_QPB), (unsigned) ((n_kv + lid_kpb - 1)/lid_kpb), (unsigned) n_stream);
+         // 0159 GGML_CUDA_LID_SKIP_IDLE=1: the warps past the batch compute nothing
+         static const bool lid_skip_idle = getenv("GGML_CUDA_LID_SKIP_IDLE") != nullptr && atoi(getenv("GGML_CUDA_LID_SKIP_IDLE")) != 0;
+-- 
+2.43.0
+

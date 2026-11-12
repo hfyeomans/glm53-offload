@@ -1,7 +1,7 @@
 From 4b44b16c9fcee80fc2fd776752d219b04d9e82c3 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 04:45:20 -0600
-Subject: [PATCH 063/141] glm-dsa: LLAMA_TP_PROMPT runs prompt batches on both
+Subject: [PATCH 063/211] glm-dsa: LLAMA_TP_PROMPT runs prompt batches on both
  cards per layer (token-half attention, expert-parallel MoE, gather /
  reduce-scatter)
 

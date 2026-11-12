@@ -1,7 +1,7 @@
 From 7513ed06586ef8e9d9698256bc5758932134e290 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 21:57:59 -0600
-Subject: [PATCH 051/141] moe-cache: LLAMA_MOE_PREDICT=1 predicts a layer's
+Subject: [PATCH 051/211] moe-cache: LLAMA_MOE_PREDICT=1 predicts a layer's
  experts on the CPU from the previous layer's FFN input during its attention
  and scores the prediction (measurement only)
 

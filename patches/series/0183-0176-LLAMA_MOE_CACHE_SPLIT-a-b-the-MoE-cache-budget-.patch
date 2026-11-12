@@ -1,0 +1,54 @@
+From a714901253efc42a028caa6f86f70113eadf1b4b Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:11:12 -0600
+Subject: [PATCH 183/211] 0176: LLAMA_MOE_CACHE_SPLIT=a,b -- the MoE cache
+ budget shares per device
+
+---
+ src/llama-moe-cache.cpp | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ef387e776..610f85362 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1212,6 +1212,36 @@ struct llama_moe_cache::impl {
+             }
+             split_sum += d.split;
+         }
++        // 0176 LLAMA_MOE_CACHE_SPLIT=a,b,...: the shares given, in the order of the devices with host experts
++        if (const char * s = getenv("LLAMA_MOE_CACHE_SPLIT"); s != nullptr && *s != '\0') {
++            std::vector<double> shares;
++            for (const char * p = s; *p != '\0'; ) {
++                char * end = nullptr;
++                const double v = strtod(p, &end);
++                if (end == p) {
++                    break;
++                }
++                shares.push_back(v);
++                p = *end == ',' ? end + 1 : end;
++            }
++            size_t k = 0;
++            double sum = 0.0;
++            for (device & d : devices) {
++                if (d.host_bytes > 0 && k < shares.size()) {
++                    sum += shares[k++];
++                }
++            }
++            if (sum > 0.0 && k == shares.size()) {
++                k = 0;
++                split_sum = sum;
++                for (device & d : devices) {
++                    d.split = d.host_bytes > 0 ? shares[k++] : 0.0;
++                }
++                LLAMA_LOG_INFO("llama_moe_cache: 0176: the budget split %s between the devices (LLAMA_MOE_CACHE_SPLIT)\n", s);
++            } else {
++                LLAMA_LOG_WARN("llama_moe_cache: LLAMA_MOE_CACHE_SPLIT=%s does not name one share a device, not used\n", s);
++            }
++        }
+         if (split_sum == 0.0) {
+             // the devices do not report their free memory
+             for (device & d : devices) {
+-- 
+2.43.0
+

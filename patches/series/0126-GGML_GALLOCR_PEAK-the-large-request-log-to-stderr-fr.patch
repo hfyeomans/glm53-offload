@@ -1,7 +1,7 @@
 From ae0cb3e224e8d8e74cebc7d7308f694af6f15121 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:23:33 -0600
-Subject: [PATCH 126/141] GGML_GALLOCR_PEAK: the large-request log to stderr,
+Subject: [PATCH 126/211] GGML_GALLOCR_PEAK: the large-request log to stderr,
  from 256 MiB
 
 ---

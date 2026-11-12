@@ -1,0 +1,92 @@
+From fe5949873fee3dad0a19c6706abc803dfa694952 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 21:41:20 -0600
+Subject: [PATCH 188/211] 0181: the MTP stash rows used only where they
+ continue the draft memory (0180 failed at a request boundary)
+
+---
+ common/speculative.cpp | 47 ++++++++++++++++++++++++++++--------------
+ 1 file changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index e1eba9fed..a5a38ab6b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1617,8 +1617,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
+-    // 0180: decode the stashed catch-up rows as process() would have (all of them, no outputs)
+-    bool flush_stash() {
++    // 0181: the stash rows of sequence s that continue its draft memory (positions pos_max + 1, + 2, ...) below end
++    std::vector<const stash_row *> stash_take(llama_seq_id s, llama_pos end) const {
++        std::vector<const stash_row *> out;
++        llama_pos next = llama_memory_seq_pos_max(llama_get_memory(this->params.ctx_dft), s) + 1;
++        for (const auto & r : stash[s]) {
++            if (r.pos == next && r.pos < end) {
++                out.push_back(&r);
++                next++;
++            }
++        }
++        return out;
++    }
++
++    // 0180: decode the stashed catch-up rows as process() would have (no outputs); 0181: only those that continue the draft memory below
++    // end, the rest dropped
++    bool flush_stash(llama_pos end = INT32_MAX) {
+         if (!defer) {
+             return true;
+         }
+@@ -1627,14 +1641,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (stash[s].empty()) {
+                 continue;
+             }
+-            batch.clear();
+-            for (const auto & r : stash[s]) {
+-                const int32_t idx = batch.add(r.id, r.pos, s, false);
+-                batch.set_embd_state(idx, { r.h.data(), 1, (size_t) n_embd });
+-            }
+-            if (llama_process(this->params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+-                SPC_ERR("%s", "0180: the stashed catch-up decode failed\n");
+-                ok = false;
++            const auto rows = stash_take(s, end);
++            if (!rows.empty()) {
++                batch.clear();
++                for (const stash_row * r : rows) {
++                    const int32_t idx = batch.add(r->id, r->pos, s, false);
++                    batch.set_embd_state(idx, { r->h.data(), 1, (size_t) n_embd });
++                }
++                if (llama_process(this->params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++                    SPC_ERR("%s", "0180: the stashed catch-up decode failed\n");
++                    ok = false;
++                }
+             }
+             stash[s].clear();
+         }
+@@ -1712,7 +1729,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // 0180 LLAMA_MTP_DEFER_CATCHUP=1: a verify-sized batch is stashed and decoded with the first draft row (its accepted rows only)
+         bool deferred = false;
+         if (defer) {
+-            if (!flush_stash()) {
++            if (!flush_stash(batch_in.tokens[0].pos[0])) {
+                 return false;
+             }
+             deferred = n_tokens <= this->params.n_max + 1;
+@@ -1846,11 +1863,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             // 0180: the stashed catch-up rows of the accepted positions, ahead of the first draft row
+             if (defer) {
+-                for (const auto & r : stash[seq_id]) {
+-                    if (r.pos < dp.pos0) {
+-                        const int32_t ir = batch.add(r.id, r.pos, seq_id, false);
+-                        batch.set_embd_state(ir, { r.h.data(), 1, (size_t) n_embd });
+-                    }
++                for (const stash_row * r : stash_take(seq_id, dp.pos0)) { // 0181
++                    const int32_t ir = batch.add(r->id, r->pos, seq_id, false);
++                    batch.set_embd_state(ir, { r->h.data(), 1, (size_t) n_embd });
+                 }
+             }
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+-- 
+2.43.0
+

@@ -1,0 +1,331 @@
+From aa6b4240d5d7b42804d29ada145571c2876332e0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:37:58 -0600
+Subject: [PATCH 177/211] 0170: TD -- the other card all-reduce ends its splits
+ (lazy module loading / pageable uploads deadlocked on it), route bias twins
+ uploaded before the next graph, pair all-reduce timeout
+
+---
+ ggml/src/ggml-cuda/pair-allreduce.cu | 34 +++++++++++++++++---
+ src/llama-context.cpp                |  1 +
+ src/llama-moe-cache.cpp              | 40 ++++++++++++++++++++---
+ src/llama-moe-cache.h                |  2 ++
+ src/models/glm-dsa.cpp               | 47 ++++++++++++++++++++++++----
+ 5 files changed, 109 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/pair-allreduce.cu b/ggml/src/ggml-cuda/pair-allreduce.cu
+index cd92f7950..9a0c15c6c 100644
+--- a/ggml/src/ggml-cuda/pair-allreduce.cu
++++ b/ggml/src/ggml-cuda/pair-allreduce.cu
+@@ -22,6 +22,9 @@ struct ggml_cuda_pair_ar {
+     float * host[2] = { nullptr, nullptr };          // rank r's staging: PAIR_AR_POOL slots (mapped pinned host memory)
+     int   * arr[2]  = { nullptr, nullptr };          // rank r's tokens: [PAIR_AR_POOL][PAIR_AR_BLOCKS][PAIR_AR_STRIDE]
+     int   * ctr[2]  = { nullptr, nullptr };          // on device r: { calls, blocks done in the current call }
++    int   * err_host = nullptr;                      // 0170: set by a kernel that gave up waiting (mapped host memory)
++    int   * err_dev  = nullptr;
++    uint64_t timeout_ns = 0;
+ };
+ 
+ static ggml_cuda_pair_ar g_pair_ar;
+@@ -55,15 +58,26 @@ bool ggml_cuda_pair_ar_init(int dev0, int dev1, size_t max_bytes) {
+         CUDA_CHECK(cudaMemset(p.ctr[r], 0, 2*sizeof(int)));
+         CUDA_CHECK(cudaDeviceSynchronize());
+     }
++    {
++        void * e = nullptr;
++        ggml_cuda_set_device(p.dev[0]);
++        CUDA_CHECK(cudaHostAlloc(&e, 64, cudaHostAllocPortable | cudaHostAllocMapped));
++        memset(e, 0, 64);
++        p.err_host = (int *) e;
++        CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.err_dev, e, 0));
++        const char * t = getenv("GGML_CUDA_PAIR_AR_TIMEOUT_MS");
++        p.timeout_ns = (uint64_t) (t != nullptr ? atoll(t) : 10000)*1000000ull;
++    }
+     p.ready = true;
+-    GGML_LOG_INFO("%s: 0164: pair all-reduce between CUDA%d and CUDA%d, up to %zu KiB a call\n", __func__, dev0, dev1,
+-        p.slot_elems*sizeof(float)/1024);
++    GGML_LOG_INFO("%s: 0164: pair all-reduce between CUDA%d and CUDA%d, up to %zu KiB a call, gives up after %llu ms\n", __func__, dev0, dev1,
++        p.slot_elems*sizeof(float)/1024, (unsigned long long) (p.timeout_ns/1000000ull));
+     return true;
+ }
+ 
+ static __global__ void pair_ar_kernel(
+         const float * __restrict__ src, float * __restrict__ dst, float * __restrict__ host_mine, const float * __restrict__ host_other,
+-        const int n, int * arr_mine, const int * arr_other, int * ctr, const size_t slot_elems, const bool vec) {
++        const int n, int * arr_mine, const int * arr_other, int * ctr, const size_t slot_elems, const bool vec,
++        int * err, const uint64_t timeout_ns) {
+     __shared__ int s_call;
+     if (threadIdx.x == 0) {
+         s_call = *(volatile int *) ctr;
+@@ -95,10 +109,19 @@ static __global__ void pair_ar_kernel(
+         const volatile int * ao = arr_other + (slot*PAIR_AR_BLOCKS + blockIdx.x)*PAIR_AR_STRIDE;
+         *am = token;
+         __threadfence_system();
++        uint64_t t0;
++        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+         while (*ao != token) {
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+             __nanosleep(32);
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
++            uint64_t t1;
++            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
++            if (timeout_ns > 0 && t1 - t0 > timeout_ns) {
++                *(volatile int *) err = 1; // 0170: give up; the host aborts at the next pair all-reduce
++                __threadfence_system();
++                break;
++            }
+         }
+     }
+     __syncthreads();
+@@ -139,10 +162,13 @@ void ggml_cuda_op_pair_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     const int64_t n = ggml_nelements(src);
+     GGML_ASSERT(n > 0 && (size_t) n <= p.slot_elems);
++    if (*(volatile int *) p.err_host != 0) {
++        GGML_ABORT("pair all-reduce: a call waited longer than GGML_CUDA_PAIR_AR_TIMEOUT_MS for its peer (the two devices' graphs disagree or the host blocked on one)");
++    }
+ 
+     const bool vec = ((uintptr_t) src->data % 16) == 0 && ((uintptr_t) dst->data % 16) == 0;
+     pair_ar_kernel<<<PAIR_AR_BLOCKS, PAIR_AR_THREADS, 0, ctx.stream()>>>(
+         (const float *) src->data, (float *) dst->data, p.host[rank], p.host[1 - rank], (int) n,
+-        p.arr[rank], p.arr[1 - rank], p.ctr[rank], p.slot_elems, vec);
++        p.arr[rank], p.arr[1 - rank], p.ctr[rank], p.slot_elems, vec, p.err_dev, p.timeout_ns);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 83cdbc3dc..c311aa733 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1895,6 +1895,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // 0138: the borrowed cache slots are given up before a graph that needs their memory (before its inputs land there)
+         if (moe_cache) {
+             moe_cache->borrow_update(sched.get(), ubatch.n_tokens);
++            moe_cache->td_flush(); // 0170
+         }
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 1027821dd..ef387e776 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -435,6 +435,7 @@ struct llama_moe_cache::impl {
+         std::vector<int32_t> staged;            // 0150: this layer's experts in staging slots for its next lookup
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
+         ggml_tensor * route_bias_td = nullptr; // 0165 LLAMA_TP_DECODE: its twin on the layer's other device (ig_xd), the same values
++        int32_t td_row = -1;                   // 0170: the twin's row in its device's table (rb_td_all)
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
+         std::vector<float> route_epb;       // the layer's exp_probs_b, folded into the route bias (empty: not folded)
+@@ -566,6 +567,9 @@ struct llama_moe_cache::impl {
+     std::vector<ggml_backend_buffer_ptr> rb_buf;
+     std::vector<ggml_context_ptr>        rb_td_ctx; // 0165: the twins, per device
+     std::vector<ggml_backend_buffer_ptr> rb_td_buf;
++    std::vector<ggml_tensor *>           rb_td_all;   // 0170: per device, the twins as rows of one tensor [n_expert, n]
++    std::vector<std::vector<float>>      rb_td_host;  // its host mirror
++    std::vector<bool>                    rb_td_dirty; // the mirror changed since the last upload (td_flush)
+     size_t win_async = 0; // misses computed on the CPU and filled on the side stream, in the window
+ 
+     // LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, read with the ids; the uncached ones are uploaded on the side stream
+@@ -1661,6 +1665,9 @@ struct llama_moe_cache::impl {
+             if (td_env) {
+                 rb_td_ctx.resize(devices.size());
+                 rb_td_buf.resize(devices.size());
++                rb_td_all.assign(devices.size(), nullptr);
++                rb_td_host.assign(devices.size(), {});
++                rb_td_dirty.assign(devices.size(), false);
+                 for (size_t id = 0; id < devices.size(); ++id) {
+                     size_t n = 0;
+                     for (const layer & l : layers) {
+@@ -1669,14 +1676,19 @@ struct llama_moe_cache::impl {
+                     if (n == 0) {
+                         continue;
+                     }
+-                    ggml_init_params ip = { ggml_tensor_overhead()*n, nullptr, true };
++                    ggml_init_params ip = { ggml_tensor_overhead()*(n + 1), nullptr, true };
+                     rb_td_ctx[id].reset(ggml_init(ip));
++                    rb_td_all[id] = ggml_new_tensor_2d(rb_td_ctx[id].get(), GGML_TYPE_F32, n_exp, (int64_t) n); // 0170: one table
++                    ggml_format_name(rb_td_all[id], "moe_cache.route_bias_td.%d", (int) id);
++                    rb_td_host[id].assign((size_t) n_exp*n, 0.0f);
++                    int32_t row = 0;
+                     for (size_t il = 0; il < layers.size(); ++il) {
+                         layer & l = layers[il];
+                         if (l.route_bias == nullptr || l.ig_xd < 0 || groups[l.ig_xd].id != (int32_t) id) {
+                             continue;
+                         }
+-                        l.route_bias_td = ggml_new_tensor_1d(rb_td_ctx[id].get(), GGML_TYPE_F32, n_exp);
++                        l.td_row = row++;
++                        l.route_bias_td = ggml_view_1d(rb_td_ctx[id].get(), rb_td_all[id], n_exp, (size_t) l.td_row*rb_td_all[id]->nb[1]);
+                         ggml_format_name(l.route_bias_td, "moe_cache.route_bias_td-%d", (int) il);
+                     }
+                     rb_td_buf[id].reset(ggml_backend_alloc_ctx_tensors_from_buft(rb_td_ctx[id].get(), devices[id].buft));
+@@ -1684,9 +1696,10 @@ struct llama_moe_cache::impl {
+                     ggml_backend_buffer_set_usage(rb_td_buf[id].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                     for (const layer & l : layers) {
+                         if (l.route_bias_td != nullptr && groups[l.ig_xd].id == (int32_t) id) {
+-                            ggml_backend_tensor_set(l.route_bias_td, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias_td));
++                            std::copy(l.route_bias_host.begin(), l.route_bias_host.end(), rb_td_host[id].begin() + (size_t) l.td_row*n_exp);
+                         }
+                     }
++                    ggml_backend_tensor_set(rb_td_all[id], rb_td_host[id].data(), 0, ggml_nbytes(rb_td_all[id]));
+                 }
+             }
+             LLAMA_LOG_INFO("llama_moe_cache: cache-aware routing, selection bias %.4f for the cached experts\n", (double) route_bias_value());
+@@ -2269,7 +2282,11 @@ struct llama_moe_cache::impl {
+             if (l.route_bias_host != l.route_bias_last) {
+                 stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
+                 if (l.route_bias_td != nullptr) {
+-                    stage_set(devices[groups[l.ig_xd].id].backend, l.route_bias_td, l.route_bias_host.data(), ggml_nbytes(l.route_bias_td)); // 0165
++                    // 0170: into the mirror; td_flush uploads it before the next graph (an upload to the other card here could wait for it
++                    // while its pair all-reduce waits for this card)
++                    const int32_t id_td = groups[l.ig_xd].id;
++                    std::copy(l.route_bias_host.begin(), l.route_bias_host.end(), rb_td_host[id_td].begin() + (size_t) l.td_row*l.route_bias_host.size());
++                    rb_td_dirty[id_td] = true;
+                 }
+                 l.route_bias_last = l.route_bias_host;
+             }
+@@ -3286,7 +3303,11 @@ struct llama_moe_cache::impl {
+             if (l.route_bias_host != l.route_bias_last) {
+                 stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
+                 if (l.route_bias_td != nullptr) {
+-                    stage_set(devices[groups[l.ig_xd].id].backend, l.route_bias_td, l.route_bias_host.data(), ggml_nbytes(l.route_bias_td)); // 0165
++                    // 0170: into the mirror; td_flush uploads it before the next graph (an upload to the other card here could wait for it
++                    // while its pair all-reduce waits for this card)
++                    const int32_t id_td = groups[l.ig_xd].id;
++                    std::copy(l.route_bias_host.begin(), l.route_bias_host.end(), rb_td_host[id_td].begin() + (size_t) l.td_row*l.route_bias_host.size());
++                    rb_td_dirty[id_td] = true;
+                 }
+                 l.route_bias_last = l.route_bias_host;
+             }
+@@ -3547,6 +3568,15 @@ ggml_tensor * llama_moe_cache::get_route_bias(int32_t il, int64_t n_tokens, int6
+     return pimpl->get_slot_map(il, n_tokens, n_expert_used) != nullptr ? pimpl->layers[il].route_bias : nullptr;
+ }
+ 
++void llama_moe_cache::td_flush() {
++    for (size_t id = 0; id < pimpl->rb_td_all.size(); ++id) {
++        if (pimpl->rb_td_all[id] != nullptr && pimpl->rb_td_dirty[id]) {
++            ggml_backend_tensor_set(pimpl->rb_td_all[id], pimpl->rb_td_host[id].data(), 0, ggml_nbytes(pimpl->rb_td_all[id]));
++            pimpl->rb_td_dirty[id] = false;
++        }
++    }
++}
++
+ ggml_tensor * llama_moe_cache::get_route_bias_td(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+     if (il < 0 || il >= (int32_t) pimpl->layers.size() || pimpl->layers[il].route_bias_td == nullptr) {
+         return nullptr;
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 85a5d9a72..ccb5e9770 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -42,6 +42,8 @@ public:
+     ggml_tensor * get_route_bias(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+     // 0165 LLAMA_TP_DECODE: its twin on the layer's other device (nullptr without one)
+     ggml_tensor * get_route_bias_td(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
++    // 0170: upload the twins the last graph's lookups changed (before a graph, while no pair all-reduce waits)
++    void td_flush();
+ 
+     // true when the route bias of layer il already holds the layer's exp_probs_b (it replaces exp_probs_b in the graph, see 0034)
+     bool route_bias_folded(int32_t il) const;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 69f7d9b5b..7b0d85c62 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -632,6 +632,18 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         // the last full indexer layer's top-k as each card holds it: the other card takes its copy right after the home card's indexer
+         // (a later layer reading it across the cards would queue the copy behind the source card's all-reduce, which waits for the reader)
+         ggml_tensor * top_k_c[2] = { nullptr, nullptr };
++        // 0170: the other card's all-reduce is the first of each pair and ends the card's split; its residual add waits for the card's
++        // next split (x_of), so after it the host queues nothing on that card until the home card's all-reduce is queued
++        ggml_tensor * x_ar[2]  = { nullptr, nullptr };
++        ggml_tensor * x_res[2] = { nullptr, nullptr };
++        auto x_of = [&](int c) {
++            if (x_ar[c] != nullptr) {
++                x[c] = ggml_add(ctx0, x_ar[c], x_res[c]);
++                x_ar[c]  = nullptr;
++                x_res[c] = nullptr;
++            }
++            return x[c];
++        };
+         for (int il = 0; il < n_layer; ++il) {
+             const auto & L = model.layers[il];
+             const int H = model.tp_home(il);
+@@ -649,7 +661,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                         ggml_build_forward_expand(gf, top_k_c[O]);
+                     }
+                 }
+-                ggml_tensor * cur = build_norm(x[c], W(L.attn_norm, c), NULL, LLM_NORM_RMS, il);
++                ggml_tensor * cur = build_norm(x_of(c), W(L.attn_norm, c), NULL, LLM_NORM_RMS, il);
++                if (c == H) {
++                    res->t_layer_inp[il] = x[H];
++                }
+                 ggml_tensor * q_a = ggml_mul_mat(ctx0, W(L.wq_a, c), cur);
+                 q_a = build_norm(q_a, W(L.attn_q_a_norm, c), nullptr, LLM_NORM_RMS, il);
+                 qr[c] = q_a;
+@@ -726,7 +741,13 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                                                  top_k != nullptr ? top_k->ne[0] : 0, kq_scale, il);
+                 o = ggml_mul_mat(ctx0, Wh(L.wo, c, 2), o);
+                 cb(o, "attn_out_part", il);
+-                ggml_tensor * f = ggml_add(ctx0, ggml_pair_allreduce(ctx0, o, c), x[c]);
++                ggml_tensor * a = ggml_pair_allreduce(ctx0, o, c);
++                if (c == O) {
++                    ggml_build_forward_expand(gf, a); // 0170: the end of the other card's split
++                    pin_from(n0, c);
++                    return a;
++                }
++                ggml_tensor * f = ggml_add(ctx0, a, x[c]);
+                 cb(f, "ffn_inp", il);
+                 ggml_build_forward_expand(gf, f);
+                 pin_from(n0, c);
+@@ -736,6 +757,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             // card c's FFN: a dense layer's halves, or its part of the MoE; the all-reduce and the residual into x[c]
+             auto ffn = [&](int c, ggml_tensor * ffn_inp) {
+                 const int n0 = ggml_graph_n_nodes(gf);
++                if (c == O) {
++                    ffn_inp = ggml_add(ctx0, ffn_inp, x[c]); // 0170: the other card's attention residual, at the top of its FFN split
++                    cb(ffn_inp, "ffn_inp", il);
++                }
+                 ggml_tensor * h = build_norm(ffn_inp, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
+                 ggml_tensor * p = nullptr;
+                 int n1 = n0;
+@@ -804,25 +829,35 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                     moe_td_w     = nullptr;
+                 }
+                 cb(p, "ffn_out_part", il);
+-                ggml_tensor * y = ggml_add(ctx0, ggml_pair_allreduce(ctx0, p, c), ffn_inp);
++                ggml_tensor * p_ar = ggml_pair_allreduce(ctx0, p, c);
++                if (c == O) {
++                    ggml_build_forward_expand(gf, p_ar); // 0170: the end of the other card's split, the residual add in its next one
++                    pin_from(n0, c);
++                    x_ar[c]  = p_ar;
++                    x_res[c] = ffn_inp;
++                    x[c]     = nullptr;
++                    return;
++                }
++                ggml_tensor * y = ggml_add(ctx0, p_ar, ffn_inp);
+                 cb(y, "l_out", il);
+                 ggml_build_forward_expand(gf, y);
+                 pin_from(c == H ? n1 : n0, c);
+                 x[c] = y;
+             };
+ 
++            // 0170: home pre-attention, the other card's attention, the home attention, the other card's FFN, the home FFN
+             pre(H);
+             pre(O);
+-            ggml_tensor * ffn_inp_o = attn(O);
+-            ffn(O, ffn_inp_o);
++            ggml_tensor * a_o = attn(O);
+             ggml_tensor * ffn_inp_h = attn(H);
++            ffn(O, a_o);
+             ffn(H, ffn_inp_h);
+         }
+ 
+         // the final norm, the MTP hidden state and the logits on the output's card
+         const int co = model.dev_output() == model.tp_devs[0] ? 0 : 1;
+         const int n0 = ggml_graph_n_nodes(gf);
+-        ggml_tensor * cur = build_norm(x[co], model.output_norm, NULL, LLM_NORM_RMS, -1);
++        ggml_tensor * cur = build_norm(x_of(co), model.output_norm, NULL, LLM_NORM_RMS, -1);
+         if (crop_before_nextn(inp_out_ids)) {
+             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+         }
+-- 
+2.43.0
+

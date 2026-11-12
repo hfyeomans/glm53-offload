@@ -1,7 +1,7 @@
 From a3722fda15441ce921fc5267d5327cac383652c0 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 22:21:18 -0600
-Subject: [PATCH 101/141] quantize_row_q8_K in AVX-512 on x86
+Subject: [PATCH 101/211] quantize_row_q8_K in AVX-512 on x86
  (GGML_CPU_Q8K_SIMD, default on): bit for bit the reference, 6x
 
 ---

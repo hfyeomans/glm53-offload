@@ -1,0 +1,30 @@
+From 7ec896c0c60971a679a64ad540d7abd690e89fc0 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 03:33:07 -0600
+Subject: [PATCH 158/211] 0153 LLAMA_MOE_XD: the home lookup CONT on the home
+ card, in the graph where it is made (it ran at the end of the other card
+ split, so the home hits waited for it)
+
+---
+ src/llama-graph.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ec164521c..23148ecb9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2956,6 +2956,11 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+     ggml_tensor * ids = selected_experts;
+     if (!ggml_is_contiguous(ids)) {
+         ids = ggml_cont(ctx0, ids);
++        // 0153: with a cross-device lookup the home lookup waits (0146), its CONT does not: on the home card, in the graph now
++        if (moe_cache->get_slot_map_xd(il, selected_experts->ne[1], selected_experts->ne[0]) != nullptr) {
++            ggml_backend_sched_set_tensor_backend(sched, ids, moe_cache->backend(il));
++            ggml_build_forward_expand(gf, ids);
++        }
+     }
+     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,130 @@
+From 49ac5cb1bfceeac753669d68b4a8442325c9e746 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 04:01:19 -0600
+Subject: [PATCH 159/211] LLAMA_MOE_CPU_REDUCE=1 / LLAMA_MOE_XD_REDUCE=1: the
+ CPU part and the cross-device hits weighted and summed where computed (72 KB
+ to the home card, not 576 KB)
+
+---
+ src/llama-graph.cpp | 69 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 23148ecb9..f4b6e2866 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -48,6 +48,29 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     return res;
+ }
+ 
++// 0154 LLAMA_MOE_CPU_REDUCE: the CPU part's experts weighted and summed on the CPU, one pass: dst [n_embd, n_tokens] = sum over k of
++// w[k, t] * x[:, k, t], k in order (the order of the device's MUL + ADDs); src[0] = x [n_embd, n_used, n_tokens], src[1] = w [1, n_used, n_tokens]
++static void llama_moe_cpu_wsum(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(userdata);
++    const ggml_tensor * x = dst->src[0];
++    const ggml_tensor * w = dst->src[1];
++    const int64_t n_embd = x->ne[0], n_used = x->ne[1], n_tok = x->ne[2];
++    const int64_t per = (n_embd + nth - 1) / nth;
++    const int64_t i0 = std::min<int64_t>(n_embd, per * ith), i1 = std::min<int64_t>(n_embd, i0 + per);
++    for (int64_t t = 0; t < n_tok; ++t) {
++        float * d = (float *) ((char *) dst->data + t*dst->nb[1]);
++        for (int64_t k = 0; k < n_used; ++k) {
++            const float wk = *(const float *) ((const char *) w->data + k*w->nb[1] + t*w->nb[2]);
++            const float * xk = (const float *) ((const char *) x->data + k*x->nb[1] + t*x->nb[2]);
++            if (k == 0) {
++                for (int64_t i = i0; i < i1; ++i) { d[i] = xk[i] * wk; }
++            } else {
++                for (int64_t i = i0; i < i1; ++i) { const float p = xk[i] * wk; d[i] = d[i] + p; }
++            }
++        }
++    }
++}
++
+ static bool can_reuse_kq_mask(
+         ggml_tensor * kq_mask,
+         const llama_kv_cache_context * mctx,
+@@ -2708,6 +2731,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     }
+ 
++    // 0154 LLAMA_MOE_CPU_REDUCE / LLAMA_MOE_XD_REDUCE: the off-card parts weighted and summed where they are computed
++    static const bool moe_reduce_cpu = getenv("LLAMA_MOE_CPU_REDUCE") != nullptr && atoi(getenv("LLAMA_MOE_CPU_REDUCE")) != 0;
++    static const bool moe_reduce_xd  = getenv("LLAMA_MOE_XD_REDUCE")  != nullptr && atoi(getenv("LLAMA_MOE_XD_REDUCE"))  != 0;
++    const bool moe_reduce_ok = !weight_before_ffn && down_exps_b == nullptr && post_exp_norm == nullptr;
++    ggml_tensor * moe_xd_out  = nullptr;
++    ggml_tensor * moe_cpu_out = nullptr;
++
+     ggml_tensor * experts = nullptr;
+     if (p_gids != nullptr) {
+         // 0085: the device skips the CPU's experts; its down projection writes zeros there, up and gate leave them undefined
+@@ -2735,6 +2765,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             moe_xd_views = true;
+             experts_xd = build_experts(cur, selected_experts, slots_xd, true);
+             moe_xd_views = false;
++            if (moe_reduce_xd && moe_reduce_ok) {
++                // 0154: weighted and summed on the other card (its nodes get that backend below)
++                ggml_tensor * xw = ggml_mul(ctx0, experts_xd, weights);
++                ggml_tensor * s  = ggml_view_2d(ctx0, xw, n_embd, n_tokens, xw->nb[2], 0);
++                for (int64_t i = 1; i < xw->ne[1]; ++i) {
++                    s = ggml_add(ctx0, s, ggml_view_2d(ctx0, xw, n_embd, n_tokens, xw->nb[2], i*xw->nb[1]));
++                }
++                cb(s, "ffn_moe_out_xd", il);
++                moe_xd_out = s;
++                experts_xd = s;
++            }
+             ggml_build_forward_expand(gf, experts_xd);
+             for (int i = n_nodes_xd; i < ggml_graph_n_nodes(gf); ++i) {
+                 ggml_tensor * node = ggml_graph_node(gf, i);
+@@ -2757,6 +2798,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // the CPU part comes after the slot lookup, whose copy callback fills the CPU map and reads the inputs of the CPU part
+         const int n_nodes_dev = ggml_graph_n_nodes(gf);
+         ggml_tensor * experts_cpu = build_experts(cur, sel2d, cpu_ids, false);
++        if (moe_reduce_cpu && moe_reduce_ok) {
++            // 0154: weighted and summed on the CPU, one op
++            ggml_tensor * args[2] = { experts_cpu, weights };
++            experts_cpu = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 2, llama_moe_cpu_wsum, GGML_N_TASKS_MAX, nullptr);
++            cb(experts_cpu, "ffn_moe_out_cpu", il);
++            moe_cpu_out = experts_cpu;
++        }
+         ggml_build_forward_expand(gf, experts_cpu);
+         for (int i = n_nodes_dev; i < ggml_graph_n_nodes(gf); ++i) {
+             ggml_tensor * node = ggml_graph_node(gf, i);
+@@ -2765,11 +2813,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             }
+         }
+ 
+-        moe_cache->set_cpu_part(lookup, n_expert_used, { lookup->src[1], cur });
++        if (moe_cpu_out != nullptr) {
++            moe_cache->set_cpu_part(lookup, n_expert_used, { lookup->src[1], cur, weights }); // 0154: the weights too, read with the rest
++            experts = experts_dev;
++        } else {
++            moe_cache->set_cpu_part(lookup, n_expert_used, { lookup->src[1], cur });
+ 
+-        experts = ggml_add(ctx0, experts_dev, experts_cpu);
+-        ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
+-        if (experts_xd != nullptr) {
++            experts = ggml_add(ctx0, experts_dev, experts_cpu);
++            ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
++        }
++        if (experts_xd != nullptr && moe_xd_out == nullptr) {
+             experts = ggml_add(ctx0, experts, experts_xd); // 0145
+             ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
+         }
+@@ -2835,6 +2888,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         moe_out = ggml_cont(ctx0, moe_out);
+     }
+ 
++    // 0154: the off-card sums, after the home card's own
++    for (ggml_tensor * r : { moe_xd_out, moe_cpu_out }) {
++        if (r != nullptr) {
++            moe_out = ggml_add(ctx0, moe_out, r);
++            ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->backend(il));
++        }
++    }
++
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     if (p_gids != nullptr) {
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 2bb9c1297c056c8ddcb17452115dec9347acf84b Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 13:07:22 -0600
-Subject: [PATCH 003/141] moe cache: LLAMA_MOE_CACHE_LOG_EVERY=N logs the hit
+Subject: [PATCH 003/211] moe cache: LLAMA_MOE_CACHE_LOG_EVERY=N logs the hit
  rate of the last N decode tokens
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

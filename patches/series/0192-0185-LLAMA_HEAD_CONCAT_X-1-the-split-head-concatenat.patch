@@ -1,0 +1,29 @@
+From 5c14e73ebc20f14546902decb852b5fbee97ecf6 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:04:37 -0600
+Subject: [PATCH 192/211] 0185: LLAMA_HEAD_CONCAT_X=1 -- the split head
+ concatenated on the other card, so the head card's half runs beside the other
+ half (3 heads a TD step were serial)
+
+---
+ src/models/glm-dsa.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 1634a6775..c1b5f4d52 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -213,7 +213,9 @@ static ggml_tensor * glm_dsa_head(ggml_context * ctx0, ggml_cgraph * gf, ggml_ba
+     ggml_tensor * lo = ggml_mul_mat(ctx0, wo, cur);
+     ggml_backend_sched_set_tensor_backend(sched, lo, be_o);
+     ggml_tensor * l = ggml_concat(ctx0, lx, lo, 0);
+-    ggml_backend_sched_set_tensor_backend(sched, l, be_o);
++    // 0185 LLAMA_HEAD_CONCAT_X=1: concatenated on the other card, so lo's split has no cross-card input and runs beside lx
++    static const bool concat_x = getenv("LLAMA_HEAD_CONCAT_X") != nullptr && atoi(getenv("LLAMA_HEAD_CONCAT_X")) != 0;
++    ggml_backend_sched_set_tensor_backend(sched, l, concat_x ? be_x : be_o);
+     return l;
+ }
+ 
+-- 
+2.43.0
+

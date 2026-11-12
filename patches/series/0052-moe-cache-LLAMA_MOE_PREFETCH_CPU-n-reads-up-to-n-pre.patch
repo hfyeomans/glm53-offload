@@ -1,7 +1,7 @@
 From dc0d424da98cb7b720fd66736386db3a98d9adfe Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 22:19:14 -0600
-Subject: [PATCH 052/141] moe-cache: LLAMA_MOE_PREFETCH_CPU=n reads up to n
+Subject: [PATCH 052/211] moe-cache: LLAMA_MOE_PREFETCH_CPU=n reads up to n
  predicted misses into the caches of the cores that will compute them before
  the plan waits for the ids
 

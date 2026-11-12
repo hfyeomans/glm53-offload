@@ -1,7 +1,7 @@
 From 284cbc3fca9880639cc12338686cad25afce5f7c Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 15:51:27 -0600
-Subject: [PATCH 017/141] copy callback: upload all the experts of any 2K+
+Subject: [PATCH 017/211] copy callback: upload all the experts of any 2K+
  token ubatch under pipeline parallelism, full or not
  (LLAMA_MOE_UPLOAD_ALL_FULL_ONLY=1 restores the old rule)
 

@@ -1,0 +1,26 @@
+From 0137f68b96126eb58359854a64ca638d8f411715 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 09:35:56 -0600
+Subject: [PATCH 211/211] 0202b: the other 0202 log string
+
+---
+ src/llama-moe-cache.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ee7a5abfa..7b0d19f35 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -3853,8 +3853,7 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+         if (peak != SIZE_MAX && n_tokens <= impl::max_batch) {
+             if (peak > d.short_peak + 64*1024*1024) {
+                 d.short_peak = peak;
+-                LLAMA_LOG_INFO("llama_moe_cache: 0202 %s: largest short graph so far %.1f MiB (%lld tokens, head %.0f MiB)
+-", ggml_backend_name(d.backend),
++                LLAMA_LOG_INFO("llama_moe_cache: 0202 %s: largest short graph so far %.1f MiB (%lld tokens, head %.0f MiB)\n", ggml_backend_name(d.backend),
+                     peak/1024.0/1024.0, (long long) n_tokens, d.borrow_head/1024.0/1024.0);
+             }
+             if (!want && !d.head_warned) {
+-- 
+2.43.0
+

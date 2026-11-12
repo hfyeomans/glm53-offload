@@ -1,7 +1,7 @@
 From 6eb7a745e2c6a625d4ce1bf1a07f16983b7954c9 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:19:33 -0600
-Subject: [PATCH 125/141] GGML_GALLOCR_PEAK: the allocation-request log once,
+Subject: [PATCH 125/211] GGML_GALLOCR_PEAK: the allocation-request log once,
  plus the first three requests straight to stderr
 
 ---

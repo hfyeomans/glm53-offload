@@ -1,7 +1,7 @@
 From 0708c244542532577ea17925a73b3acd477dc135 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 12:50:15 -0600
-Subject: [PATCH 036/141] speculative: the draft context shares the target
+Subject: [PATCH 036/211] speculative: the draft context shares the target
  context's CPU threadpools instead of spawning a disposable pool per graph
 
 ---

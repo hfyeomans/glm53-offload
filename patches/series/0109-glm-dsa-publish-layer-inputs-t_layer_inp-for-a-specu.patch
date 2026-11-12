@@ -1,7 +1,7 @@
 From 048ed6610ab7c7bd115796a09c8dbf9b17c2172b Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:17:45 -0600
-Subject: [PATCH 109/141] glm-dsa: publish layer inputs (t_layer_inp) for a
+Subject: [PATCH 109/211] glm-dsa: publish layer inputs (t_layer_inp) for a
  speculative draft that reads target hidden states (DFlash); the both-cards
  prompt graph concatenates its token halves for a requested layer only
 

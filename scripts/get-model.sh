@@ -1,31 +1,41 @@
 #!/bin/bash
-# get-model.sh -- fetch Unsloth's GLM-5.3 UD-Q3_K_XL at a pinned revision, verify it, and requantize it to the "a5" variant the recipes
-# were measured on: the Q8_0 non-expert tensors (attention, shared experts, dense FFN: 19.5 GB read on EVERY token) to Q5_K with
-# Unsloth's own importance matrix; every routed expert, the embedding and the output head are copied byte for byte.  Decode +11-14 %,
-# perplexity +0.17 % (inside the error bar).  The requant takes ~2-5 min on a 64-core CPU, no GPU.
+# get-model.sh -- get the model the recipes were measured on, GLM-5.3 UD-Q3_K_XL "a5" (336.7 GB in 9 shards), and verify it.
+# a5 is Unsloth's UD-Q3_K_XL with its Q8_0 non-expert tensors (attention, shared experts, dense FFN: 19.5 GB read on EVERY token)
+# requantized to Q5_K with Unsloth's own importance matrix; every routed expert, the embedding and the output head are copied byte
+# for byte.  Decode +11-14 %, perplexity +0.17 % (inside the error bar).
 #
-#   scripts/get-model.sh <dir> [--image glm53-offload:latest] [--delete-original] [--skip-download]
+#   scripts/get-model.sh <dir>            download the a5 shards (337 GB) and check their sha256
+#   scripts/get-model.sh <dir> --build    build them instead: download Unsloth's UD-Q3_K_XL at a pinned revision, verify it, requantize
+#                                         it with this repo's image (123 s on the 64-core test host, no GPU) and check the result
+#                                         against the same hashes.  Disk: 343 GB + 1.1 GB (imatrix) + 337 GB = ~681 GB.
+#     --delete-original                   with --build: remove Unsloth's shards after a verified requant
+#     --image glm53-offload:latest        with --build: the image that holds llama-quantize
+#     --skip-download                     work on what is already under <dir>
 #
-# Disk: ~343 GB (original) + 1.1 GB (imatrix) + ~337 GB (a5) = ~681 GB; --delete-original removes the first after a verified requant.
 # Output: <dir>/UD-Q3_K_XL-a5/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf (pass that to run.sh --model).
 # Downloads with the Hugging Face CLI (`hf`, from `pip install -U "huggingface_hub[hf_xet]"`) if it is on PATH, else in a python
 # container.  A gated or rate-limited download needs HF_TOKEN in the environment.
 set -u
-DIR=; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; DEL=0; SKIP=0
+DIR=; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; BUILD=0; DEL=0; SKIP=0
 while [ $# -gt 0 ]; do case $1 in
+  --build) BUILD=1; shift;;
   --image) IMAGE=$2; shift 2;;
   --delete-original) DEL=1; shift;;
   --skip-download) SKIP=1; shift;;
-  -h|--help) sed -n 2,13p "$0"; exit 0;;
+  -h|--help) sed -n 2,17p "$0"; exit 0;;
+  -*) echo "unknown option $1 (see --help)"; exit 2;;
   *) DIR=$1; shift;;
 esac; done
-[ -n "$DIR" ] || { echo "usage: $0 <dir> (see --help)"; exit 2; }
+[ -n "$DIR" ] || { echo "usage: $0 <dir> [--build] (see --help)"; exit 2; }
+[ $DEL = 0 ] || [ $BUILD = 1 ] || { echo "--delete-original goes with --build"; exit 2; }
 mkdir -p "$DIR" && DIR=$(cd "$DIR" && pwd)
+A5_REPO=killy369/GLM-5.3-UD-Q3_K_XL-a5-GGUF   # where the a5 shards are published, under UD-Q3_K_XL-a5/
+A5_REV=__HF_REV__                             # the published revision, set at the upload; until then the download is refused
 REPO=unsloth/GLM-5.3-GGUF
 REV=346b3591c7f28d1a23716f97a065ecf12ec14771
 SRC=$DIR/UD-Q3_K_XL; DST=$DIR/UD-Q3_K_XL-a5; IMX=$DIR/imatrix_unsloth.gguf_file
 IMX_SHA=936ec188a262f963e9b68bef0679758a0a80c5858e3a55a4596b45006696dec0
-SHA=(   # the Hub's LFS sha256 of each shard at $REV
+SHA=(   # the Hub's LFS sha256 of each of Unsloth's shards at $REV
   56d6d59fc554a84c503c2f786e6978d55681e42b8c01370afd923a6286d05e0a
   4a66db8d7f441a948d435e7559a4080a58cc57a8cb35ce9104103ea4039cf34f
   03c626e0fe1cb5e9f245afa092df6c25fa1f55b1072ec65f143f804cec04b710
@@ -35,7 +45,7 @@ SHA=(   # the Hub's LFS sha256 of each shard at $REV
   0b70151675f930eed91c83e51aa8c977657c4fe371af1a02951dd1b4e7258a68
   04eaa6d2cb5a548854c719994816a791a4e3d7783f38979e95b389f8f840badf
   6227252600ff83f185b6ad149266fbd0cb1c1f57ae0bfb71c247ee49faa3c31b )
-A5_SHA=(   # the a5 shards this script produced on the reference machine (the requant is deterministic)
+A5_SHA=(   # the a5 shards: what --build produced on the reference machine (the requant is deterministic), and what is published
   0bec738e5b71267d7c68eb22440f957424daa56f8d35a3eedd59c370199d2bf4
   3804657b129d1e28f9c9ed952d03b294fa9d2633f22ad82407f1b5c43b745938
   78e1b33b309ee7d04ebb3a235b4f47ce6a984446bbc5f764fb7799bd54c98836
@@ -49,29 +59,54 @@ A5_SHA=(   # the a5 shards this script produced on the reference machine (the re
 say(){ echo "[get-model] $*"; }
 avail_gb(){ df -BG --output=avail "$DIR" | tail -1 | tr -dc 0-9; }
 
-if [ $SKIP = 0 ]; then
-  [ "$(avail_gb)" -ge 690 ] || say "warning: $(avail_gb) GB free under $DIR; ~681 GB are needed (343 + 1 + 337)"
-  INC=(--include "UD-Q3_K_XL/*" --include "imatrix_unsloth.gguf_file")
+fetch(){   # fetch <repo> <revision> <pattern>...: those files of the repo into $DIR
+  local repo=$1 rev=$2 inc=() p; shift 2
+  for p in "$@"; do inc+=(--include "$p"); done
   if command -v hf >/dev/null; then
-    hf download "$REPO" --revision "$REV" "${INC[@]}" --local-dir "$DIR" || exit 3
+    hf download "$repo" --revision "$rev" "${inc[@]}" --local-dir "$DIR"
   else
     say "no hf CLI on PATH: downloading in a python container"
     docker run --rm -e HF_TOKEN="${HF_TOKEN:-}" -v "$DIR":/out python:3.12-slim sh -c \
-      "pip install -q -U 'huggingface_hub[hf_xet]' && hf download $REPO --revision $REV --include 'UD-Q3_K_XL/*' --include imatrix_unsloth.gguf_file --local-dir /out" || exit 3
+      'pip install -q -U "huggingface_hub[hf_xet]" && exec hf download "$@" --local-dir /out' sh "$repo" --revision "$rev" "${inc[@]}"
   fi
+}
+
+verify(){   # verify <dir> <file prefix> <name of the hash array>: sha256 of the 9 shards, in parallel
+  local d=$1 pre=$2 bad=0 pids=() i f p; local -n want=$3
+  for i in 1 2 3 4 5 6 7 8 9; do
+    f=$d/$pre-0000$i-of-00009.gguf
+    [ -f "$f" ] || { say "missing $f"; bad=1; continue; }
+    ( got=$(sha256sum "$f" | cut -d' ' -f1); [ "$got" = "${want[$((i-1))]}" ] || { echo "[get-model] MISMATCH $f: $got"; exit 1; } ) &
+    pids+=($!)
+  done
+  for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || bad=1; done
+  return $bad
+}
+
+if [ $BUILD = 0 ]; then
+  if [ $SKIP = 0 ]; then
+    case "$A5_REPO $A5_REV" in __*|*" __"*) say "this copy has no published a5 shards to download (no repo or no pinned revision); build them: $0 $DIR --build"; exit 2;; esac
+    [ "$(avail_gb)" -ge 340 ] || say "warning: $(avail_gb) GB free under $DIR; 337 GB are needed"
+    fetch "$A5_REPO" "$A5_REV" "UD-Q3_K_XL-a5/*" "LICENSE*" || exit 3
+  fi
+  say "verifying the a5 shards (sha256, 337 GB)"
+  verify "$DST" GLM-5.3-UD-Q3_K_XL-a5 A5_SHA || { say "verification failed: run this script again (the download resumes)"; exit 4; }
+  say "a5 verified"
+  say "done: $DST/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf"
+  exit 0
+fi
+
+# --build: Unsloth's files, then the requant
+if [ $SKIP = 0 ]; then
+  [ "$(avail_gb)" -ge 690 ] || say "warning: $(avail_gb) GB free under $DIR; ~681 GB are needed (343 + 1 + 337)"
+  fetch "$REPO" "$REV" "UD-Q3_K_XL/*" imatrix_unsloth.gguf_file || exit 3
 fi
 
 say "verifying the original shards and the imatrix (sha256, ~343 GB)"
-BAD=0; PIDS=()
-for i in 1 2 3 4 5 6 7 8 9; do
-  f=$SRC/GLM-5.3-UD-Q3_K_XL-0000$i-of-00009.gguf
-  [ -f "$f" ] || { say "missing $f"; BAD=1; continue; }
-  ( got=$(sha256sum "$f" | cut -d' ' -f1); [ "$got" = "${SHA[$((i-1))]}" ] || { echo "[get-model] MISMATCH $f: $got"; exit 1; } ) &
-  PIDS+=($!)
-done
-for p in "${PIDS[@]}"; do wait "$p" || BAD=1; done
+BAD=0
+verify "$SRC" GLM-5.3-UD-Q3_K_XL SHA || BAD=1
 [ "$(sha256sum "$IMX" 2>/dev/null | cut -d' ' -f1)" = "$IMX_SHA" ] || { say "imatrix missing or MISMATCH at $IMX"; BAD=1; }
-[ $BAD = 0 ] || { say "verification failed: re-run the download (it resumes), then this script with --skip-download"; exit 4; }
+[ $BAD = 0 ] || { say "verification failed: run the download again (it resumes), then this script with --build --skip-download"; exit 4; }
 say "original verified"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { say "no image $IMAGE (docker build -t glm53-offload -f docker/Dockerfile .)"; exit 2; }
@@ -89,13 +124,13 @@ docker run --rm -v "$DIR":/m --entrypoint /app/llama-quantize "$IMAGE" --allow-r
   --imatrix /m/imatrix_unsloth.gguf_file "${TT[@]}" --output-tensor-type q6_k --token-embedding-type q8_0 \
   /m/UD-Q3_K_XL/GLM-5.3-UD-Q3_K_XL-00001-of-00009.gguf /m/UD-Q3_K_XL-a5/GLM-5.3-UD-Q3_K_XL-a5 Q5_K_M "$(nproc)" || exit 5
 
-say "verifying the a5 shards"
-BAD=0
-for i in 1 2 3 4 5 6 7 8 9; do
-  f=$DST/GLM-5.3-UD-Q3_K_XL-a5-0000$i-of-00009.gguf
-  got=$(sha256sum "$f" | cut -d' ' -f1)
-  [ "$got" = "${A5_SHA[$((i-1))]}" ] || { say "a5 shard $i differs from the reference ($got): the model still runs, but it is not the measured file"; BAD=1; }
-done
-[ $BAD = 0 ] && say "a5 verified: byte-identical to the reference"
-if [ $DEL = 1 ] && [ $BAD = 0 ]; then rm -rf "$SRC"; say "removed the original ($SRC)"; fi
-say "done: $DST/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf"
+say "verifying the a5 shards (sha256, 337 GB)"
+if verify "$DST" GLM-5.3-UD-Q3_K_XL-a5 A5_SHA; then
+  say "a5 verified: byte-identical to the reference"
+  if [ $DEL = 1 ]; then rm -rf "$SRC"; say "removed the original ($SRC)"; fi
+  say "done: $DST/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf"
+else
+  say "the a5 shards differ from the reference: the model still runs, but it is not the measured file"
+  say "left in place: $DST/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf"
+  exit 6
+fi

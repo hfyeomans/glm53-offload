@@ -1,7 +1,7 @@
 From 144e12276f9f87e0b4a844ce0055cbe3a388e0b1 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 12:32:20 -0600
-Subject: [PATCH 115/141] layer-major prompt graph: every block views exactly
+Subject: [PATCH 115/211] layer-major prompt graph: every block views exactly
  the batch key extent, past the ubatch n_kv if need be (a view is checked
  against the whole cache tensor), so the batch has one size and the allocator
  plans once

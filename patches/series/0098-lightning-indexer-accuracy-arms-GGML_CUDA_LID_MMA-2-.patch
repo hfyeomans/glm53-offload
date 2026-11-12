@@ -1,7 +1,7 @@
 From ea5b93ecba523a72f526d3f9b54ac9c0cb3d04cc Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 20:34:39 -0600
-Subject: [PATCH 098/141] lightning indexer accuracy arms: GGML_CUDA_LID_MMA=2
+Subject: [PATCH 098/211] lightning indexer accuracy arms: GGML_CUDA_LID_MMA=2
  (fresh accumulator per 16-dim step, f32 adds) and GGML_CUDA_LID_VEC=1 (the
  f32 vector kernel)
 

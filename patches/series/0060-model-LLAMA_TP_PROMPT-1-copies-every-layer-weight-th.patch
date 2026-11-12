@@ -1,7 +1,7 @@
 From 762d5fdba64bd5a4d87fadb853bf3d5173e882b4 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 04:45:20 -0600
-Subject: [PATCH 060/141] model: LLAMA_TP_PROMPT=1 copies every layer weight
+Subject: [PATCH 060/211] model: LLAMA_TP_PROMPT=1 copies every layer weight
  that lives on one GPU to the other at load (tp_w, tp_home)
 
 ---

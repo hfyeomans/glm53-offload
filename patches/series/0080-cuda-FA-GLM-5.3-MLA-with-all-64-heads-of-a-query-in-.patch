@@ -1,7 +1,7 @@
 From 645ef17ff3f3e78c06317f6b64deb78faac33502 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 11:49:56 -0600
-Subject: [PATCH 080/141] cuda FA: GLM-5.3 MLA with all 64 heads of a query in
+Subject: [PATCH 080/211] cuda FA: GLM-5.3 MLA with all 64 heads of a query in
  one tile (ncols1 1, ncols2 64; sparse from 4K keys; GGML_CUDA_FA_MLA64=0
  restores the 16-head grouping) + test cases
 

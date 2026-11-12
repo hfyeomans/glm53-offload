@@ -1,7 +1,7 @@
 From f3fe3dfa9a937200692d7b94e856a6dec69505f0 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 11:05:06 -0600
-Subject: [PATCH 027/141] moe cache: LLAMA_MOE_PREFETCH=1 predicts the next
+Subject: [PATCH 027/211] moe cache: LLAMA_MOE_PREFETCH=1 predicts the next
  layer's experts at the top of each layer (decode), plans them into the cache
  at the lookup callback and uploads the uncached ones on the side stream
  before that layer's hits

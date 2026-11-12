@@ -1,7 +1,7 @@
 From 71be04893b597db8dd7fd0962f5e4e416757bff3 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 04:45:20 -0600
-Subject: [PATCH 062/141] context: the copy callback uploads the expert views
+Subject: [PATCH 062/211] context: the copy callback uploads the expert views
  of LLAMA_TP_PROMPT in one copy through the card upload ring (per-backend ring
  marker)
 

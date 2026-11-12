@@ -1,0 +1,32 @@
+From 549a229a22f118b3ab5c386ae22fc3e65c300671 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:24:58 -0600
+Subject: [PATCH 204/211] 0197: LLAMA_SHORT_BATCH_UB=u -- a short batch in
+ small ubatches, on the cache decode path and inside the arena head, so it
+ gives no borrowed slot up
+
+---
+ src/llama-context.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8328ac34f..468cfc3cd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2497,6 +2497,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         const uint32_t u = ((n_all + k - 1)/k + 255)/256*256;
+         n_ub = std::min(n_ub, u);
+     }
++    // 0197 LLAMA_SHORT_BATCH_UB=u: a batch of at most LLAMA_SHORT_BATCH_MAX tokens in ubatches of at most u, on the cache's decode path and
++    // inside the arena's head, so it gives no borrowed slot up
++    static const uint32_t short_ub  = getenv("LLAMA_SHORT_BATCH_UB") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_SHORT_BATCH_UB"))) : 0;
++    static const uint32_t short_max = getenv("LLAMA_SHORT_BATCH_MAX") != nullptr ? (uint32_t) std::max(0, atoi(getenv("LLAMA_SHORT_BATCH_MAX"))) : 256;
++    if (short_ub > 0 && moe_cache && !lm_try && balloc->get_n_tokens() <= short_max) {
++        n_ub = std::min(n_ub, short_ub);
++    }
+ 
+     while (true) {
+         mctx = memory->init_batch(*balloc, n_ub, embd_all);
+-- 
+2.43.0
+

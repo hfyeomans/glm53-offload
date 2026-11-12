@@ -1,7 +1,7 @@
 From 67b1a0d8c666a13fba07119ec1c91fa5f205854a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:19:24 -0600
-Subject: [PATCH 110/141] layer-major prompt graph: k = min(LLAMA_LM_PIPE,
+Subject: [PATCH 110/211] layer-major prompt graph: k = min(LLAMA_LM_PIPE,
  ceil(n / LLAMA_LM_MIN_UB)) balanced ubatches of a multiple of 256 rows (a
  short prompt is one ubatch, its experts uploaded once)
 

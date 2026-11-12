@@ -1,0 +1,138 @@
+From 09d000804c3828a55384a1eee62b834648ddf6ea Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:53:53 -0600
+Subject: [PATCH 202/211] 0195: LLAMA_MOE_PROMPT_STAGE_ARENA=1 -- the prompt
+ prefetch's staging areas from the top of the arena, so they hold experts
+ during decode
+
+---
+ ggml/include/ggml-cuda.h        |  2 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 30 ++++++++++++++++++++++++++++--
+ src/llama-moe-cache.cpp         | 29 ++++++++++++++++++++++++++++-
+ 3 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 600bdee62..005166647 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -75,6 +75,8 @@ GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_alloc_borrowed(ggml_bac
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_arena_buffer_type(ggml_backend_t backend);
+ // the arena's layout, as offsets from its base: the head, the largest compute buffer, the ring's range and the bytes mapped
+ GGML_BACKEND_API void ggml_backend_cuda_arena_info(ggml_backend_t backend, size_t * head, size_t * compute, size_t * ring_lo, size_t * ring_hi, size_t * mapped);
++// 0195: a buffer from the top of the arena's shared pages, for memory only the graphs that give the borrowed slots up use; nullptr without an arena
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_arena_alloc_top(ggml_backend_t backend, size_t size);
+ // waits for every stream of the backend's device (the main stream, the upload ring, the side uploads)
+ GGML_BACKEND_API void ggml_backend_cuda_synchronize_device(ggml_backend_t backend);
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8f981ba67..9f5eefae9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7233,6 +7233,7 @@ struct ggml_cuda_arena {
+     size_t    compute = 0; // the largest compute buffer handed out, from va
+     size_t    ring_lo = 0; // the upload ring's memory [ring_lo, ring_hi), after the compute buffer
+     size_t    ring_hi = 0;
++    size_t    top_lo  = 0; // 0195: [top_lo, head + shared) is held from the top of the shared pages, 0: nothing
+     int       live    = 0; // compute buffers from the arena not freed yet
+     ggml_backend_buffer_type buft = {};
+ };
+@@ -7316,7 +7317,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_arena_alloc_buffer(ggml_backend_b
+     const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+     ggml_cuda_arena & a = g_cuda_arena[device];
+ #if defined(GGML_USE_VMM)
+-    if (a.live == 0 && (a.ring_hi == 0 || size <= a.ring_lo) && ggml_cuda_arena_grow(device, size)) {
++    if (a.live == 0 && (a.ring_hi == 0 || size <= a.ring_lo) && (a.top_lo == 0 || size <= a.top_lo) && ggml_cuda_arena_grow(device, size)) {
+         a.compute = std::max(a.compute, size);
+         a.live++;
+         ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) a.va);
+@@ -7344,7 +7345,10 @@ static void ggml_cuda_ring_malloc(void ** ptr, size_t size, int device, bool are
+ #if defined(GGML_USE_VMM)
+     ggml_cuda_arena & a = g_cuda_arena[device];
+     if (arena_ok && a.va != 0 && ggml_cuda_borrow_ring()) {
+-        const size_t lo = a.ring_hi > 0 ? a.ring_hi : GGML_PAD(a.compute, 4096);
++        size_t lo = a.ring_hi > 0 ? a.ring_hi : GGML_PAD(a.compute, 4096);
++        if (a.top_lo > 0 && lo < a.head + a.shared && lo + size > a.top_lo) {
++            lo = a.head + a.shared; // 0195: past what the top holds
++        }
+         if (ggml_cuda_arena_grow(device, lo + size)) {
+             if (a.ring_hi == 0) {
+                 a.ring_lo = lo;
+@@ -7456,6 +7460,28 @@ void ggml_backend_cuda_arena_info(ggml_backend_t backend, size_t * head, size_t
+     *mapped  = a.mapped;
+ }
+ 
++ggml_backend_buffer_t ggml_backend_cuda_arena_alloc_top(ggml_backend_t backend, size_t size) {
++#if defined(GGML_USE_VMM)
++    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
++    ggml_cuda_arena & a = g_cuda_arena[device];
++    if (a.va == 0) {
++        return nullptr;
++    }
++    size = GGML_PAD(size, ggml_cuda_info().devices[device].vmm_granularity);
++    const size_t end = a.top_lo > 0 ? a.top_lo : a.head + a.shared;
++    if (end < a.head + size) {
++        return nullptr;
++    }
++    a.top_lo = end - size;
++    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) (a.va + a.top_lo));
++    ctx->external = true;
++    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
++#else
++    GGML_UNUSED(backend); GGML_UNUSED(size);
++    return nullptr;
++#endif // defined(GGML_USE_VMM)
++}
++
+ void ggml_backend_cuda_synchronize_device(ggml_backend_t backend) {
+     ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
+     CUDA_CHECK(cudaDeviceSynchronize());
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index e68e5c303..de36f8283 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-model.h"
+ 
+ #include "ggml-cpp.h"
++#include "ggml-alloc.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -2515,7 +2516,33 @@ struct llama_moe_cache::impl {
+                         total += es[ip]*p_pf_n;
+                     }
+                 }
+-                ps.buf = llama_memory_bufs::alloc_buf(ps.ctx.get(), devices[id].buft, false, "MoE prompt prefetch");
++#ifdef GGML_USE_CUDA
++                // 0195 LLAMA_MOE_PROMPT_STAGE_ARENA=1: the staging areas from the top of the arena: only graphs that have given the borrowed slots up use them
++                static const bool stage_arena = getenv("LLAMA_MOE_PROMPT_STAGE_ARENA") != nullptr && atoi(getenv("LLAMA_MOE_PROMPT_STAGE_ARENA")) != 0 &&
++                    getenv("LLAMA_MOE_CACHE_BORROW_RING") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_RING")) != 0;
++                if (stage_arena && devices[id].borrow_bytes > 0 && ggml_backend_is_cuda(devices[id].backend)) {
++                    const size_t align = ggml_backend_buft_get_alignment(devices[id].buft);
++                    size_t a_size = 0;
++                    for (int a = 0; a < 2; ++a) {
++                        for (size_t ip = 0; ip < n_ip && ip < 4; ++ip) {
++                            a_size += GGML_PAD(ggml_nbytes(ps.t[a][ip]), align);
++                        }
++                    }
++                    ps.buf.reset(ggml_backend_cuda_arena_alloc_top(devices[id].backend, a_size));
++                    if (ps.buf) {
++                        ggml_tallocr ta = ggml_tallocr_new(ps.buf.get());
++                        for (int a = 0; a < 2; ++a) {
++                            for (size_t ip = 0; ip < n_ip && ip < 4; ++ip) {
++                                GGML_ASSERT(ggml_tallocr_alloc(&ta, ps.t[a][ip]) == GGML_STATUS_SUCCESS);
++                            }
++                        }
++                        LLAMA_LOG_INFO("%s: 0195: device %zu: the staging areas from the top of the arena\n", __func__, id);
++                    }
++                }
++#endif
++                if (!ps.buf) {
++                    ps.buf = llama_memory_bufs::alloc_buf(ps.ctx.get(), devices[id].buft, false, "MoE prompt prefetch");
++                }
+                 GGML_ASSERT(ps.buf);
+                 LLAMA_LOG_INFO("%s: LLAMA_MOE_PROMPT_PREFETCH: device %zu: %d experts a layer, two staging areas, %.1f MiB\n", __func__, id, p_pf_n,
+                     total/1024.0/1024.0);
+-- 
+2.43.0
+

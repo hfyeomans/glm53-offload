@@ -1,0 +1,36 @@
+From 8e8a0e27fc345a30f05d22aa1112f501c79bd628 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 03:17:30 -0600
+Subject: [PATCH 196/211] 0189: LLAMA_HEAD_OVERLAP=1 -- the split head card's
+ half in a split of its own, the concat waits for a copy of the other half
+ (0185 blocked the host)
+
+---
+ src/models/glm-dsa.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index c1b5f4d52..e3dfc87f4 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -212,7 +212,16 @@ static ggml_tensor * glm_dsa_head(ggml_context * ctx0, ggml_cgraph * gf, ggml_ba
+     ggml_tensor * wo = ggml_view_2d(ctx0, w, w->ne[0], w->ne[1] - nh, w->nb[1], (size_t) nh*w->nb[1]);
+     ggml_tensor * lo = ggml_mul_mat(ctx0, wo, cur);
+     ggml_backend_sched_set_tensor_backend(sched, lo, be_o);
+-    ggml_tensor * l = ggml_concat(ctx0, lx, lo, 0);
++    // 0189 LLAMA_HEAD_OVERLAP=1: lo in a split of its own (no cross-card input), then a copy of lx on the other card, so the concat's split
++    // waits for that copy instead of holding lo back until lx arrives
++    static const bool head_overlap = getenv("LLAMA_HEAD_OVERLAP") != nullptr && atoi(getenv("LLAMA_HEAD_OVERLAP")) != 0;
++    ggml_tensor * lx_c = lx;
++    if (head_overlap) {
++        ggml_build_forward_expand(gf, lo);
++        lx_c = ggml_cont(ctx0, lx);
++        ggml_backend_sched_set_tensor_backend(sched, lx_c, be_x);
++    }
++    ggml_tensor * l = ggml_concat(ctx0, lx_c, lo, 0);
+     // 0185 LLAMA_HEAD_CONCAT_X=1: concatenated on the other card, so lo's split has no cross-card input and runs beside lx
+     static const bool concat_x = getenv("LLAMA_HEAD_CONCAT_X") != nullptr && atoi(getenv("LLAMA_HEAD_CONCAT_X")) != 0;
+     ggml_backend_sched_set_tensor_backend(sched, l, concat_x ? be_x : be_o);
+-- 
+2.43.0
+

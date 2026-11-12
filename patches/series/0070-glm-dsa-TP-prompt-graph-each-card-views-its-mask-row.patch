@@ -1,7 +1,7 @@
 From ad3443eae193f09051c172ba8710d7ad4d146abc Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 06:09:47 -0600
-Subject: [PATCH 070/141] glm-dsa TP prompt graph: each card views its mask
+Subject: [PATCH 070/211] glm-dsa TP prompt graph: each card views its mask
  rows once per graph (a view per layer was a separate 256 MB host copy at 32K,
  52 GB kept with pipeline copies)
 

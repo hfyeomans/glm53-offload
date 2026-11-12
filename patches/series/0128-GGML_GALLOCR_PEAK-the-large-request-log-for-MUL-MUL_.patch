@@ -1,7 +1,7 @@
 From 724b40df9743bd209cd5470328857e3f7972086d Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:30:59 -0600
-Subject: [PATCH 128/141] GGML_GALLOCR_PEAK: the large-request log for MUL /
+Subject: [PATCH 128/211] GGML_GALLOCR_PEAK: the large-request log for MUL /
  MUL_MAT_ID only
 
 ---

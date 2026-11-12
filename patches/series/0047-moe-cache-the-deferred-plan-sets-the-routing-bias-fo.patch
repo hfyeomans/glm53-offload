@@ -1,7 +1,7 @@
 From b3ee393729f12d0a763df671feb491b94b49e354 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 19:43:29 -0600
-Subject: [PATCH 047/141] moe-cache: the deferred plan sets the routing bias
+Subject: [PATCH 047/211] moe-cache: the deferred plan sets the routing bias
  for the next token and, with LLAMA_MOE_ASYNC_FILL_TOKENS, fills on the side
  stream behind a per-layer event
 

@@ -1,0 +1,133 @@
+From f4164cf5e6c8253b6766610ddd0d368c56d4ad00 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 06:57:35 -0600
+Subject: [PATCH 199/211] 0192: LLAMA_GRAPH_SLOTS=N -- an MTP draft context
+ keeps up to N (scheduler, graph) slots keyed by batch shape (0180 deferral
+ rebuilt every draft)
+
+---
+ src/llama-context.cpp | 66 ++++++++++++++++++++++++++++++++++++++++++-
+ src/llama-context.h   | 13 +++++++++
+ 2 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a3b602f5d..83c305d40 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -994,6 +994,8 @@ void llama_context::sched_reserve() {
+     gf_res_prev_active = nullptr;
+     sched_alt.reset(); // 0187: made again on first use, from the new buffer types
+     gf_res_prev_active_alt = nullptr;
++    graph_slots.clear(); // 0192: the same
++    graph_slot_cur = -1;
+ 
+     sched_new(max_nodes, cparams.pipeline_parallel);
+ 
+@@ -1893,10 +1895,65 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // 0192 LLAMA_GRAPH_SLOTS=N: up to N (scheduler, graph) slots of an MTP draft context keyed by the batch's (tokens, outputs)
++    static const int n_graph_slots = getenv("LLAMA_GRAPH_SLOTS") != nullptr ? std::max(0, atoi(getenv("LLAMA_GRAPH_SLOTS"))) : 0;
++    const bool use_slots = n_graph_slots >= 2 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !moe_cache && gf_res_reserve;
++    if (use_slots) {
++        if (graph_slot_cur < 0) {
++            graph_slots.clear();
++            graph_slots.emplace_back(); // the home slot: the context's own scheduler, which stays in sched while it is current
++            graph_slots[0].key = -1;
++            graph_slot_cur = 0;
++            LLAMA_LOG_INFO("%s: LLAMA_GRAPH_SLOTS: up to %d graph slots by batch shape\n", __func__, n_graph_slots);
++        }
++        const int64_t key = ubatch.n_tokens > 32 ? -1 : (((int64_t) ubatch.n_tokens << 32) | (uint32_t) n_outputs);
++        int want = -1;
++        for (int i = 0; i < (int) graph_slots.size(); ++i) {
++            if (graph_slots[i].key == key) {
++                want = i;
++                break;
++            }
++        }
++        if (want < 0) {
++            if ((int) graph_slots.size() < n_graph_slots) {
++                graph_slots.emplace_back();
++                want = (int) graph_slots.size() - 1;
++            } else { // the least recently used slot that is neither home nor current
++                for (int i = 1; i < (int) graph_slots.size(); ++i) {
++                    if (i != graph_slot_cur && (want < 0 || graph_slots[i].used < graph_slots[want].used)) {
++                        want = i;
++                    }
++                }
++                graph_slots[want].active = nullptr;
++                if (graph_slots[want].res) {
++                    graph_slots[want].res->reset();
++                }
++            }
++            graph_slots[want].key = key;
++        }
++        if (want != graph_slot_cur) {
++            auto & from = graph_slots[graph_slot_cur];
++            auto & to   = graph_slots[want];
++            from.sched  = std::move(sched);
++            from.active = gf_res_prev_active;
++            if (!to.sched) {
++                to.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                    gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
++                ggml_backend_sched_set_copy_callback(to.sched.get(), sched_copy_experts, this);
++                to.active = nullptr;
++            }
++            sched = std::move(to.sched);
++            gf_res_prev_active = to.active;
++            to.active = nullptr;
++            graph_slot_cur = want;
++        }
++        graph_slots[graph_slot_cur].used = ++graph_slot_clock;
++    }
++
+     // 0187 LLAMA_GRAPH_DUAL_SCHED=1: an MTP draft context alternates its catch-up (no outputs) with one-row drafts; each kind keeps its
+     // own scheduler, and so its allocated graph, so neither is rebuilt because the other ran in between
+     static const bool dual_sched = getenv("LLAMA_GRAPH_DUAL_SCHED") != nullptr && atoi(getenv("LLAMA_GRAPH_DUAL_SCHED")) != 0;
+-    if (dual_sched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !moe_cache && gf_res_reserve) {
++    if (!use_slots && dual_sched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !moe_cache && gf_res_reserve) {
+         const int slot = n_outputs > 0 ? 1 : 0;
+         if (slot != sched_slot) {
+             if (!sched_alt) {
+@@ -3106,6 +3163,13 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
+ }
+ 
+ llm_graph_result * llama_context::get_gf_res_prev() {
++    if (graph_slot_cur >= 0 && graph_slot_cur < (int) graph_slots.size()) { // 0192: the current slot's graph result
++        auto & sr = graph_slots[graph_slot_cur].res;
++        if (!sr) {
++            sr.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
++        }
++        return sr.get();
++    }
+     auto & res = gf_res_prev[n_outputs > 0];
+     if (!res) {
+         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 097dd6da9..b91a524bc 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -375,6 +375,19 @@ private:
+     llm_graph_result * gf_res_prev_active_alt = nullptr;
+     int sched_slot = 0;
+ 
++    // 0192 LLAMA_GRAPH_SLOTS=N (an MTP draft context): (scheduler, graph) slots keyed by the batch's (tokens, outputs); slot 0 is the home
++    // slot (the reserved scheduler, batches over 32 tokens); the current slot's scheduler and active graph are in sched / gf_res_prev_active
++    struct graph_slot {
++        int64_t key = -1;
++        ggml_backend_sched_ptr sched;
++        std::unique_ptr<llm_graph_result> res;
++        llm_graph_result * active = nullptr;
++        uint64_t used = 0;
++    };
++    std::vector<graph_slot> graph_slots;
++    int graph_slot_cur = -1;
++    uint64_t graph_slot_clock = 0;
++
+     bool sched_need_reserve = true;
+ 
+     // whether the reserve graph has a logits tensor, set in sched_reserve()
+-- 
+2.43.0
+

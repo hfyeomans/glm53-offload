@@ -1,7 +1,7 @@
 From 67840155248be0ae147f8f03cd72936627ad1bd4 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 09:55:00 -0600
-Subject: [PATCH 024/141] cuda: GGML_CUDA_OP_TIMING=1 times every op with
+Subject: [PATCH 024/211] cuda: GGML_CUDA_OP_TIMING=1 times every op with
  device events and prints the top entries; GGML_CUDA_DISABLE_GRAPHS=1 runs
  without CUDA graphs
 

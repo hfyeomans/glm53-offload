@@ -1,7 +1,7 @@
 From 5073dc76e8e457bafdced7d16e7dd473de763661 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:17:45 -0600
-Subject: [PATCH 108/141] layer-major prompt graph: at least one FFN block on
+Subject: [PATCH 108/211] layer-major prompt graph: at least one FFN block on
  the last layer, on 0 rows when the ubatch has no outputs (an empty block list
  crashed the builder for every ubatch of a prompt but its last)
 

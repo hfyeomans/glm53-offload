@@ -1,7 +1,7 @@
 From 51d2a2e01762b0312ef11088eed0e9ad677bcf0e Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 06:31:12 -0600
-Subject: [PATCH 072/141] LLAMA_TP_PROMPT: the both-cards prompt graph only for
+Subject: [PATCH 072/211] LLAMA_TP_PROMPT: the both-cards prompt graph only for
  a batch that is one ubatch (LLAMA_TP_PROMPT_ANY=1 for every batch)
 
 ---

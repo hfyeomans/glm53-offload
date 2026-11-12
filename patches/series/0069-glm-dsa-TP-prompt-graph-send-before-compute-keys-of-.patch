@@ -1,7 +1,7 @@
 From 3d79cd8cc17804fa09c757389ccd4afa12b5510a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 06:01:26 -0600
-Subject: [PATCH 069/141] glm-dsa TP prompt graph: send before compute (keys of
+Subject: [PATCH 069/211] glm-dsa TP prompt graph: send before compute (keys of
  both cards before attention, the non-home expert half first, both cards
  gather/reduce receives before their norms and shared experts)
 

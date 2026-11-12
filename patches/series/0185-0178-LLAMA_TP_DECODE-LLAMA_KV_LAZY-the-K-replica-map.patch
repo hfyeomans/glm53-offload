@@ -1,0 +1,66 @@
+From 4a72405d8dd5c74b324690b1e24642f98fee4c41 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 18:45:33 -0600
+Subject: [PATCH 185/211] 0178: LLAMA_TP_DECODE + LLAMA_KV_LAZY -- the K
+ replica mapped lazily with the home KV, its unused pages lendable to the MoE
+ cache
+
+---
+ src/llama-kv-cache.cpp | 41 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 9248979c9..b9b9eb5d9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1583,7 +1583,46 @@ void llama_kv_cache::td_rep_alloc() {
+         ggml_format_name(l.k_rep, "cache_k_rep_l%d", (int) l.il);
+     }
+     for (auto & [buft, ctx] : ctxs) {
+-        ggml_backend_buffer_t buf = td_rep_bufs.emplace(std::move(ctx), buft, "K replica");
++        ggml_backend_buffer_t buf = nullptr;
++#ifdef GGML_USE_CUDA
++        // 0178 LLAMA_KV_LAZY=1: mapped as the cells are used, with the home KV (llama_kv_lazy_commit maps every lazy buffer)
++        static const bool kv_lazy = getenv("LLAMA_KV_LAZY") != nullptr && atoi(getenv("LLAMA_KV_LAZY")) != 0;
++        if (kv_lazy && !lazy_bufs.empty()) {
++            std::vector<ggml_tensor *> ts;
++            std::vector<size_t> lens;
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->view_src == nullptr) {
++                    ts.push_back(t);
++                    lens.push_back(ggml_backend_buft_get_alloc_size(buft, t));
++                }
++            }
++            std::vector<size_t> offs(ts.size());
++            buf = ts.empty() ? nullptr : ggml_backend_cuda_alloc_lazy(buft, (int) ts.size(), lens.data(), offs.data());
++            if (buf != nullptr) {
++                char * base = (char *) ggml_backend_buffer_get_base(buf);
++                llama_kv_lazy_buf lb = { buf, {}, {} };
++                for (size_t i = 0; i < ts.size(); ++i) {
++                    GGML_ASSERT(ggml_backend_tensor_alloc(buf, ts[i], base + offs[i]) == GGML_STATUS_SUCCESS);
++                    lb.row.push_back(ts[i]->nb[1]);
++                    lb.len.push_back(lens[i]);
++                }
++                lazy_bufs.push_back(lb);
++                td_rep_bufs.bufs.emplace_back(std::move(ctx), ggml_backend_buffer_ptr(buf));
++                // the cells mapped so far for the home KV, for the replica too
++                std::vector<size_t> w(lb.row.size());
++                for (size_t i = 0; i < w.size(); ++i) {
++                    w[i] = std::min(lb.len[i], (size_t) lazy_cells*lb.row[i]);
++                }
++                if (lazy_cells > 0 && !ggml_backend_cuda_lazy_commit(buf, w.data(), (int) w.size())) {
++                    throw std::runtime_error("LLAMA_TP_DECODE: could not map the lazy K replica");
++                }
++                LLAMA_LOG_INFO("%s: LLAMA_TP_DECODE: lazy K replica on %s (%.1f MiB when every cell is mapped)\n", __func__,
++                    ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
++                continue;
++            }
++        }
++#endif
++        buf = td_rep_bufs.emplace(std::move(ctx), buft, "K replica");
+         if (buf == nullptr) {
+             throw std::runtime_error("LLAMA_TP_DECODE: failed to allocate the K replica");
+         }
+-- 
+2.43.0
+

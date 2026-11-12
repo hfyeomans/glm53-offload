@@ -1,0 +1,74 @@
+From 55d8ea54f08bc206f29722539774b72dfe24c2f9 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:51:12 -0600
+Subject: [PATCH 151/211] 0141: lendable chunks are one handle a page (cuMemMap
+ offsets must be zero)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 947dacead..920d06cdd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7432,7 +7432,7 @@ void ggml_backend_cuda_synchronize_device(ggml_backend_t backend) {
+ // again, the most recently given first (ggml_backend_cuda_lend_take).
+ struct ggml_cuda_lend_chunk {
+ #if defined(GGML_USE_VMM)
+-    CUmemGenericAllocationHandle h = 0;
++    std::vector<CUmemGenericAllocationHandle> h; // 0147: one handle a page (cuMemMap maps a handle from its start only)
+ #endif
+     size_t bytes = 0;
+     std::vector<uintptr_t> va; // its pieces in the banks: address, length, offset in the chunk
+@@ -7587,7 +7587,9 @@ bool ggml_backend_cuda_lazy_commit(ggml_backend_buffer_t buf, const size_t * wan
+             ggml_cuda_lazy_map m = {};
+             if (got) {
+                 ggml_cuda_lend_chunk & c = L.chunks[k];
+-                CU_CHECK(cuMemMap(at, r*gran, p*gran, c.h, 0));
++                for (size_t q = 0; q < r; ++q) {
++                    CU_CHECK(cuMemMap(at + q*gran, gran, 0, c.h[p + q], 0));
++                }
+                 for (size_t q = p; q < p + r; ++q) {
+                     c.out[q] = 1;
+                 }
+@@ -7684,7 +7686,11 @@ ggml_backend_buffer_t ggml_backend_cuda_alloc_banks(ggml_backend_t backend, size
+     }
+     for (ggml_cuda_lend_chunk & c : L.chunks) {
+         GGML_ASSERT(c.bytes > 0 && c.bytes % gran == 0);
+-        c.h = ggml_cuda_vmm_create(device, c.bytes); // kept: its pages move between the banks and the lazy buffers
++        // kept: its pages move between the banks and the lazy buffers
++        c.h.resize(c.bytes/gran);
++        for (CUmemGenericAllocationHandle & hp : c.h) {
++            hp = ggml_cuda_vmm_create(device, gran);
++        }
+         c.out.assign(c.bytes/gran, 0);
+     }
+     CUdeviceptr bank = 0;
+@@ -7712,7 +7718,9 @@ ggml_backend_buffer_t ggml_backend_cuda_alloc_banks(ggml_backend_t backend, size
+             apos += segs[i].len;
+         } else {
+             ggml_cuda_lend_chunk & c = L.chunks[segs[i].chunk];
+-            CU_CHECK(cuMemMap(at, segs[i].len, segs[i].chunk_off, c.h, 0));
++            for (size_t q = 0; q < segs[i].len/gran; ++q) {
++                CU_CHECK(cuMemMap(at + q*gran, gran, 0, c.h[segs[i].chunk_off/gran + q], 0));
++            }
+             ggml_cuda_vmm_access(device, at, segs[i].len);
+             c.va.push_back((uintptr_t) at);
+             c.len.push_back(segs[i].len);
+@@ -7785,8 +7793,11 @@ bool ggml_backend_cuda_lend_take(ggml_backend_t backend, int k) {
+         return false;
+     }
+     ggml_cuda_set_device(device);
++    const size_t gran = ggml_cuda_info().devices[device].vmm_granularity;
+     for (size_t i = 0; i < c.va.size(); ++i) {
+-        CU_CHECK(cuMemMap((CUdeviceptr) c.va[i], c.len[i], c.off[i], c.h, 0));
++        for (size_t q = 0; q < c.len[i]/gran; ++q) {
++            CU_CHECK(cuMemMap((CUdeviceptr) c.va[i] + q*gran, gran, 0, c.h[c.off[i]/gran + q], 0));
++        }
+         ggml_cuda_vmm_access(device, (CUdeviceptr) c.va[i], c.len[i]);
+     }
+     c.in_bank = true;
+-- 
+2.43.0
+

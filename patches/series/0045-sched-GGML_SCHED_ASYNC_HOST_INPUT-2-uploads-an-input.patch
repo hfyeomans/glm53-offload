@@ -1,7 +1,7 @@
 From 94fe5220e89dd92061de4c72ccc28e545af5c423 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 19:31:26 -0600
-Subject: [PATCH 045/141] sched: GGML_SCHED_ASYNC_HOST_INPUT=2 uploads an input
+Subject: [PATCH 045/211] sched: GGML_SCHED_ASYNC_HOST_INPUT=2 uploads an input
  computed on the host on a CUDA upload stream of its own, so it overlaps the
  work queued before it (pipeline-parallel copies only)
 

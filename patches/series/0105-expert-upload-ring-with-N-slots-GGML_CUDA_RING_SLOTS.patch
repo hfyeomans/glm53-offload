@@ -1,7 +1,7 @@
 From 7c94b09ca9d5dc4ff67c1d3f809314f8702df8c5 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 01:55:00 -0600
-Subject: [PATCH 105/141] expert upload ring with N slots
+Subject: [PATCH 105/211] expert upload ring with N slots
  (GGML_CUDA_RING_SLOTS=2..4, default 2): the upload of split k waits for split
  k-N
 

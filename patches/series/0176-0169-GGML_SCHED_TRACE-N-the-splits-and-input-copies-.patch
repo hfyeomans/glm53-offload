@@ -1,0 +1,74 @@
+From 367aac735f70d9ccb87eb9f9c3158628dd3997e8 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:08:08 -0600
+Subject: [PATCH 176/211] 0169: GGML_SCHED_TRACE=N -- the splits and input
+ copies of the first N graph computes, flushed
+
+---
+ ggml/src/ggml-backend.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 267f0acbc..c38719842 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2427,11 +2427,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         ggml_backend_sched_upload_user_inputs(sched);
+     }
+ 
++    // 0169 GGML_SCHED_TRACE=N: the splits of the first N graph computes, before and after each is issued
++    static const int sched_trace = getenv("GGML_SCHED_TRACE") != nullptr ? atoi(getenv("GGML_SCHED_TRACE")) : 0;
++    static int sched_trace_graph = 0;
++    const bool trace = sched_trace > 0 && sched_trace_graph < sched_trace;
++    if (sched_trace > 0) {
++        sched_trace_graph++;
++    }
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        if (trace) {
++            bool has_ar = false;
++            for (int j = 0; j < split->graph.n_nodes; j++) {
++                has_ar = has_ar || split->graph.nodes[j]->op == GGML_OP_PAIR_ALLREDUCE;
++            }
++            GGML_LOG_INFO("sched trace g%d s%d/%d %s: %d inputs, %d nodes [%s .. %s]%s\n", sched_trace_graph, split_id, sched->n_splits,
++                ggml_backend_name(split_backend), split->n_inputs, split->graph.n_nodes,
++                split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-",
++                split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "-", has_ar ? " ALLREDUCE" : "");
++            fflush(stdout);
++            fflush(stderr);
++        }
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         // 0060: not between two GPUs with transient inputs, their buffers are distinct
+@@ -2453,6 +2474,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             const bool host_pass = sched->host_weights_first[split_backend_id] ? pass == 0 : pass == 1;
+             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                 if (ggml_backend_sched_is_host_weight(split->inputs[input_id]) == host_pass) {
++                    if (trace) {
++                        ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
++                        GGML_LOG_INFO("sched trace   input %s from %s\n", split->inputs[input_id]->name, ib ? ggml_backend_name(ib) : "-");
++                        fflush(stderr);
++                    }
+                     ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                     n_copy_inputs++;
+                     n_host_weights += host_pass;
+@@ -2504,6 +2530,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (trace) {
++            GGML_LOG_INFO("sched trace g%d s%d issued\n", sched_trace_graph, split_id);
++            fflush(stderr);
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+-- 
+2.43.0
+

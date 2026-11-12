@@ -1,7 +1,7 @@
 From 814d77719bdce8d259b37e892d5536639f4b5438 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 04:32:21 -0600
-Subject: [PATCH 059/141] ggml: ggml_mul_mat_id_set_id_offset reads ids as id -
+Subject: [PATCH 059/211] ggml: ggml_mul_mat_id_set_id_offset reads ids as id -
  offset and skips the ones outside [0, n_as) (zero rows); CUDA supports it in
  mmq / mmf (expert parallelism)
 

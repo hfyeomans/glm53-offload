@@ -1,0 +1,35 @@
+From 2a566a679cb67b73ba3bc0437a5dbd9ab1962f8a Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:53:53 -0600
+Subject: [PATCH 203/211] 0196: LLAMA_MOE_CACHE_EQUAL_COVER=1 -- the same share
+ of every expert group in the cache, counting what is borrowed and lent
+
+---
+ src/llama-moe-cache.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index de36f8283..c3390a164 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1319,7 +1319,16 @@ struct llama_moe_cache::impl {
+         for (group & g : groups) {
+             const device & d = devices[g.id];
+             const int32_t n_expert  = g.ref[0]->ne[2];
+-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
++            size_t        budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
++            // 0196 LLAMA_MOE_CACHE_EQUAL_COVER=1: the same share of every group's experts, counting what is borrowed and lent
++            static const bool equal_cover = getenv("LLAMA_MOE_CACHE_EQUAL_COVER") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_EQUAL_COVER")) != 0;
++            if (equal_cover && borrow_group[g.id] >= 0 && d.borrow_bytes + d.lend_bytes > 0) {
++                const double own = (double) size*d.split/split_sum;
++                const double all = own + (double) (d.borrow_bytes + d.lend_bytes);
++                budget = borrow_group[g.id] == (int32_t) (&g - groups.data()) ?
++                    (size_t) std::max(0.0, own - all*(double) (d.host_bytes - g.host_bytes)/d.host_bytes) :
++                    (size_t) (all*g.host_bytes/d.host_bytes);
++            }
+             const int32_t max_slots = g.layers.size()*n_expert;
+             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                 g.n_slots++;
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 62c05385cb21883b68d774771dc455bcfff94efd Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 15:54:12 -0600
-Subject: [PATCH 019/141] ggml-alloc: GGML_GALLOCR_HEADROOM_PCT=N allocates
+Subject: [PATCH 019/211] ggml-alloc: GGML_GALLOCR_HEADROOM_PCT=N allocates
  compute chunks N % over the reservation, so graphs that outgrow it slightly
  do not reallocate (synchronize) under the pipeline
 

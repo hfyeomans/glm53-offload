@@ -1,7 +1,7 @@
 From 18fee94187e78c0e8619868e300f5a80a48b6861 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 12:20:37 -0600
-Subject: [PATCH 081/141] upload ring: GGML_CUDA_RING_MIXED=1 copies runs of
+Subject: [PATCH 081/211] upload ring: GGML_CUDA_RING_MIXED=1 copies runs of
  uncached experts host-to-device and cached ones from their banks (copy engine
  both ways); the TP expert views build their table
 

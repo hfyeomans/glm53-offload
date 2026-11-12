@@ -1,7 +1,7 @@
 From 5b43a8363e069117bb57513f953006ffcc75c3b4 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 10:46:12 -0600
-Subject: [PATCH 025/141] LLAMA_MOE_PROBE=1: score each layer's own router
+Subject: [PATCH 025/211] LLAMA_MOE_PROBE=1: score each layer's own router
  applied to the pre-attention residual of layers il, il+1, il+2 against the
  experts selected (the measurement behind prefetching predicted misses)
 

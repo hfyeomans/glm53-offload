@@ -1,7 +1,7 @@
 From f40d0357697b5609536a3c2fc487da6b13d05368 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 12:15:47 -0600
-Subject: [PATCH 114/141] GGML_GALLOCR_TRACE=1 (diagnostic): the graph
+Subject: [PATCH 114/211] GGML_GALLOCR_TRACE=1 (diagnostic): the graph
  allocator logs why it re-plans in a release build (counts, or the first node
  / source that outgrew its slot, with sizes); the layer-major graph logs its
  key extents

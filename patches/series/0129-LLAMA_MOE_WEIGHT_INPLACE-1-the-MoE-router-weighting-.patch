@@ -1,7 +1,7 @@
 From 0e6f91e44497e1adda6c518cc4cf245ecbd78052 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 17:38:17 -0600
-Subject: [PATCH 129/141] LLAMA_MOE_WEIGHT_INPLACE=1: the MoE router weighting
+Subject: [PATCH 129/211] LLAMA_MOE_WEIGHT_INPLACE=1: the MoE router weighting
  in place over the down projection output (never written once fused), and the
  CUDA weighted-reduction fusion accepts it
 

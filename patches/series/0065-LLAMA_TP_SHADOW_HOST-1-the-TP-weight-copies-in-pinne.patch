@@ -1,7 +1,7 @@
 From 4a6ad7525220cd729ba607c5378ce29d767db940 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 05:03:45 -0600
-Subject: [PATCH 065/141] LLAMA_TP_SHADOW_HOST=1: the TP weight copies in
+Subject: [PATCH 065/211] LLAMA_TP_SHADOW_HOST=1: the TP weight copies in
  pinned host memory (uploaded per prompt graph), so the MoE cache keeps its
  GPU memory
 

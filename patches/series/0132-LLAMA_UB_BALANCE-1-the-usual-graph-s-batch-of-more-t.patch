@@ -1,7 +1,7 @@
 From a11e5ac9b208befab05ad5107b6002e8b66ce9b1 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 10:15:57 -0600
-Subject: [PATCH 132/141] LLAMA_UB_BALANCE=1: the usual graph's batch of more
+Subject: [PATCH 132/211] LLAMA_UB_BALANCE=1: the usual graph's batch of more
  than n_ubatch tokens in equal ubatches instead of n_ubatch-sized ones and a
  tail
 

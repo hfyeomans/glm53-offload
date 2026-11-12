@@ -1,7 +1,7 @@
 From a90d453e9299095f5716317ecb0baed7af2cf4b5 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 16:07:28 -0600
-Subject: [PATCH 039/141] sched: GGML_SCHED_ASYNC_HOST_INPUT=1 uploads split
+Subject: [PATCH 039/211] sched: GGML_SCHED_ASYNC_HOST_INPUT=1 uploads split
  inputs computed on the host on the split backend stream instead of a blocking
  copy after waiting for the device
 

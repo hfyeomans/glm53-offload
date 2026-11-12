@@ -1,0 +1,104 @@
+From d4d527e7804fc82d09ad145ae16362e285b4d46e Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:00:21 -0600
+Subject: [PATCH 179/211] 0172: LLAMA_TD_HOME_FIRST=1 -- dense TD graphs queue
+ home attention first (6 splits a layer), TD splits at host weights without
+ inputs
+
+---
+ ggml/src/ggml-backend.cpp |  3 ++-
+ src/models/glm-dsa.cpp    | 28 ++++++++++++++++++++++------
+ 2 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c38719842..634c10377 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1788,7 +1788,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+ 
+             // check if we should start a new split based on the sources of the current node
+             bool need_new_split = false;
+-            if (node_backend_id == cur_backend_id && split->n_inputs > 0 && !pair) {
++            // 0172: under TD (gpu_switch_nosync) also a split without inputs, once it has nodes (the home router's split)
++            if (node_backend_id == cur_backend_id && (split->n_inputs > 0 || (sched->gpu_switch_nosync && i > split->i_start)) && !pair) {
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+                     struct ggml_tensor * src = node->src[j];
+                     if (src == NULL) {
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 88a87f044..e2af591d7 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -718,8 +718,12 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 pin_from(n0, c);
+             };
+ 
+-            // card c's heads of the attention, its wo partial, the all-reduce and the residual
++            // card c's heads of the attention, its wo partial, the all-reduce and the residual.  first: this card's all-reduce is the first
++            // of the pair queued, so it ends the card's split and the residual add waits for the card's FFN (0170, 0172)
++            static const bool td_home_first = getenv("LLAMA_TD_HOME_FIRST") != nullptr && atoi(getenv("LLAMA_TD_HOME_FIRST")) != 0;
++            const bool home_first = td_home_first && dense;
+             auto attn = [&](int c) {
++                const bool first = home_first ? c == H : c == O;
+                 const int n0 = ggml_graph_n_nodes(gf);
+                 ggml_tensor * top_k = dense ? nullptr : top_k_c[c];
+                 GGML_ASSERT((dense || top_k != nullptr) && "shared indexer layer must follow a previous full indexer layer");
+@@ -742,8 +746,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 o = ggml_mul_mat(ctx0, Wh(L.wo, c, 2), o);
+                 cb(o, "attn_out_part", il);
+                 ggml_tensor * a = ggml_pair_allreduce(ctx0, o, c);
+-                if (c == O) {
+-                    ggml_build_forward_expand(gf, a); // 0170: the end of the other card's split
++                if (first) {
++                    ggml_build_forward_expand(gf, a); // 0170: the end of the card's split
+                     pin_from(n0, c);
+                     return a;
+                 }
+@@ -777,8 +781,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             // card c's FFN: a dense layer's halves, or its part of the MoE; the all-reduce and the residual into x[c]
+             auto ffn = [&](int c, ggml_tensor * ffn_inp) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+-                if (c == O) {
+-                    ffn_inp = ggml_add(ctx0, ffn_inp, x[c]); // 0170: the other card's attention residual, at the top of its FFN split
++                const bool attn_first = home_first ? c == H : c == O; // its attention all-reduce came first: the residual add is here
++                const bool first2     = c == O;                        // its FFN all-reduce is the first of the pair (both orders)
++                if (attn_first) {
++                    ffn_inp = ggml_add(ctx0, ffn_inp, x[c]); // 0170: the attention residual, at the top of the card's FFN split
+                     cb(ffn_inp, "ffn_inp", il);
+                 }
+                 const bool routed = c == H && h_home != nullptr; // 0171: the norm and router came with the attention
+@@ -856,7 +862,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 }
+                 cb(p, "ffn_out_part", il);
+                 ggml_tensor * p_ar = ggml_pair_allreduce(ctx0, p, c);
+-                if (c == O) {
++                if (first2) {
+                     ggml_build_forward_expand(gf, p_ar); // 0170: the end of the other card's split, the residual add in its next one
+                     pin_from(n0, c);
+                     x_ar[c]  = p_ar;
+@@ -872,6 +878,15 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             };
+ 
+             // 0170: home pre-attention, the other card's attention, the home attention, the other card's FFN, the home FFN
++            if (home_first) {
++                // 0172: home pre-attention + attention, the other card's pre-attention + attention + FFN, the home FFN
++                pre(H);
++                ggml_tensor * a_h = attn(H);
++                pre(O);
++                ggml_tensor * ffn_inp_o = attn(O);
++                ffn(O, ffn_inp_o);
++                ffn(H, a_h);
++            } else {
+             pre(H);
+             pre(O);
+             ggml_tensor * a_o = attn(O);
+@@ -881,6 +896,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             }
+             ffn(O, a_o);
+             ffn(H, ffn_inp_h);
++            } // 0172
+         }
+ 
+         // the final norm, the MTP hidden state and the logits on the output's card
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 3d40bdb11d9c71d39e504ebab4b7777d10e610f1 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:23:41 -0600
-Subject: [PATCH 010/141] sched: host-weight copies first is per backend; set
+Subject: [PATCH 010/211] sched: host-weight copies first is per backend; set
  for the twins only
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

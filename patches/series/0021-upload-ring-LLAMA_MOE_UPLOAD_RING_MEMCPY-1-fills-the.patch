@@ -1,7 +1,7 @@
 From 27e75430fd54b287d6993231dc42a881250dce3c Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 16:13:33 -0600
-Subject: [PATCH 021/141] upload ring: LLAMA_MOE_UPLOAD_RING_MEMCPY=1 fills the
+Subject: [PATCH 021/211] upload ring: LLAMA_MOE_UPLOAD_RING_MEMCPY=1 fills the
  slot with one cudaMemcpyAsync of the whole expert tensor from the pinned host
  weights (copy engine) instead of the gather kernel
 

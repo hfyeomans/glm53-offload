@@ -1,7 +1,7 @@
 From f2dab2532dc7b4ba71405ba894741616d3980685 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 00:43:15 -0600
-Subject: [PATCH 103/141] MUL_MAT_ID one block a real tile
+Subject: [PATCH 103/211] MUL_MAT_ID one block a real tile
  (GGML_CUDA_MMQ_MMID_COMPACT=1): the experts column tiles scanned on the card,
  a block finds its expert by binary search
 

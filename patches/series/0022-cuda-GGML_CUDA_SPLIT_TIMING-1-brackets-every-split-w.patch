@@ -1,7 +1,7 @@
 From 8026b0c8393a357e72c29926acf97f16571dd1ed Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 09:29:13 -0600
-Subject: [PATCH 022/141] cuda: GGML_CUDA_SPLIT_TIMING=1 brackets every split
+Subject: [PATCH 022/211] cuda: GGML_CUDA_SPLIT_TIMING=1 brackets every split
  with timing events and prints busy / gap totals per device
 
 ---

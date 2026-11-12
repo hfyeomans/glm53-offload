@@ -1,0 +1,197 @@
+From 459b6335f714eb5ed1ca5ae9e084c1adc921131d Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 02:20:45 -0600
+Subject: [PATCH 155/211] GGML_CUDA_MMVQ_SMALLK_MT=1|2: the dense matvec at 2-4
+ tokens over a K one warp covers in one trip runs one warp a block (the
+ absorbed MLA heads); LLAMA_TEST_MMV_DECODE test cases
+
+---
+ ggml/src/ggml-cuda/mmvq.cu | 74 +++++++++++++++++++++++++++++++++++---
+ tests/test-backend-ops.cpp | 37 +++++++++++++++++++
+ 2 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 8f8340736..155cfbc4c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -450,6 +450,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ }
+ 
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
++    // 0151: the multi-token small-K launch is one warp a block
++    if (small_k && ncols_dst > 1 && (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GB10)) {
++        return 1;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+         switch (ncols_dst) {
+             case 1:
+@@ -592,7 +596,8 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+     }
+ }
+ 
+-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++// 0151: wide = 4 rows a block for the multi-token small-K launch (GGML_CUDA_MMVQ_SMALLK_MT=2), 2 otherwise
++static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool wide = false) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+@@ -610,7 +615,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
+             case 6:
+             case 7:
+             case 8:
+-                return 2;
++                return small_k && wide ? 4 : 2;
+             default:
+                 return 1;
+         }
+@@ -637,7 +642,7 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
++    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, halve_iters);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1044,7 +1049,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
++    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, halve_iters);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -1083,6 +1088,37 @@ static void mul_mat_vec_q_switch_fusion(
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+ }
+ 
++// GGML_CUDA_MMVQ_SMALLK_MT=1|2 (0151): the dense matvec at 2-4 tokens over a K one warp covers in a single trip runs one warp a block,
++// 2 (1) or 4 (2) rows of it; 0 / unset = upstream's four warps
++static int ggml_cuda_mmvq_smallk_mt() {
++    static const int v = [] {
++        const char * s = getenv("GGML_CUDA_MMVQ_SMALLK_MT");
++        const int r = s ? atoi(s) : 0;
++        const int m = (r == 1 || r == 2) ? r : 0;
++        if (s) {
++            GGML_LOG_INFO("%s: multi-token small-K matvec %s\n", __func__, m == 0 ? "off" : m == 1 ? "one warp, 2 rows a block" : "one warp, 4 rows a block");
++        }
++        return m;
++    }();
++    return v;
++}
++
++static constexpr bool mmvq_smallk_mt_type(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
++        case GGML_TYPE_Q6_K:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ // LLAMA_MMVQ_MOE_RPB=2|4|8: rows per block of the multi-token MoE kernel (0037; default 2 = upstream)
+ static int ggml_cuda_mmvq_moe_rpb() {
+     static const int rpb = [] {
+@@ -1244,6 +1280,36 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         return;
+     }
+ 
++    // 0151: 2-4 tokens over a K one warp covers in one trip (the absorbed MLA heads), one warp a block
++    if constexpr (mmvq_smallk_mt_type(type)) {
++        const int mt = ggml_cuda_mmvq_smallk_mt();
++        if (mt != 0 && ncols_dst >= 2 && ncols_dst <= 4 && blocks_per_row_x <= blocks_per_iter_1warp &&
++                (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GB10)) {
++            const auto launch_mt = [&](auto ncols_tag, auto wide_tag) {
++                constexpr int  c_ncols_dst = decltype(ncols_tag)::value;
++                constexpr bool c_wide      = decltype(wide_tag)::value;
++                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, true, c_wide);
++                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, c_wide>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
++                     dims.first, dims.second, 0, ids_stride, stream);
++            };
++            const auto launch_n = [&](auto wide_tag) {
++                switch (ncols_dst) {
++                    case 2:  launch_mt(std::integral_constant<int, 2>{}, wide_tag); break;
++                    case 3:  launch_mt(std::integral_constant<int, 3>{}, wide_tag); break;
++                    default: launch_mt(std::integral_constant<int, 4>{}, wide_tag); break;
++                }
++            };
++            if (mt == 2) {
++                launch_n(std::true_type{});
++            } else {
++                launch_n(std::false_type{});
++            }
++            return;
++        }
++    }
++
+     switch (ncols_dst) {
+         case 1: {
+             // static, else MSVC lambda capture breaks the constexpr uses below
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d0dbd1dff..e56adea66 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10189,6 +10189,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+     std::default_random_engine rng(0);
+ 
++    if (getenv("LLAMA_TEST_MMV_DECODE") != nullptr) {
++        // 0151: the multi-token small-K matvec against the CPU: K one warp covers in one trip, 1-5 tokens, batched and not, odd rows
++        for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
++            for (int n : { 1, 2, 3, 4, 5 }) {
++                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 512, n, 256, {64, 1}, {1, 1}));
++                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 257, n, 256, { 4, 1}, {1, 1}));
++                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 512, {64, 1}, {1, 1}));
++                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  33, n, 512, { 1, 1}, {1, 1}));
++            }
++        }
++        for (int n : { 1, 2, 3, 4 }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, n, 192, {64, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 2048, n, 6144, {1, 1}, {1, 1}));
++        }
++        return test_cases;
++    }
++
+     // unary ops
+     // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+@@ -12827,6 +12844,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    if (getenv("LLAMA_TEST_MMV_DECODE") != nullptr) {
++        // 0151: GLM-5.3's dense matvecs at decode (1 token; 3 = a verify step at draft-n-max 2): the absorbed MLA heads (wk_b q5_1 K 192,
++        // wv_b q5_K K 512, 64 heads), q_a and the shared gate / up, kv_a, q_b, attn_output, the shared down, the indexer (q8_0), the
++        // router (f32)
++        for (int n : { 1, 2, 3, 4 }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_1, GGML_TYPE_F32,   512, n,   192, {64, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   256, n,   512, {64, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  2048, n,  6144, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   576, n,  6144, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 16384, n,  2048, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  6144, n, 16384, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  6144, n,  2048, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  4096, n,  2048, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   128, n,  6144, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,    32, n,  6144, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   256, n,  6144, { 1, 1}, {1, 1}));
++        }
++        return test_cases;
++    }
++
+     if (getenv("LLAMA_TEST_FA_MLA") != nullptr) {
+         // GLM-5.3 decode attention: K 576 / V 512 (V a view of K), 1 KV head x 64 query heads, 1 token
+         for (int64_t kv : { 1024, 4096, 16384, 65536 }) {
+-- 
+2.43.0
+

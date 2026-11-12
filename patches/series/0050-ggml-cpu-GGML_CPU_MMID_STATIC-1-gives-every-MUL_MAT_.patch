@@ -1,7 +1,7 @@
 From b30780846cdb5b8d3aacb3669becb84b75ffaa0a Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 21:57:59 -0600
-Subject: [PATCH 050/141] ggml-cpu: GGML_CPU_MMID_STATIC=1 gives every
+Subject: [PATCH 050/211] ggml-cpu: GGML_CPU_MMID_STATIC=1 gives every
  MUL_MAT_ID expert matrix the static row split (thread k always takes the same
  rows)
 

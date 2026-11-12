@@ -1,7 +1,7 @@
 From 017eb0231521c635940b30068e17ab50a3e9087b Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 19:41:34 -0600
-Subject: [PATCH 095/141] lightning indexer as a tensor-core tile
+Subject: [PATCH 095/211] lightning indexer as a tensor-core tile
  (GGML_CUDA_LID_MMA=1): 8 queries a block in mma A fragments, 64-key f16 tiles
  by cp.async, keys dequantized once a call
 

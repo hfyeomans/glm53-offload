@@ -1,7 +1,7 @@
 From 83df23f8feba963088f269c479af23169e472390 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 13:34:26 -0600
-Subject: [PATCH 138/141] LLAMA_MOE_UPLOAD_AHEAD=1: a layer's expert tensors
+Subject: [PATCH 138/211] LLAMA_MOE_UPLOAD_AHEAD=1: a layer's expert tensors
  and the next layer's go up at the layer's first expert split, an event per
  tensor, slots freed when their last reader has been issued
 

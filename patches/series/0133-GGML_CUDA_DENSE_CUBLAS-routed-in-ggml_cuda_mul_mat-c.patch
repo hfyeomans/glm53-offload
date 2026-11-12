@@ -1,7 +1,7 @@
 From 4f3a58cc8ebf8b6d5bbb7db5e6e296b3af99a392 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 10:40:34 -0600
-Subject: [PATCH 133/141] GGML_CUDA_DENSE_CUBLAS routed in ggml_cuda_mul_mat
+Subject: [PATCH 133/211] GGML_CUDA_DENSE_CUBLAS routed in ggml_cuda_mul_mat
  (contiguous weights with a converter only); GGML_CUDA_FUSE_IQ3_XXS=1: the
  fused gate/up/GLU MMQ kernel for IQ3_XXS weights
 

@@ -1,0 +1,46 @@
+From cfcfb0749fbcf8ef65a3b24e9a25eddfaa733e02 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:57:21 -0600
+Subject: [PATCH 205/211] 0198: fix: the both-cards prompt graph
+ (LLAMA_TP_PROMPT) under LLAMA_TP_DECODE returned before setting td_rep_sync,
+ so a prompt of 1,024 tokens up to one ubatch never reached the replicas and
+ TD read stale keys; the lines move above the branch
+
+---
+ src/models/glm-dsa.cpp | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index cb1b936ed..e5bbc53a3 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -279,6 +279,12 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     static const bool tp_any = getenv("LLAMA_TP_PROMPT_ANY") != nullptr && atoi(getenv("LLAMA_TP_PROMPT_ANY")) != 0;
+     const bool tp = tp_min > 0 && model.tp_devs.size() == 2 && n_tokens >= tp_min && (tp_any || cparams.tp_batch_single);
+     ggml_backend_sched_set_transient_inputs(sched, tp);
++    // 0198: before the branch, which returns: that graph too writes only the home caches
++    static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 8;
++    const bool td = cparams.td && !tp && cparams.lm_rows == 0 && n_tokens <= td_max && moe_cache != nullptr;
++    res->td_rep_sync  = cparams.td && !td;
++    res->td_rep_reads = td; // 0173
++    ggml_backend_sched_set_gpu_switch_nosync(sched, td);
+     if (tp) {
+         GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
+         ggml_backend_t be[2] = { nullptr, nullptr };
+@@ -620,12 +626,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+     // the router; the home card computes its cached experts, the CPU part and the shared expert, the other card the cached experts of the
+     // other parity (xd).  A layer's splits: the home card's pre-attention (norm, q_a, the KV and indexer writes, the indexer, whose top-k
+     // leaves ahead of the home all-reduce), the other card's attention and FFN, then the home card's attention and FFN (its lookup callback
+-    // blocks the host only once the other card's all-reduces are queued).  Any other graph writes only the home caches: the replicas follow
+-    static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 8;
+-    const bool td = cparams.td && !tp && cparams.lm_rows == 0 && n_tokens <= td_max && moe_cache != nullptr;
+-    res->td_rep_sync  = cparams.td && !td;
+-    res->td_rep_reads = td; // 0173
+-    ggml_backend_sched_set_gpu_switch_nosync(sched, td);
++    // blocks the host only once the other card's all-reduces are queued).  Any other graph writes only the home caches: the replicas follow (0198: set above, before the both-cards prompt branch)
+     if (td) {
+         GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
+         ggml_backend_t be[2] = { nullptr, nullptr };
+-- 
+2.43.0
+

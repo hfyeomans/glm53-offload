@@ -1,7 +1,7 @@
 From 8f9c6a5d8f0d445bc4e93ac845b0d69314997a53 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 19:47:14 -0600
-Subject: [PATCH 096/141] MMQ tile configs for consumer Blackwell as a
+Subject: [PATCH 096/211] MMQ tile configs for consumer Blackwell as a
  compile-time sweep (GGML_CUDA_MMQ_BW_VARIANT=1..4; unset = the Ampere table)
 
 ---

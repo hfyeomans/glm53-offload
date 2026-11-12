@@ -1,0 +1,458 @@
+From 7be420601432ec7c3191961b4f6edf2351c01483 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:55:56 -0600
+Subject: [PATCH 149/211] LLAMA_MOE_XD=1: two cards compute every layer cache
+ hits, each card caching the experts of its parity; the other card hits run
+ there beside the CPU part
+
+---
+ src/llama-graph.cpp     |  44 ++++++++-
+ src/llama-graph.h       |   3 +
+ src/llama-moe-cache.cpp | 203 ++++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-cache.h   |   6 ++
+ 4 files changed, 245 insertions(+), 11 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f5f0f0871..14aea21c5 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1713,7 +1713,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = slots == nullptr ?
+         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
++        ggml_mul_mat_id(ctx0, cached ? (moe_xd_views ? moe_cache->get_experts_xd(w) : moe_cache->get_experts(w)) : w, cur_mm, slots);
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);
+@@ -2737,6 +2737,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             moe_overlap_hook = nullptr;
+         }
+ 
++        // 0145 LLAMA_MOE_XD=1: the hits of the other device's parity, computed on that device from its banks (before the CPU part, so
++        // both devices and the CPU work at once)
++        ggml_tensor * experts_xd = nullptr;
++        if (ggml_tensor * slots_xd = build_moe_cache_slots_xd(selected_experts, il)) {
++            const int n_nodes_xd = ggml_graph_n_nodes(gf);
++            moe_xd_views = true;
++            experts_xd = build_experts(cur, selected_experts, slots_xd, true);
++            moe_xd_views = false;
++            ggml_build_forward_expand(gf, experts_xd);
++            for (int i = n_nodes_xd; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_tensor * node = ggml_graph_node(gf, i);
++                if (node->view_src == nullptr) {
++                    ggml_backend_sched_set_tensor_backend(sched, node, moe_cache->backend_xd(il));
++                }
++            }
++        }
++
+         // the CPU part comes after the slot lookup, whose copy callback fills the CPU map and reads the inputs of the CPU part
+         const int n_nodes_dev = ggml_graph_n_nodes(gf);
+         ggml_tensor * experts_cpu = build_experts(cur, sel2d, cpu_ids, false);
+@@ -2752,6 +2769,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+         experts = ggml_add(ctx0, experts_dev, experts_cpu);
+         ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
++        if (experts_xd != nullptr) {
++            experts = ggml_add(ctx0, experts, experts_xd); // 0145
++            ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
++        }
+         cb(experts, "ffn_moe_down_merged", il);
+     }
+ 
+@@ -2890,6 +2911,27 @@ bool llm_graph_context::moe_probe_enabled() {
+     return v;
+ }
+ 
++ggml_tensor * llm_graph_context::build_moe_cache_slots_xd(ggml_tensor * selected_experts, int il) const {
++    if (moe_cache == nullptr) {
++        return nullptr;
++    }
++    ggml_tensor * slot_map = moe_cache->get_slot_map_xd(il, selected_experts->ne[1], selected_experts->ne[0]);
++    ggml_backend_t be = moe_cache->backend_xd(il);
++    if (slot_map == nullptr || be == nullptr) {
++        return nullptr;
++    }
++    ggml_tensor * ids = selected_experts;
++    if (!ggml_is_contiguous(ids)) {
++        ids = ggml_cont(ctx0, ids);
++    }
++    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
++    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens], on the other device
++    ggml_backend_sched_set_tensor_backend(sched, slots, be);
++    cb(slots, "ffn_moe_slots_xd", il);
++    ggml_build_forward_expand(gf, slots);
++    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
++}
++
+ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * selected_experts,
+          ggml_tensor * up_exps,
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index f6d6255a7..f0974cf23 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1077,6 +1077,7 @@ struct llm_graph_context {
+     mutable std::function<void()> moe_overlap_hook;
+     static bool moe_shexp_overlap_enabled();
+     mutable ggml_tensor * moe_probe_sel = nullptr;
++    mutable bool          moe_xd_views  = false; // 0145: build_lora_mm_id reads the other device's banks
+     static bool moe_probe_enabled();
+     static bool moe_prefetch_enabled(); // LLAMA_MOE_PREFETCH=1: predict the next layer's experts at the top of each layer (decode)
+ 
+@@ -1251,6 +1252,8 @@ struct llm_graph_context {
+              ggml_tensor * down_exps,
+              ggml_tensor * gate_up_exps,
+                      int   il) const;
++    // 0145 LLAMA_MOE_XD=1: the slots of the selected experts in the other device's group of the layer, looked up there
++    ggml_tensor * build_moe_cache_slots_xd(ggml_tensor * selected_experts, int il) const;
+ 
+     //
+     // inputs
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index fbeced253..b4f4d2aa3 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -409,6 +409,7 @@ struct llama_moe_cache::impl {
+         int32_t n_lend  = 0;
+         int32_t n_lent  = 0;
+         moe_cache_slru slru;
++        int32_t own = -1;                 // 0145: the group caches the experts e with e % 2 == own of its cross-device layers
+     };
+ 
+     struct layer {
+@@ -423,6 +424,11 @@ struct llama_moe_cache::impl {
+         std::vector<std::pair<int32_t, int32_t>> pending_fills; // LLAMA_MOE_ASYNC_FILL: (expert, slot) uploaded on the side stream
+         ggml_backend_event_t fill_ev = nullptr; // LLAMA_MOE_ASYNC_FILL_TOKENS: recorded on the side stream behind the layer's last fills there
+         bool fill_ev_pending = false;           // the layer's next hits wait for fill_ev
++        int32_t ig_xd = -1;                     // 0145: the layer's group on the other device (-1: none)
++        ggml_tensor * slot_map_xd = nullptr;    // 0145: that group's slot map of the layer
++        ggml_backend_event_t fill_ev_xd = nullptr; // 0145: behind the layer's fills on the other device
++        bool fill_ev_xd_pending = false;
++        uint32_t cpu_acc_xd = 0;
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
+@@ -486,6 +492,14 @@ struct llama_moe_cache::impl {
+     std::vector<layer> layers;
+     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
+     std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
++    // 0145 LLAMA_MOE_XD=1
++    bool xd = false;
++    std::unordered_map<const ggml_tensor *, binding> bindings_xd; // host experts -> the other device's cached experts
++    std::unordered_map<const ggml_tensor *, int32_t> layer_of_xd; // the other device's slot map -> layer
++    std::vector<int32_t> ids_h;
++    std::vector<int32_t> ids_x;
++    std::vector<moe_cache_slru::fill> fills_x;
++    std::vector<moe_cache_slru::fill> cpu_x;
+ 
+     std::vector<int32_t> ids;
+     std::vector<moe_cache_slru::fill> fills;
+@@ -1044,6 +1058,36 @@ struct llama_moe_cache::impl {
+                 devices[id].host_bytes += ggml_nbytes(t);
+             }
+         }
++        // 0145 LLAMA_MOE_XD=1: with two devices, each group also takes the other device's layers of its layout, and the group of device k
++        // caches the experts e with e % 2 == k there; the deferred plan plans both groups of such a layer
++        if (const char * s = getenv("LLAMA_MOE_XD"); s != nullptr && atoi(s) != 0 && !groups.empty()) {
++            if (devices.size() != 2 || !deferred_plan()) {
++                LLAMA_LOG_WARN("%s: LLAMA_MOE_XD needs two devices and LLAMA_MOE_DEFERRED_PLAN=1, off\n", __func__);
++            } else {
++                xd = true;
++                std::vector<std::vector<int32_t>> own_layers(groups.size());
++                for (size_t ig = 0; ig < groups.size(); ++ig) {
++                    own_layers[ig] = groups[ig].layers;
++                }
++                for (size_t ig = 0; ig < groups.size(); ++ig) {
++                    groups[ig].own = groups[ig].id;
++                    for (size_t jg = 0; jg < groups.size(); ++jg) {
++                        if (groups[jg].id == groups[ig].id || !llama_moe_cache_same_layout(groups[ig].ref, groups[jg].ref)) {
++                            continue;
++                        }
++                        for (int32_t il : own_layers[jg]) {
++                            groups[ig].layers.push_back(il);
++                            for (const ggml_tensor * t : llama_moe_cache_layer_experts(model.layers[il])) {
++                                groups[ig].host_bytes              += ggml_nbytes(t);
++                                devices[groups[ig].id].host_bytes += ggml_nbytes(t);
++                            }
++                        }
++                    }
++                    std::sort(groups[ig].layers.begin(), groups[ig].layers.end());
++                }
++                LLAMA_LOG_INFO("%s: 0145: both devices cache every layer, each the experts of its parity\n", __func__);
++            }
++        }
+         if (groups.empty()) {
+             LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
+             return;
+@@ -1096,6 +1140,9 @@ struct llama_moe_cache::impl {
+         if (const char * s = getenv("LLAMA_MOE_CACHE_ADMIT"); s != nullptr && *s != '\0') {
+             admit_k = atoi(s);
+         }
++        if (xd) {
++            admit_k = 0; // 0145: admission plans the home group with every expert
++        }
+         if (const char * s = getenv("LLAMA_MOE_CACHE_LOG_EVERY"); s != nullptr && *s != '\0') {
+             log_every = atoi(s);
+         }
+@@ -1238,9 +1285,16 @@ struct llama_moe_cache::impl {
+             }
+             for (int32_t il : g.layers) {
+                 layer & l = layers[il];
+-                l.ig      = (int32_t) ig;
+-                l.experts = llama_moe_cache_layer_experts(model.layers[il]);
+-                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                // 0145: a layer of the other device in this group is a cross-device one (its hits of this device's parity run here)
++                const bool home = !xd || ggml_backend_get_device(devices[g.id].backend) == model.dev_layer(il);
++                if (home) {
++                    l.ig      = (int32_t) ig;
++                    l.experts = llama_moe_cache_layer_experts(model.layers[il]);
++                } else {
++                    l.ig_xd = (int32_t) ig;
++                }
++                const auto l_experts = llama_moe_cache_layer_experts(model.layers[il]);
++                for (size_t ip = 0; ip < l_experts.size(); ++ip) {
+                     ggml_tensor * bank   = g.banks[ip];
+                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                     // 0143 LLAMA_MOE_ZERO_SKIP=1: the device computes the CPU's experts (zero slots from n_slots) as 0, reading nothing
+@@ -1248,8 +1302,15 @@ struct llama_moe_cache::impl {
+                     if (zero_skip && n_zero > 0) {
+                         ggml_mul_mat_id_mark_zero_slots(cached, g.n_slots);
+                     }
+-                    ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+-                    bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
++                    ggml_format_name(cached, home ? "moe_cache.%s" : "moe_cache_xd.%s", l_experts[ip]->name);
++                    (home ? bindings : bindings_xd)[l_experts[ip]] = { il, (int32_t) ip, cached };
++                }
++                if (!home) {
++                    l.slot_map_xd = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
++                    ggml_format_name(l.slot_map_xd, "moe_cache.slot_map_xd-%d", il);
++                    layer_of_xd[l.slot_map_xd] = il;
++                    buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map_xd), alignment_host);
++                    continue;
+                 }
+                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
+@@ -1439,9 +1500,11 @@ struct llama_moe_cache::impl {
+ 
+             for (group & g : groups) {
+                 for (int32_t il : g.layers) {
+-                    if (layers[il].slot_map != nullptr) {
+-                        int32_t * slots = (int32_t *) layers[il].slot_map->data;
+-                        std::fill(slots, slots + layers[il].slot_map->ne[1], g.slru.empty);
++                    // 0145: a cross-device group's map of the layer is its own
++                    ggml_tensor * sm = layers[il].ig == (int32_t) (&g - groups.data()) ? layers[il].slot_map : layers[il].slot_map_xd;
++                    if (sm != nullptr) {
++                        int32_t * slots = (int32_t *) sm->data;
++                        std::fill(slots, slots + sm->ne[1], g.slru.empty);
+                         g.slru.slot_map[il] = slots;
+                     }
+                     if (layers[il].cpu_ids != nullptr) {
+@@ -1636,6 +1699,11 @@ struct llama_moe_cache::impl {
+         }
+         const layer & l = layers[il];
+ 
++        // 0145: a layer with a cross-device group is served by the deferred plan only, both of its lookups or neither
++        if (l.ig_xd >= 0 && get_slot_map_xd(il, n_tokens, n_expert_used) == nullptr) {
++            return nullptr;
++        }
++
+         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
+         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+             return nullptr;
+@@ -1648,6 +1716,32 @@ struct llama_moe_cache::impl {
+         return it != bindings.end() ? it->second.cached : nullptr;
+     }
+ 
++    // 0145: the other device's lookup of a layer, served with the home one (up to defer_max_tokens)
++    ggml_tensor * get_slot_map_xd(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++        if (!xd || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il].ig_xd < 0 || layers[il].slot_map_xd == nullptr) {
++            return nullptr;
++        }
++        const layer & l = layers[il];
++        if (n_tokens == 0 || n_tokens > defer_max_tokens || l.cpu_ids == nullptr ||
++            std::min(n_tokens*n_expert_used, l.slot_map_xd->ne[1]) > groups[l.ig_xd].n_slots ||
++            std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
++            return nullptr;
++        }
++        return l.slot_map_xd;
++    }
++
++    ggml_tensor * get_experts_xd(const ggml_tensor * w) const {
++        const auto it = bindings_xd.find(w);
++        return it != bindings_xd.end() ? it->second.cached : nullptr;
++    }
++
++    ggml_backend_t backend_xd(int32_t il) const {
++        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig_xd < 0) {
++            return nullptr;
++        }
++        return devices[groups[layers[il].ig_xd].id].backend;
++    }
++
+     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+         const auto it = bindings.find(w);
+         if (it == bindings.end()) {
+@@ -1896,7 +1990,36 @@ struct llama_moe_cache::impl {
+             return (size_t) (acc >> 16);
+         };
+         size_t n_hit = 0;
+-        if (!g.slru.plan(il, ids.data(), ids.size(), defer_st.n_used, n_zero, n_cpu, rng, fills, cpu, n_hit)) {
++        // 0145: with a cross-device group, each group plans the experts of its parity; the CPU computes the misses of both
++        group * gx = l.ig_xd >= 0 ? &groups[l.ig_xd] : nullptr;
++        size_t n_hit_x = 0;
++        fills_x.clear();
++        cpu_x.clear();
++        const int32_t * ids_plan    = ids.data();
++        size_t          n_ids_plan  = ids.size();
++        int32_t         n_used_plan = defer_st.n_used;
++        if (gx != nullptr) {
++            ids_h.clear();
++            ids_x.clear();
++            for (int32_t e : ids) {
++                ((e & 1) == g.own ? ids_h : ids_x).push_back(e);
++            }
++            const uint32_t share_qx = gx->slru.n_filled == gx->slru.n_active ? cpu_share_q : 0;
++            auto n_cpu_x = [&](size_t n_miss) {
++                const uint64_t acc = (uint64_t) n_miss*share_qx + l.cpu_acc_xd;
++                l.cpu_acc_xd = acc & 0xffff;
++                return (size_t) (acc >> 16);
++            };
++            if (!gx->slru.plan(il, ids_x.data(), ids_x.size(), 1, n_zero, n_cpu_x, rng, fills, cpu, n_hit_x)) {
++                GGML_ABORT("the MoE cache is too small for the experts selected in layer %d (cross-device)", il);
++            }
++            fills_x = fills;
++            cpu_x   = cpu;
++            ids_plan    = ids_h.data();
++            n_ids_plan  = ids_h.size();
++            n_used_plan = 1;
++        }
++        if (!g.slru.plan(il, ids_plan, n_ids_plan, n_used_plan, n_zero, n_cpu, rng, fills, cpu, n_hit)) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+         fill_mark.assign(g.slru.n_expert, 0);
+@@ -1906,6 +2029,12 @@ struct llama_moe_cache::impl {
+         for (const auto & f : cpu) {
+             fill_mark[f.expert] = 1;
+         }
++        for (const auto & f : fills_x) {
++            fill_mark[f.expert] = 1;
++        }
++        for (const auto & f : cpu_x) {
++            fill_mark[f.expert] = 1;
++        }
+         int32_t * cpu_ids = (int32_t *) l.cpu_ids->data;
+         for (size_t i = 0; i < ids.size(); ++i) {
+             cpu_ids[i] = fill_mark[ids[i]] ? ids[i] : -1;
+@@ -1952,6 +2081,32 @@ struct llama_moe_cache::impl {
+             l.fill_ev_pending = true;
+         }
+ #endif
++#ifdef GGML_USE_CUDA
++        // 0145: the other device's fills of the layer go on its side stream; its next lookup of the layer waits for them
++        if (gx != nullptr && !fills_x.empty()) {
++            ggml_backend_t bx = devices[gx->id].backend;
++            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                const ggml_tensor * w    = l.experts[ip];
++                ggml_tensor       * bank = gx->banks[ip];
++                const size_t es = w->nb[2];
++                for (const auto & f : fills_x) {
++                    ggml_backend_cuda_side_upload_async(bx, (uint8_t *) bank->data + f.slot*es, (const uint8_t *) w->data + f.expert*es, es);
++                    bytes += es;
++                }
++            }
++            if (l.fill_ev_xd == nullptr) {
++                l.fill_ev_xd = ggml_backend_event_new(ggml_backend_get_device(bx));
++                GGML_ASSERT(l.fill_ev_xd != nullptr);
++            }
++            ggml_backend_cuda_side_upload_record(bx, l.fill_ev_xd);
++            l.fill_ev_xd_pending = true;
++        }
++#endif
++        if (gx != nullptr) {
++            n_hit += n_hit_x;
++            fills.insert(fills.end(), fills_x.begin(), fills_x.end());
++            cpu.insert(cpu.end(), cpu_x.begin(), cpu_x.end());
++        }
+         // 0140 LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, behind this layer's fills
+         if (pred_pending) {
+             prefetch_deferred(il, backend);
+@@ -1960,8 +2115,10 @@ struct llama_moe_cache::impl {
+         if (l.route_bias != nullptr) {
+             const float d = route_bias_value();
+             const int32_t * slots_rb = g.slru.slot_map[il];
++            const int32_t * slots_rx = gx != nullptr ? gx->slru.slot_map[il] : nullptr; // 0145
+             for (int32_t e = 0; e < g.slru.n_expert; ++e) {
+-                l.route_bias_host[e] = (l.route_epb.empty() ? 0.0f : l.route_epb[e]) + (slots_rb[e] < g.slru.n_slots ? d : 0.0f);
++                const bool cached_e = slots_rb[e] < g.slru.n_slots || (slots_rx != nullptr && slots_rx[e] < gx->slru.n_slots);
++                l.route_bias_host[e] = (l.route_epb.empty() ? 0.0f : l.route_epb[e]) + (cached_e ? d : 0.0f);
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+                 ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
+@@ -2632,6 +2789,19 @@ struct llama_moe_cache::impl {
+                 return prompt_plan(backend, ip->second, src, dst, graph);
+             }
+         }
++        // 0145: the other device's slot map of a layer goes up as it is, behind that device's fills of the layer (the plan is the home map's)
++        if (!layer_of_xd.empty()) {
++            const auto ix = layer_of_xd.find(src);
++            if (ix != layer_of_xd.end()) {
++                layer & lx = layers[ix->second];
++                if (lx.fill_ev_xd_pending) {
++                    ggml_backend_event_wait(backend, lx.fill_ev_xd);
++                    lx.fill_ev_xd_pending = false;
++                }
++                ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++                return true;
++            }
++        }
+         const auto it = layer_of.find(src);
+         if (it == layer_of.end()) {
+             return copy_cpu_input(src, dst);
+@@ -2760,6 +2930,7 @@ struct llama_moe_cache::impl {
+             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+             return true;
+         }
++        GGML_ASSERT(l.ig_xd < 0 && "0145: a cross-device layer is planned by the deferred plan only");
+         ggml_backend_synchronize(backend);
+         l.last_ids.assign(ids.begin(), ids.end());
+ 
+@@ -3411,6 +3582,18 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+ #endif
+ }
+ 
++ggml_backend_t llama_moe_cache::backend_xd(int32_t il) const {
++    return pimpl->backend_xd(il);
++}
++
++ggml_tensor * llama_moe_cache::get_slot_map_xd(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++    return pimpl->get_slot_map_xd(il, n_tokens, n_expert_used);
++}
++
++ggml_tensor * llama_moe_cache::get_experts_xd(const ggml_tensor * w) const {
++    return pimpl->get_experts_xd(w);
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index bc9af81fe..afd0fd530 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -114,6 +114,12 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
++    // 0145 LLAMA_MOE_XD=1 (two devices, the deferred plan): every group also caches the other device's layers, the group of device k the
++    // experts e with e % 2 == k; a layer's hits of the other device's parity are computed there.  nullptr when the layer has none
++    ggml_backend_t backend_xd(int32_t il) const;
++    ggml_tensor * get_slot_map_xd(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
++    ggml_tensor * get_experts_xd(const ggml_tensor * w) const;
++
+     // 0138 LLAMA_MOE_CACHE_BORROW_MIB=N (with LLAMA_MOE_CACHE_LFU, CUDA VMM): each device's largest group gets N MiB more slots whose
+     // pages are the device's compute buffer and upload ring (an arena: ggml_backend_cuda_alloc_borrowed), so the memory only prompts use
+     // holds experts between them; LLAMA_MOE_CACHE_BORROW_HEAD_MIB (default 2048) of the arena stay private for the decode graphs.
+-- 
+2.43.0
+

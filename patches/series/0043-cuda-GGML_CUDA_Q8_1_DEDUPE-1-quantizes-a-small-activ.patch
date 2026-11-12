@@ -1,7 +1,7 @@
 From 5ae0c680094031ed85fe401ce80cfdabe0049612 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 17:17:34 -0600
-Subject: [PATCH 043/141] cuda: GGML_CUDA_Q8_1_DEDUPE=1 quantizes a small
+Subject: [PATCH 043/211] cuda: GGML_CUDA_Q8_1_DEDUPE=1 quantizes a small
  activation to q8_1 once per graph evaluation and serves it to every matvec
  that reads the same rows
 

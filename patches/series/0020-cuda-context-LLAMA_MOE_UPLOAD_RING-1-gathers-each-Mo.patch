@@ -1,7 +1,7 @@
 From e281e7ab2e3b8cb45822dc36c1276797edfdb8fa Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 16:04:29 -0600
-Subject: [PATCH 020/141] cuda + context: LLAMA_MOE_UPLOAD_RING=1 gathers each
+Subject: [PATCH 020/211] cuda + context: LLAMA_MOE_UPLOAD_RING=1 gathers each
  MoE layer's experts into a two-slot device ring on an upload stream,
  overlapped with the previous split's GEMMs (event-ordered), in place of the
  scheduler's copy slot

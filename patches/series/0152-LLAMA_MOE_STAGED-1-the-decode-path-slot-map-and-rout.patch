@@ -1,0 +1,93 @@
+From 5660e9870b462801f3c6ad20bfed14087a175c66 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 00:01:24 -0600
+Subject: [PATCH 152/211] LLAMA_MOE_STAGED=1: the decode path slot map and
+ route bias uploads go through a pinned ring (asynchronous)
+
+---
+ src/llama-moe-cache.cpp | 41 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index b4f4d2aa3..02fb024b2 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -2121,7 +2121,7 @@ struct llama_moe_cache::impl {
+                 l.route_bias_host[e] = (l.route_epb.empty() ? 0.0f : l.route_epb[e]) + (cached_e ? d : 0.0f);
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+-                ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
++                stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
+                 l.route_bias_last = l.route_bias_host;
+             }
+         }
+@@ -2767,6 +2767,39 @@ struct llama_moe_cache::impl {
+         p_cur++; // 0088
+     }
+ 
++    // 0148 LLAMA_MOE_STAGED=1: a small upload of the decode path is copied into a pinned ring first, so the cudaMemcpyAsync is asynchronous
++    // (from pageable memory it may wait for the stream to reach it); 4 MiB, a slot comes back ~18 verify steps later
++    ggml_backend_buffer_ptr stage_buf;
++    uint8_t * stage_ptr = nullptr;
++    size_t    stage_pos = 0;
++    static bool staged_enabled() {
++        static const bool v = getenv("LLAMA_MOE_STAGED") != nullptr && atoi(getenv("LLAMA_MOE_STAGED")) != 0;
++        return v;
++    }
++    void stage_set(ggml_backend_t backend, ggml_tensor * dst, const void * src, size_t n) {
++        constexpr size_t ring = (size_t) 4 << 20;
++        if (staged_enabled() && n <= 65536) {
++            if (!stage_buf) {
++                ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
++                if (buft != nullptr) {
++                    stage_buf.reset(ggml_backend_buft_alloc_buffer(buft, ring));
++                    stage_ptr = stage_buf ? (uint8_t *) ggml_backend_buffer_get_base(stage_buf.get()) : nullptr;
++                }
++            }
++            if (stage_ptr != nullptr) {
++                if (stage_pos + n > ring) {
++                    stage_pos = 0;
++                }
++                uint8_t * p = stage_ptr + stage_pos;
++                memcpy(p, src, n);
++                stage_pos += GGML_PAD(n, 256);
++                ggml_backend_tensor_set_async(backend, dst, p, 0, n);
++                return;
++            }
++        }
++        ggml_backend_tensor_set_async(backend, dst, src, 0, n);
++    }
++
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+         // 0091: the CPU part's result goes up on the card's stream, then the next layer's prefetch part two behind it
+         if (!layer_of_pout.empty()) {
+@@ -2798,7 +2831,7 @@ struct llama_moe_cache::impl {
+                     ggml_backend_event_wait(backend, lx.fill_ev_xd);
+                     lx.fill_ev_xd_pending = false;
+                 }
+-                ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++                stage_set(backend, dst, src->data, ggml_nbytes(src)); // 0148
+                 return true;
+             }
+         }
+@@ -2927,7 +2960,7 @@ struct llama_moe_cache::impl {
+                 ggml_backend_event_wait(backend, l.fill_ev);
+                 l.fill_ev_pending = false;
+             }
+-            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++            stage_set(backend, dst, src->data, ggml_nbytes(src)); // 0148
+             return true;
+         }
+         GGML_ASSERT(l.ig_xd < 0 && "0145: a cross-device layer is planned by the deferred plan only");
+@@ -3093,7 +3126,7 @@ struct llama_moe_cache::impl {
+                 l.route_bias_host[pf.first] = (l.route_epb.empty() ? 0.0f : l.route_epb[pf.first]) + d;
+             }
+             if (l.route_bias_host != l.route_bias_last) {
+-                ggml_backend_tensor_set_async(backend, l.route_bias, l.route_bias_host.data(), 0, ggml_nbytes(l.route_bias));
++                stage_set(backend, l.route_bias, l.route_bias_host.data(), ggml_nbytes(l.route_bias)); // 0148
+                 l.route_bias_last = l.route_bias_host;
+             }
+         }
+-- 
+2.43.0
+

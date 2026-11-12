@@ -1,0 +1,41 @@
+From c8e25ca5b33be076bedbc0a7053b750b8ec2cff3 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 01:22:35 -0600
+Subject: [PATCH 206/211] 0199: fix: LLAMA_TP_DECODE replicas after a state
+ restore (the prompt cache): the restored cells are recorded and copied before
+ the next TD graph; td_rep_flush drops cells removed since they were recorded
+
+---
+ src/llama-kv-cache.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 2493e90d3..0d9c4b22b 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1720,6 +1720,12 @@ void llama_kv_cache::td_rep_flush(ggml_backend_sched_t sched) const {
+     }
+     std::vector<uint32_t> idx;
+     idx.swap(td_rep_pending);
++    // 0199: a cell removed since it was recorded holds nothing to copy, and its pages may be unmapped
++    const auto & td_cells = (other ? other->v_cells : v_cells)[0];
++    idx.erase(std::remove_if(idx.begin(), idx.end(), [&](uint32_t c) { return td_cells.is_empty(c); }), idx.end());
++    if (idx.empty()) {
++        return;
++    }
+     std::sort(idx.begin(), idx.end());
+     idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+     std::vector<std::pair<uint32_t, uint32_t>> runs; // [first, end)
+@@ -2642,6 +2648,9 @@ const slot_info_vec_t *   sinfos_in) {
+             throw std::runtime_error("failed to restore kv cache");
+         }
+ 
++        // 0199 LLAMA_TP_DECODE: a restored state is in the home cache only: the replicas copy its cells before the next TD graph
++        td_rep_sync(nullptr, sinfo);
++
+         if (sinfos_out) {
+             (*sinfos_out)[s] = sinfo;
+         }
+-- 
+2.43.0
+

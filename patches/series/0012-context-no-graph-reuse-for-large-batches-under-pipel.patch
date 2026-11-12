@@ -1,7 +1,7 @@
 From a2622162cfb65488add5c323138397d210e5a4fd Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:46:22 -0600
-Subject: [PATCH 012/141] context: no graph reuse for large batches under
+Subject: [PATCH 012/211] context: no graph reuse for large batches under
  pipeline parallelism
 
 A reused graph forces a full scheduler synchronization before set_inputs under pipeline parallelism, which drains the

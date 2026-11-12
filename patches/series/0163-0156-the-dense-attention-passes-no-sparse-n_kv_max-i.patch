@@ -1,0 +1,26 @@
+From 6c66b66d83a309952fefae3b851b72197ff620ab Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:57:55 -0600
+Subject: [PATCH 163/211] 0156: the dense attention passes no sparse n_kv_max
+ (it dereferenced the null top-k)
+
+---
+ src/llama-graph.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 7576ec2c7..108b5793c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3905,7 +3905,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
+     ggml_tensor * v = ggml_view_4d(ctx0, k, n_embd_v, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k ? top_k->ne[0] : 0, kq_scale, il); // 0156: dense
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+-- 
+2.43.0
+

@@ -1,0 +1,100 @@
+From 75f317472d8116b914c6ee80924c1866e30bbc70 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:47:31 -0600
+Subject: [PATCH 178/211] 0171: TD -- the home router queued with its attention
+ (lookup split rule), phase 1 hands back a contiguous selection
+
+---
+ src/llama-graph.cpp    |  5 +++++
+ src/models/glm-dsa.cpp | 31 ++++++++++++++++++++++++++++++-
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0bb7976a4..588eb2f3d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2431,6 +2431,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     // 0166 LLAMA_TP_DECODE phase 1: the router alone
+     if (moe_td_phase == 1) {
++        // 0171: contiguous here, so the later lookup builds no CONT of its own in its split
++        if (!ggml_is_contiguous(selected_experts)) {
++            selected_experts = ggml_cont(ctx0, selected_experts);
++            ggml_build_forward_expand(gf, selected_experts);
++        }
+         moe_td_sel = selected_experts;
+         moe_td_w   = weights;
+         return nullptr;
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 7b0d85c62..88a87f044 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -754,6 +754,26 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 return f;
+             };
+ 
++            // 0171: the home card's FFN norm and router, queued right after its attention (that split has inputs, so the scheduler starts
++            // a new split at the MoE cache lookup); the selection is kept for its FFN, after the other card's FFN
++            ggml_tensor * h_home = nullptr;
++            ggml_tensor * sel_home = nullptr;
++            ggml_tensor * w_home = nullptr;
++            auto route_home = [&](ggml_tensor * ffn_inp) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                h_home = build_norm(ffn_inp, L.ffn_norm, NULL, LLM_NORM_RMS, il);
++                moe_td_phase = 1;
++                moe_td_other = false;
++                build_moe_ffn(h_home, L.ffn_gate_inp, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps, L.ffn_exp_probs_b,
++                    n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
++                    (llama_expert_gating_func_type) hparams.expert_gating_func, il, nullptr,
++                    L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
++                moe_td_phase = 0;
++                sel_home = moe_td_sel;
++                w_home   = moe_td_w;
++                pin_from(n0, H);
++            };
++
+             // card c's FFN: a dense layer's halves, or its part of the MoE; the all-reduce and the residual into x[c]
+             auto ffn = [&](int c, ggml_tensor * ffn_inp) {
+                 const int n0 = ggml_graph_n_nodes(gf);
+@@ -761,7 +781,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                     ffn_inp = ggml_add(ctx0, ffn_inp, x[c]); // 0170: the other card's attention residual, at the top of its FFN split
+                     cb(ffn_inp, "ffn_inp", il);
+                 }
+-                ggml_tensor * h = build_norm(ffn_inp, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
++                const bool routed = c == H && h_home != nullptr; // 0171: the norm and router came with the attention
++                ggml_tensor * h = routed ? h_home : build_norm(ffn_inp, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
+                 ggml_tensor * p = nullptr;
+                 int n1 = n0;
+                 if ((uint32_t) il < hparams.n_layer_dense_lead) {
+@@ -771,6 +792,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                         Wh(L.ffn_down, c, 2), NULL, NULL,
+                         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                 } else {
++                    if (routed) {
++                        moe_td_sel = sel_home;
++                        moe_td_w   = w_home;
++                    } else {
+                     moe_td_phase = 1;
+                     moe_td_other = c != H;
+                     build_moe_ffn(h, W(L.ffn_gate_inp, c), L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps, W(L.ffn_exp_probs_b, c),
+@@ -779,6 +804,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                         L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
+                     moe_td_other = false;
+                     pin_from(n0, c); // the norm and the router
++                    } // 0171
+                     if (c != H) {
+                         moe_td_phase = 2;
+                         p = build_moe_ffn(h, W(L.ffn_gate_inp, c), L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps, W(L.ffn_exp_probs_b, c),
+@@ -850,6 +876,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+             pre(O);
+             ggml_tensor * a_o = attn(O);
+             ggml_tensor * ffn_inp_h = attn(H);
++            if ((uint32_t) il >= hparams.n_layer_dense_lead) {
++                route_home(ffn_inp_h); // 0171
++            }
+             ffn(O, a_o);
+             ffn(H, ffn_inp_h);
+         }
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From ae8250da686f78f0a0923fe9dab8862e5d7320ab Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Tue, 3 Nov 2026 12:28:58 -0600
-Subject: [PATCH 034/141] MTP draft context: an expert cache over the NextN
+Subject: [PATCH 034/211] MTP draft context: an expert cache over the NextN
  layers only, sized by LLAMA_MTP_MOE_CACHE_MIB (default none), instead of a
  second full-size cache
 

@@ -1,7 +1,7 @@
 From 67eb13525fb9db22624cb8e4fc6ecced124114ce Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 11:54:34 -0600
-Subject: [PATCH 112/141] layer-major prompt graph: the expert copy callback
+Subject: [PATCH 112/211] layer-major prompt graph: the expert copy callback
  uploads whole layers for it (its FFN blocks share one copy; the selective
  path read only the first block routing), and decode takes it only for batches
  of LLAMA_LM_MIN_TOKENS (2048) or more

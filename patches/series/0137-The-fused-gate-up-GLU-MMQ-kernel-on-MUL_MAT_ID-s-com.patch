@@ -1,7 +1,7 @@
 From 73c3f6e6f2f904a0d33f995287f91575b388e6ff Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:13:31 -0600
-Subject: [PATCH 137/141] The fused gate/up/GLU MMQ kernel on MUL_MAT_ID's
+Subject: [PATCH 137/211] The fused gate/up/GLU MMQ kernel on MUL_MAT_ID's
  compacted tile grid (one block a real tile, as 0104 for the unfused path)
 
 ---

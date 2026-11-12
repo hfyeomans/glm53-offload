@@ -1,0 +1,233 @@
+From d2d41c8a084e4e849c18a98b4a1d37ae6c5e7db5 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:16:01 -0600
+Subject: [PATCH 154/211] LLAMA_MOE_PREFETCH_STAGE=K: the next layer predicted
+ experts go into staging slots for one lookup (no LFU admission, nothing
+ evicted)
+
+---
+ ggml/include/ggml-cuda.h        |   2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |   9 +++
+ src/llama-moe-cache.cpp         | 123 +++++++++++++++++++++++++++++++-
+ 3 files changed, 131 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 6ce4b4c41..600bdee62 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -62,6 +62,8 @@ GGML_BACKEND_API void ggml_backend_cuda_side_upload_async(ggml_backend_t backend
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend);
+ // records the event behind the side uploads issued so far (0045), for a wait on just those
+ GGML_BACKEND_API void ggml_backend_cuda_side_upload_record(ggml_backend_t backend, ggml_backend_event_t event);
++// 0150: the side uploads issued from now on wait for an event recorded on a stream of the same device
++GGML_BACKEND_API void ggml_backend_cuda_side_upload_wait_event(ggml_backend_t backend, ggml_backend_event_t event);
+ 
+ // 0138 LLAMA_MOE_CACHE_BORROW_MIB: the device's VMM granularity, 0 without VMM
+ GGML_BACKEND_API size_t ggml_backend_cuda_vmm_granularity(ggml_backend_t backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 920d06cdd..acda6b512 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8188,6 +8188,15 @@ void ggml_backend_cuda_side_upload_wait(ggml_backend_t backend) {
+     r.side_pending = false;
+ }
+ 
++// 0150: the side uploads issued from now on wait for `event` (recorded on a stream of the same device)
++void ggml_backend_cuda_side_upload_wait_event(ggml_backend_t backend, ggml_backend_event_t event) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    ggml_cuda_upload_ring & r = g_cuda_upload_ring[cuda_ctx->device];
++    ggml_cuda_upload_ring_init(r);
++    CUDA_CHECK(cudaStreamWaitEvent(r.stream, (cudaEvent_t) event->context, 0));
++}
++
+ void ggml_backend_cuda_side_upload_record(ggml_backend_t backend, ggml_backend_event_t event) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(cuda_ctx->device);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 63fc05ead..ffc2cc0d9 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -42,6 +42,7 @@ struct moe_cache_slru {
+     int32_t n_protected = 0;
+     int32_t n_filled    = 0; // slots that hold an expert
+     int32_t n_active    = 0; // 0138: the slots in use, [0, n_active); the rest are given up (their memory is borrowed by a graph)
++    int32_t n_low       = 0; // 0150: slots [0, n_low) stage predicted experts; the LFU uses [n_low, n_active)
+ 
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+@@ -166,7 +167,7 @@ struct moe_cache_slru {
+         float   bf   = 0.0f;
+         for (int32_t i = 0; i < lfu_sample || best < 0; ++i) {
+             rng = rng*6364136223846793005ull + 1442695040888963407ull;
+-            const int32_t s   = (int32_t) ((rng >> 33) % (uint64_t) n_active);
++            const int32_t s   = n_low + (int32_t) ((rng >> 33) % (uint64_t) (n_active - n_low));
+             const int32_t key = key_of[s];
+             if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                 continue;
+@@ -410,6 +411,8 @@ struct llama_moe_cache::impl {
+         int32_t n_lent  = 0;
+         moe_cache_slru slru;
+         int32_t own = -1;                 // 0145: the group caches the experts e with e % 2 == own of its cross-device layers
++        int32_t n_stage = 0;              // 0150: staging slots [0, n_stage), four sets of n_stage/4
++        std::vector<ggml_backend_event_t> stage_ev; // 0150: per set, reached once the layer that last read it is done
+     };
+ 
+     struct layer {
+@@ -429,6 +432,7 @@ struct llama_moe_cache::impl {
+         ggml_backend_event_t fill_ev_xd = nullptr; // 0145: behind the layer's fills on the other device
+         bool fill_ev_xd_pending = false;
+         uint32_t cpu_acc_xd = 0;
++        std::vector<int32_t> staged;            // 0150: this layer's experts in staging slots for its next lookup
+         ggml_tensor * route_bias = nullptr; // LLAMA_MOE_ROUTE_BIAS: F32 [n_expert] on the layer's device
+         std::vector<float> route_bias_host; // the values of the next upload
+         std::vector<float> route_bias_last; // the values of the last upload
+@@ -756,6 +760,80 @@ struct llama_moe_cache::impl {
+ #endif
+     }
+ 
++    // 0150 LLAMA_MOE_PREFETCH_STAGE=K
++    static int32_t stage_k() {
++        static const int32_t v = getenv("LLAMA_MOE_PREFETCH_STAGE") != nullptr ? std::max(0, atoi(getenv("LLAMA_MOE_PREFETCH_STAGE"))) : 0;
++        return v;
++    }
++    size_t st_staged = 0;
++    size_t st_used   = 0;
++    size_t st_n      = 0;
++    // up to K predicted uncached experts of layer il+1 (by rank, each row's first choices first) into staging set (il+1) % 4 on the side
++    // stream, behind the layer that read that set four layers back; il+1's map points at them for its next lookup, which waits for them
++    void prefetch_staged(int32_t il, ggml_backend_t backend) {
++        pred_pending = false;
++#ifdef GGML_USE_CUDA
++        const int32_t jl = il + 1;
++        if (jl >= (int32_t) layers.size() || layers[jl].ig < 0 || layers[jl].ig_xd >= 0 || !ggml_backend_is_cuda(backend)) {
++            return;
++        }
++        layer & lj = layers[jl];
++        group & gj = groups[lj.ig];
++        if (devices[gj.id].backend != backend || gj.n_stage == 0 || pred_ids.empty()) {
++            return;
++        }
++        if (pred_in_pin) {
++            memcpy(pred_ids.data(), pred_pin, pred_ids.size()*sizeof(int32_t));
++        }
++        const int32_t K    = gj.n_stage/4;
++        const int32_t base = (jl & 3)*K;
++        const int32_t n_exp = gj.slru.n_expert;
++        int32_t * slots = gj.slru.slot_map[jl];
++        lj.staged.clear();
++        pf_mark.assign(n_exp, 0);
++        const size_t n_tok = pred_ids.size()/(size_t) n_expert_used;
++        for (int32_t r = 0; r < n_expert_used && (int32_t) lj.staged.size() < K; ++r) {
++            for (size_t t = 0; t < n_tok && (int32_t) lj.staged.size() < K; ++t) {
++                const int32_t e = pred_ids[t*n_expert_used + r];
++                if (e < 0 || e >= n_exp || pf_mark[e] || slots[e] < gj.n_slots) {
++                    continue;
++                }
++                pf_mark[e] = 1;
++                lj.staged.push_back(e);
++            }
++        }
++        if (lj.staged.empty()) {
++            return;
++        }
++        if (gj.stage_ev[jl & 3] != nullptr) {
++            ggml_backend_cuda_side_upload_wait_event(backend, gj.stage_ev[jl & 3]);
++        }
++        size_t bytes = 0;
++        for (size_t i = 0; i < lj.staged.size(); ++i) {
++            const int32_t e = lj.staged[i];
++            const int32_t s = base + (int32_t) i;
++            for (size_t ip = 0; ip < lj.experts.size(); ++ip) {
++                const ggml_tensor * w  = lj.experts[ip];
++                const size_t        es = w->nb[2];
++                ggml_backend_cuda_side_upload_async(backend, (uint8_t *) gj.banks[ip]->data + (size_t) s*es, (const uint8_t *) w->data + (size_t) e*es, es);
++                bytes += es;
++            }
++            slots[e] = s;
++        }
++        if (lj.fill_ev == nullptr) {
++            lj.fill_ev = ggml_backend_event_new(ggml_backend_get_device(backend));
++            GGML_ASSERT(lj.fill_ev != nullptr);
++        }
++        ggml_backend_cuda_side_upload_record(backend, lj.fill_ev);
++        lj.fill_ev_pending = true;
++        win_pf_n     += lj.staged.size();
++        win_pf_bytes += bytes;
++#else
++        GGML_UNUSED(il);
++        GGML_UNUSED(backend);
++#endif
++    }
++
+     std::unordered_map<ggml_backend_t, ggml_backend_event_t> ev_ids; // one per backend: an event belongs to its device
+     std::vector<uint8_t> fill_mark; // [n_expert] scratch of run_pending
+     std::vector<uint8_t> fill_async; // per fill of the last plan: uploaded on the side stream (0045)
+@@ -1241,6 +1319,14 @@ struct llama_moe_cache::impl {
+             }
+             g.n_top = g.n_slots;
+             g.slru.init(model.layers.size(), n_expert, g.n_slots);
++            // 0150 LLAMA_MOE_PREFETCH_STAGE=K: the group's first 4K slots stage the next layer's predicted experts (the LFU starts after them)
++            if (stage_k() > 0 && g.n_slots > 1024 && g.slru.lfu_half > 0.0f && prefetch_enabled() && deferred_plan()) {
++                g.n_stage       = 4*stage_k();
++                g.slru.n_low    = g.n_stage;
++                g.slru.n_filled = g.n_stage;
++                g.stage_ev.assign(4, nullptr);
++                LLAMA_LOG_INFO("%s: 0150: %d staging slots for the predicted experts of the next layer (%d a layer)\n", __func__, g.n_stage, stage_k());
++            }
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
+         }
+@@ -2109,9 +2195,31 @@ struct llama_moe_cache::impl {
+             fills.insert(fills.end(), fills_x.begin(), fills_x.end());
+             cpu.insert(cpu.end(), cpu_x.begin(), cpu_x.end());
+         }
+-        // 0140 LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, behind this layer's fills
++        // 0150: this layer's staged experts served this lookup only
++        if (!l.staged.empty()) {
++            int32_t * sm = g.slru.slot_map[il];
++            for (int32_t e : l.staged) {
++                st_used += g.slru.seen[e] == g.slru.seen_gen ? 1 : 0;
++                if (sm[e] < g.n_stage) {
++                    sm[e] = g.slru.empty;
++                }
++            }
++            st_staged += l.staged.size();
++            l.staged.clear();
++            if (++st_n % 4800 == 0) {
++                LLAMA_LOG_INFO("llama_moe_cache: 0150: %zu experts staged, %zu of them selected (%.1f %%)\n", st_staged, st_used,
++                    100.0*st_used/std::max<size_t>(1, st_staged));
++                st_staged = 0;
++                st_used   = 0;
++            }
++        }
++        // 0140 LLAMA_MOE_PREFETCH=1: the next layer's predicted experts, behind this layer's fills (0150: into staging slots)
+         if (pred_pending) {
+-            prefetch_deferred(il, backend);
++            if (stage_k() > 0) {
++                prefetch_staged(il, backend);
++            } else {
++                prefetch_deferred(il, backend);
++            }
+         }
+         // LLAMA_MOE_ROUTE_BIAS (0046): the selection bias of this layer for the next token, as the lookup sets it after its plan
+         if (l.route_bias != nullptr) {
+@@ -2954,6 +3062,15 @@ struct llama_moe_cache::impl {
+                 GGML_ASSERT(ev != nullptr);
+             }
+             ggml_backend_event_record(ev, backend);
++            // 0150: the layer before this one is queued in full: its staging set may be overwritten once the card is here
++            if (g.n_stage > 0 && il > 0) {
++                ggml_backend_event_t & sev = g.stage_ev[(il - 1) & 3];
++                if (sev == nullptr) {
++                    sev = ggml_backend_event_new(ggml_backend_get_device(backend));
++                    GGML_ASSERT(sev != nullptr);
++                }
++                ggml_backend_event_record(sev, backend);
++            }
+             defer_st = { il, it_cpu->second.n_used, backend, ev };
+             defer_st.x_t = it_cpu->second.inputs.size() > 1 ? it_cpu->second.inputs[1] : nullptr;
+             defer_st.ids_pin = ids_in_pin;
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 66eed1b24aa87596e0a9be93c17a1fcf0310d643 Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 13:25:45 -0600
-Subject: [PATCH 004/141] twin backends (LLAMA_TWIN_BACKENDS=1): prefill
+Subject: [PATCH 004/211] twin backends (LLAMA_TWIN_BACKENDS=1): prefill
  overlap of expert copies and GEMMs
 
 A second backend per GPU device, with its own stream and scheduler buffers, runs the large-batch expert splits of

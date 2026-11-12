@@ -1,7 +1,7 @@
 From afea04ea8ea194f949baabb9e262d4ffd39cdebd Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:16:46 -0600
-Subject: [PATCH 009/141] sched: host-weight copies first (opt-in); twin splits
+Subject: [PATCH 009/211] sched: host-weight copies first (opt-in); twin splits
  upload everything and serve prompts of 1024+ tokens
 
 The copy of a split non-host input makes the split backend stream wait on the producer event before the host-weight

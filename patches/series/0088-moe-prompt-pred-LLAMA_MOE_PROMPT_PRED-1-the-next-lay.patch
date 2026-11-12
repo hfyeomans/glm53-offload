@@ -1,7 +1,7 @@
 From 87106f56ce7a1d05fc9f1580a9c0b344d594da0e Mon Sep 17 00:00:00 2001
 From: Killy <308386066+killy-netsphere@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 15:11:42 -0600
-Subject: [PATCH 088/141] moe prompt pred (LLAMA_MOE_PROMPT_PRED=1): the next
+Subject: [PATCH 088/211] moe prompt pred (LLAMA_MOE_PROMPT_PRED=1): the next
  layer s router reads this layer s FFN input residual; the plan reads the
  guess and scores it at the next layer
 

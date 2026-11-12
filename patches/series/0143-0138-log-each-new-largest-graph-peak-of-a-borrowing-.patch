@@ -1,0 +1,39 @@
+From 02b702be32c1f4e1bd9a79fcde46632508a84cd8 Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:43:37 -0600
+Subject: [PATCH 143/211] 0138: log each new largest graph peak of a borrowing
+ device (the first 8), to size the head
+
+---
+ src/llama-moe-cache.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index c50d6c703..fc3652dd8 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -387,6 +387,8 @@ struct llama_moe_cache::impl {
+         size_t   borrow_head  = 0;    // the arena's private head: a graph that reaches past it needs the borrowed pages
+         bool     borrow_on    = true; // the borrowed slots are in use
+         uint32_t borrow_n     = 0;    // transitions
++        size_t   borrow_peak  = 0;    // 0139: the largest graph peak seen
++        uint32_t borrow_logs  = 0;
+     };
+ 
+     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
+@@ -3049,6 +3051,12 @@ void llama_moe_cache::borrow_update(ggml_backend_sched_t sched, int64_t n_tokens
+         static const bool ring = getenv("LLAMA_MOE_CACHE_BORROW_RING") != nullptr && atoi(getenv("LLAMA_MOE_CACHE_BORROW_RING")) != 0;
+         const size_t peak = ggml_backend_sched_get_peak(sched, d.backend);
+         const bool   want = (!ring || n_tokens <= impl::max_batch) && peak <= d.borrow_head;
++        if (peak != SIZE_MAX && peak > d.borrow_peak && d.borrow_logs < 8) {
++            d.borrow_peak = peak;
++            d.borrow_logs++;
++            LLAMA_LOG_INFO("llama_moe_cache: 0139 %s: new largest graph peak %.1f MiB (%lld tokens, head %.0f MiB)\n", ggml_backend_name(d.backend),
++                peak/1024.0/1024.0, (long long) n_tokens, d.borrow_head/1024.0/1024.0);
++        }
+         if (want == d.borrow_on) {
+             continue;
+         }
+-- 
+2.43.0
+

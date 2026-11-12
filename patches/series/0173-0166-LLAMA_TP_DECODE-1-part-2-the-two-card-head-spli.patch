@@ -1,0 +1,472 @@
+From 3b333de24460c8a376f93cc2519b4239829fa0ba Mon Sep 17 00:00:00 2001
+From: Killy <308386066+killy-netsphere@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:47:19 -0600
+Subject: [PATCH 173/211] 0166: LLAMA_TP_DECODE=1 part 2 -- the two-card
+ head-split decode graph (glm-dsa), build_moe_ffn in phases, sched gpu-switch
+ nosync
+
+---
+ ggml/include/ggml-backend.h |   3 +
+ ggml/src/ggml-backend.cpp   |   8 +-
+ src/llama-graph.cpp         |  47 ++++++-
+ src/llama-graph.h           |   7 +
+ src/models/glm-dsa.cpp      | 264 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 322 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b5a1e1c11..fca417164 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -361,6 +361,9 @@ extern "C" {
+     // the inputs that splits copy from another GPU are allocated and freed like intermediates, not kept for the whole graph in every
+     // pipeline copy (for graphs that cross between GPUs many times); applies to the graphs allocated after the call
+     GGML_API void                 ggml_backend_sched_set_transient_inputs(ggml_backend_sched_t sched, bool transient);
++    // 0166: no host wait for the previous GPU's work when a split without inputs starts on another GPU (their buffers are distinct; a
++    // two-card graph whose cards wait on each other inside kernels, ggml_pair_allreduce, would deadlock on it)
++    GGML_API void                 ggml_backend_sched_set_gpu_switch_nosync(ggml_backend_sched_t sched, bool nosync);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+ 
+     // Split graph without allocating it
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1a3bbcdde..267f0acbc 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1224,6 +1224,7 @@ struct ggml_backend_sched {
+     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+     ggml_backend_event_t input_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES]; // user inputs uploaded from the host copy
+     bool transient_inputs;                                          // 0060: cross-GPU inputs are not kept for the whole graph
++    bool gpu_switch_nosync;                                         // 0166: no host wait at a GPU -> GPU switch
+     ggml_backend_event_t transient_events[GGML_SCHED_MAX_BACKENDS]; // 0060: the destination's progress, waited on before such a copy
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+@@ -2434,7 +2435,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         // 0060: not between two GPUs with transient inputs, their buffers are distinct
+-        const bool gpu_switch = sched->transient_inputs && prev_backend_id >= 0 &&
++        const bool gpu_switch = (sched->transient_inputs || sched->gpu_switch_nosync) && prev_backend_id >= 0 && // 0166
+             ggml_backend_sched_backend_is_gpu(sched->backends[prev_backend_id]) && ggml_backend_sched_backend_is_gpu(split_backend);
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !gpu_switch) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+@@ -2853,6 +2854,11 @@ void ggml_backend_sched_set_transient_inputs(ggml_backend_sched_t sched, bool tr
+     sched->transient_inputs = transient;
+ }
+ 
++void ggml_backend_sched_set_gpu_switch_nosync(ggml_backend_sched_t sched, bool nosync) {
++    GGML_ASSERT(sched);
++    sched->gpu_switch_nosync = nosync;
++}
++
+ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
+     GGML_ASSERT(sched);
+     int backend_index = ggml_backend_sched_backend_id(sched, backend);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b8af78919..d1c9e8c7f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2245,6 +2245,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
++    // 0166 LLAMA_TP_DECODE phases 2 and 3: the router ran in phase 1
++    ggml_tensor * selected_experts = nullptr;
++    ggml_tensor * weights          = nullptr;
++    if (moe_td_phase >= 2) {
++        GGML_ASSERT(moe_td_sel != nullptr && moe_td_w != nullptr);
++        selected_experts = moe_td_sel;
++        weights          = moe_td_w;
++    } else {
+     ggml_tensor * logits = nullptr;
+ 
+     if (probs_in == nullptr) {
+@@ -2291,7 +2299,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // LLAMA_MOE_ROUTE_BIAS folded (0034): the cache's route bias holds exp_probs_b + d for the cached experts and replaces exp_probs_b
+     ggml_tensor * route_bias_folded = nullptr;
+     if (moe_cache != nullptr && exp_probs_b != nullptr && moe_cache->route_bias_folded(il)) {
+-        route_bias_folded = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
++        route_bias_folded = moe_td_other ? moe_cache->get_route_bias_td(il, n_tokens, n_expert_used) : // 0166
++            moe_cache->get_route_bias(il, n_tokens, n_expert_used);
+     }
+     if (exp_probs_b != nullptr) {
+         selection_probs = ggml_add(ctx0, probs, route_bias_folded != nullptr ? route_bias_folded : exp_probs_b);
+@@ -2311,7 +2320,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     // LLAMA_MOE_ROUTE_BIAS: favour the cached experts in the selection of the batches the MoE cache serves; the weights stay unbiased
+     if (moe_cache != nullptr && route_bias_folded == nullptr) {
+-        ggml_tensor * route_bias = moe_cache->get_route_bias(il, n_tokens, n_expert_used);
++        ggml_tensor * route_bias = moe_td_other ? moe_cache->get_route_bias_td(il, n_tokens, n_expert_used) : // 0166
++            moe_cache->get_route_bias(il, n_tokens, n_expert_used);
+         if (route_bias != nullptr) {
+             // LLAMA_MOE_ROUTE_PROTECT=R: the R best experts by the unbiased score stay selected, the bias only steers the rest
+             static const int route_protect = getenv("LLAMA_MOE_ROUTE_PROTECT") != nullptr ? atoi(getenv("LLAMA_MOE_ROUTE_PROTECT")) : 0;
+@@ -2358,7 +2368,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     // select experts
+-    ggml_tensor * selected_experts = selected_experts_in;
++    selected_experts = selected_experts_in;
+     if (selected_experts == nullptr) {
+         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+@@ -2380,7 +2390,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+     }
+ 
+-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
++    weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
+ 
+ 
+@@ -2419,6 +2429,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // 0166 LLAMA_TP_DECODE phase 1: the router alone
++    if (moe_td_phase == 1) {
++        moe_td_sel = selected_experts;
++        moe_td_w   = weights;
++        return nullptr;
++    }
++    } // 0166
++
+     // 0062 LLAMA_TP_PROMPT: expert parallelism over two cards, see moe_ep
+     if (moe_ep) {
+         moe_ep_route_end = ggml_graph_n_nodes(gf);
+@@ -2481,7 +2499,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     // the experts of host-resident layers may be read from the MoE cache
+-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
++    ggml_tensor * slots = moe_td_phase == 2 ? nullptr : // 0166: the other card has no home lookup
++        build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+@@ -2739,6 +2758,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * moe_xd_out  = nullptr;
+     ggml_tensor * moe_cpu_out = nullptr;
+ 
++    // 0166 LLAMA_TP_DECODE phase 2: the other card's hits of the layer's other-parity experts (xd), weighted and summed there
++    if (moe_td_phase == 2) {
++        ggml_tensor * slots_xd = build_moe_cache_slots_xd(selected_experts, il);
++        GGML_ASSERT(slots_xd != nullptr && "LLAMA_TP_DECODE: a MoE layer without a cross-device lookup (LLAMA_MOE_XD=1)");
++        moe_xd_views = true;
++        ggml_tensor * e = build_experts(cur, selected_experts, slots_xd, true);
++        moe_xd_views = false;
++        ggml_tensor * xw = ggml_mul(ctx0, e, weights);
++        ggml_tensor * s  = ggml_view_2d(ctx0, xw, n_embd, n_tokens, xw->nb[2], 0);
++        for (int64_t i = 1; i < xw->ne[1]; ++i) {
++            s = ggml_add(ctx0, s, ggml_view_2d(ctx0, xw, n_embd, n_tokens, xw->nb[2], i*xw->nb[1]));
++        }
++        cb(s, "ffn_moe_out_xd", il);
++        return s;
++    }
++
+     ggml_tensor * experts = nullptr;
+     if (p_gids != nullptr) {
+         // 0085: the device skips the CPU's experts; its down projection writes zeros there, up and gate leave them undefined
+@@ -2761,7 +2796,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // 0145 LLAMA_MOE_XD=1: the hits of the other device's parity, computed on that device from its banks; 0146: FIRST in the graph, so
+         // the scheduler copies their inputs over before this device's own hits are queued on its stream, and both devices work at once
+         ggml_tensor * experts_xd = nullptr;
+-        if (ggml_tensor * slots_xd = build_moe_cache_slots_xd(selected_experts, il)) {
++        if (ggml_tensor * slots_xd = moe_td_phase == 3 ? nullptr : build_moe_cache_slots_xd(selected_experts, il)) { // 0166: phase 2 did it
+             const int n_nodes_xd = ggml_graph_n_nodes(gf);
+             moe_xd_views = true;
+             experts_xd = build_experts(cur, selected_experts, slots_xd, true);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 6a45209aa..b78bdf2b5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1080,6 +1080,13 @@ struct llm_graph_context {
+     static bool moe_shexp_overlap_enabled();
+     mutable ggml_tensor * moe_probe_sel = nullptr;
+     mutable bool          moe_xd_views  = false; // 0145: build_lora_mm_id reads the other device's banks
++    // 0166 LLAMA_TP_DECODE: build_moe_ffn in phases -- 1: the router alone (its selection and weights kept in moe_td_sel / moe_td_w);
++    // 2: the other card's hits of the other parity (xd) from them, weighted and summed (returned); 3: the home card's part from them,
++    // without the xd branch.  moe_td_other: the router reads the MoE cache's route bias twin on the other card
++    mutable int           moe_td_phase  = 0;
++    mutable bool          moe_td_other  = false;
++    mutable ggml_tensor * moe_td_sel    = nullptr;
++    mutable ggml_tensor * moe_td_w      = nullptr;
+     static bool moe_probe_enabled();
+     static bool moe_prefetch_enabled(); // LLAMA_MOE_PREFETCH=1: predict the next layer's experts at the top of each layer (decode)
+ 
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 670db6e8d..1269d2f89 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -567,6 +567,270 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         return;
+     }
+ 
++    // 0166 LLAMA_TP_DECODE=1 (docs/20261107-two-card-tp-decode-design.md): a batch of up to LLAMA_TP_DECODE_MAX tokens (default 8) runs every
++    // layer on both cards.  Both hold the residual stream (the same bits); card c computes heads 32c..32c+31 (wq_b rows, wk_b / wv_b heads,
++    // wo input columns) over its own latent KV (the home cache or its replica, 0165); ggml_pair_allreduce (0164) sums the partials.  Both run
++    // the router; the home card computes its cached experts, the CPU part and the shared expert, the other card the cached experts of the
++    // other parity (xd).  A layer's splits: the home card's pre-attention (norm, q_a, the KV and indexer writes, the indexer, whose top-k
++    // leaves ahead of the home all-reduce), the other card's attention and FFN, then the home card's attention and FFN (its lookup callback
++    // blocks the host only once the other card's all-reduces are queued).  Any other graph writes only the home caches: the replicas follow
++    static const int td_max = getenv("LLAMA_TP_DECODE_MAX") != nullptr ? std::max(1, atoi(getenv("LLAMA_TP_DECODE_MAX"))) : 8;
++    const bool td = cparams.td && !tp && cparams.lm_rows == 0 && n_tokens <= td_max && moe_cache != nullptr;
++    res->td_rep_sync = cparams.td && !td;
++    ggml_backend_sched_set_gpu_switch_nosync(sched, td);
++    if (td) {
++        GGML_ASSERT(cparams.fused_lid && cparams.fused_top_k_mask);
++        ggml_backend_t be[2] = { nullptr, nullptr };
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
++            for (int c = 0; c < 2; ++c) {
++                if (be[c] == nullptr && ggml_backend_get_device(b) == model.tp_devs[c]) {
++                    be[c] = b;
++                }
++            }
++        }
++        GGML_ASSERT(be[0] != nullptr && be[1] != nullptr);
++        // pin the nodes built since n0 (views follow their source)
++        auto pin_from = [&](int n0, int c) {
++            for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_tensor * node = ggml_graph_node(gf, i);
++                if (node->view_src == nullptr) {
++                    ggml_backend_sched_set_tensor_backend(sched, node, be[c]);
++                }
++            }
++        };
++        auto W  = [&](ggml_tensor * w, int c) { return model.td_w(w, c); };
++        auto Wh = [&](ggml_tensor * w, int c, int kind) { return model.td_h(ctx0, w, c, kind); };
++        static const bool td_short_dense = getenv("LLAMA_DSA_SHORT_DENSE") != nullptr && atoi(getenv("LLAMA_DSA_SHORT_DENSE")) != 0;
++
++        ggml_tensor * inp_embd = build_inp_embd(model.tok_embd);
++        ggml_tensor * inp_pos  = build_inp_pos();
++        llm_graph_input_attn_k_dsa * inp = build_attn_inp_k_dsa();
++        ggml_tensor * inp_out_ids = build_inp_out_ids();
++        moe_cache->clear_preds();
++
++        const auto * mctx_mla = inp->mctx->get_mla();
++        const auto * mctx_lid = inp->mctx->get_lid();
++        ggml_tensor * kq_mask = inp->self_attn_mask_mla.cnv;
++        if (inp->self_attn_mask_lid.cnv->type == kq_mask->type) {
++            kq_mask = inp->self_attn_mask_lid.cnv;
++        }
++        const int64_t n_head_c    = n_head/2;
++        const int64_t n_lid_cells = inp->self_attn_mask_lid.cnv->ne[0];
++        const bool    dense       = td_short_dense && n_lid_cells <= (int64_t) n_indexer_top_k; // 0156 / 0160
++        {
++            static int n_logged = 0;
++            if (n_logged < 4) {
++                n_logged++;
++                LLAMA_LOG_INFO("%s: 0166: two-card head-split decode, %lld tokens, %lld indexer cells, %s attention\n", __func__,
++                    (long long) n_tokens, (long long) n_lid_cells, dense ? "dense" : "sparse (top-k)");
++            }
++        }
++
++        ggml_tensor * x[2] = { inp_embd, inp_embd };
++        ggml_tensor * prev_top_k = nullptr;
++        // the last full indexer layer's top-k as each card holds it: the other card takes its copy right after the home card's indexer
++        // (a later layer reading it across the cards would queue the copy behind the source card's all-reduce, which waits for the reader)
++        ggml_tensor * top_k_c[2] = { nullptr, nullptr };
++        for (int il = 0; il < n_layer; ++il) {
++            const auto & L = model.layers[il];
++            const int H = model.tp_home(il);
++            const int O = 1 - H;
++            GGML_ASSERT(L.wo_s == nullptr && L.wq_b != nullptr && L.wk_b != nullptr && L.wv_b != nullptr);
++            res->t_layer_inp[il] = x[H];
++
++            // pre-attention on card c: the norm, q_a, the latent key into the card's own cache; on the home card the indexer
++            ggml_tensor * qr[2] = { nullptr, nullptr };
++            auto pre = [&](int c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                if (c == O && hparams.is_indexer_full(il)) {
++                    top_k_c[O] = top_k_c[H] != nullptr ? ggml_cont(ctx0, top_k_c[H]) : nullptr; // this layer's top-k, copied over now
++                    if (top_k_c[O] != nullptr) {
++                        ggml_build_forward_expand(gf, top_k_c[O]);
++                    }
++                }
++                ggml_tensor * cur = build_norm(x[c], W(L.attn_norm, c), NULL, LLM_NORM_RMS, il);
++                ggml_tensor * q_a = ggml_mul_mat(ctx0, W(L.wq_a, c), cur);
++                q_a = build_norm(q_a, W(L.attn_q_a_norm, c), nullptr, LLM_NORM_RMS, il);
++                qr[c] = q_a;
++                if (c == H && hparams.is_indexer_full(il)) {
++                    ggml_tensor * iq = ggml_mul_mat(ctx0, L.indexer_attn_q_b, q_a);
++                    iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer_head, n_indexer_head, n_tokens);
++                    iq = ggml_rope_ext(ctx0, iq, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                       ext_factor, attn_factor, beta_fast, beta_slow);
++                    ggml_tensor * ik = ggml_mul_mat(ctx0, L.indexer_attn_k, cur);
++                    ik = build_norm(ik, L.indexer_k_norm, L.indexer_k_norm_b, LLM_NORM, il);
++                    ik = ggml_reshape_3d(ctx0, ik, n_embd_indexer_head, 1, n_tokens);
++                    ik = ggml_rope_ext(ctx0, ik, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NORM, n_ctx_orig, freq_base, freq_scale,
++                                       ext_factor, attn_factor, beta_fast, beta_slow);
++                    iq = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], iq);
++                    ik = ggml_mul_mat(ctx0, inp->self_k_rot_lid[il], ik);
++                    ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, ik, inp->get_k_idxs_lid(), il));
++                    if (dense) {
++                        prev_top_k = nullptr;
++                        top_k_c[H] = nullptr;
++                    } else {
++                        ggml_tensor * iw = ggml_mul_mat(ctx0, L.indexer_proj, cur);
++                        ggml_tensor * ikc = mctx_lid->get_k(ctx0, il);
++                        const auto n_stream = ikc->ne[3];
++                        iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], iq->ne[2]/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[3]/n_stream, 0);
++                        iw = ggml_view_4d(ctx0, iw, iw->ne[0], iw->ne[1]/n_stream, iw->ne[2], n_stream, iw->nb[1], iw->nb[2]/n_stream, iw->nb[3]/n_stream, 0);
++                        iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
++                        ggml_tensor * sc = ggml_lightning_indexer(ctx0, iq, ikc, iw, inp->self_attn_mask_lid.cnv);
++                        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
++                        const uint32_t n_top = sc->ne[0] < n_indexer_top_k ? sc->ne[0] : n_indexer_top_k;
++                        prev_top_k = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_top));
++                        cb(prev_top_k, "top_k", il);
++                        ggml_build_forward_expand(gf, prev_top_k);
++                        top_k_c[H] = prev_top_k;
++                    }
++                }
++                ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, W(L.wkv_a_mqa, c), cur);
++                ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
++                                                     ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
++                ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                                                  ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
++                k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++                kv_cmpr = build_norm(kv_cmpr, W(L.attn_kv_a_norm, c), nullptr, LLM_NORM_RMS, il);
++                kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
++                ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
++                ggml_build_forward_expand(gf, c == H ? mctx_mla->cpy_k(ctx0, Kcur, inp->get_k_idxs_mla(), il) :
++                                                       mctx_mla->cpy_k_rep(ctx0, Kcur, inp->get_k_idxs_mla(), il));
++                ggml_build_forward_expand(gf, qr[c]);
++                pin_from(n0, c);
++            };
++
++            // card c's heads of the attention, its wo partial, the all-reduce and the residual
++            auto attn = [&](int c) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                ggml_tensor * top_k = dense ? nullptr : top_k_c[c];
++                GGML_ASSERT((dense || top_k != nullptr) && "shared indexer layer must follow a previous full indexer layer");
++                ggml_tensor * q = ggml_mul_mat(ctx0, Wh(L.wq_b, c, 0), qr[c]);
++                ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head_c, n_tokens, ggml_row_size(q->type, n_embd_head_k),
++                                                    ggml_row_size(q->type, n_embd_head_k) * n_head_c, 0);
++                ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head_c, n_tokens, ggml_row_size(q->type, n_embd_head_k),
++                                                  ggml_row_size(q->type, n_embd_head_k) * n_head_c, ggml_row_size(q->type, n_embd_head_qk_nope));
++                q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                                     ext_factor, attn_factor, beta_fast, beta_slow);
++                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
++                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, Wh(L.wk_b, c, 1), q_nope);
++                q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
++                ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
++                ggml_tensor * K = c == H ? mctx_mla->get_k(ctx0, il) : mctx_mla->get_k_rep(ctx0, il);
++                ggml_tensor * V = ggml_view_4d(ctx0, K, kv_lora_rank, K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3], 0);
++                ggml_tensor * mask = top_k != nullptr ? build_fused_top_k_mask(kq_mask, top_k, il) : kq_mask;
++                ggml_tensor * o = build_attn_mha(Qcur, K, V, nullptr, mask, nullptr, nullptr, Wh(L.wv_b, c, 1),
++                                                 top_k != nullptr ? top_k->ne[0] : 0, kq_scale, il);
++                o = ggml_mul_mat(ctx0, Wh(L.wo, c, 2), o);
++                cb(o, "attn_out_part", il);
++                ggml_tensor * f = ggml_add(ctx0, ggml_pair_allreduce(ctx0, o, c), x[c]);
++                cb(f, "ffn_inp", il);
++                ggml_build_forward_expand(gf, f);
++                pin_from(n0, c);
++                return f;
++            };
++
++            // card c's FFN: a dense layer's halves, or its part of the MoE; the all-reduce and the residual into x[c]
++            auto ffn = [&](int c, ggml_tensor * ffn_inp) {
++                const int n0 = ggml_graph_n_nodes(gf);
++                ggml_tensor * h = build_norm(ffn_inp, W(L.ffn_norm, c), NULL, LLM_NORM_RMS, il);
++                ggml_tensor * p = nullptr;
++                int n1 = n0;
++                if ((uint32_t) il < hparams.n_layer_dense_lead) {
++                    p = build_ffn(h,
++                        Wh(L.ffn_up, c, 0), NULL, NULL,
++                        Wh(L.ffn_gate, c, 0), NULL, NULL,
++                        Wh(L.ffn_down, c, 2), NULL, NULL,
++                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                } else {
++                    moe_td_phase = 1;
++                    moe_td_other = c != H;
++                    build_moe_ffn(h, W(L.ffn_gate_inp, c), L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps, W(L.ffn_exp_probs_b, c),
++                        n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
++                        (llama_expert_gating_func_type) hparams.expert_gating_func, il, nullptr,
++                        L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
++                    moe_td_other = false;
++                    pin_from(n0, c); // the norm and the router
++                    if (c != H) {
++                        moe_td_phase = 2;
++                        p = build_moe_ffn(h, W(L.ffn_gate_inp, c), L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps, W(L.ffn_exp_probs_b, c),
++                            n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
++                            (llama_expert_gating_func_type) hparams.expert_gating_func, il, nullptr,
++                            L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
++                    } else {
++                        // the home card: its cached experts, the CPU part (build_moe_ffn places it) and the shared expert
++                        ggml_tensor * shexp = nullptr;
++                        if (moe_shexp_overlap_enabled() && n_tokens <= 32) {
++                            moe_overlap_hook = [&, h]() {
++                                shexp = build_ffn(h,
++                                    L.ffn_up_shexp, NULL, L.ffn_up_shexp_s,
++                                    L.ffn_gate_shexp, NULL, L.ffn_gate_shexp_s,
++                                    L.ffn_down_shexp, NULL, L.ffn_down_shexp_s,
++                                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                                ggml_build_forward_expand(gf, shexp);
++                            };
++                        }
++                        moe_td_phase = 3;
++                        ggml_tensor * moe_out = build_moe_ffn(h, L.ffn_gate_inp, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps,
++                            L.ffn_exp_probs_b, n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm,
++                            hparams.expert_weights_scale, (llama_expert_gating_func_type) hparams.expert_gating_func, il, nullptr,
++                            L.ffn_gate_up_exps, L.ffn_up_exps_s, L.ffn_gate_exps_s, L.ffn_down_exps_s);
++                        moe_overlap_hook = nullptr;
++                        if (shexp == nullptr) {
++                            shexp = build_ffn(h,
++                                L.ffn_up_shexp, NULL, L.ffn_up_shexp_s,
++                                L.ffn_gate_shexp, NULL, L.ffn_gate_shexp_s,
++                                L.ffn_down_shexp, NULL, L.ffn_down_shexp_s,
++                                NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                        }
++                        n1 = ggml_graph_n_nodes(gf); // the CPU part keeps its backend
++                        p = ggml_add(ctx0, moe_out, shexp);
++                    }
++                    moe_td_phase = 0;
++                    moe_td_sel   = nullptr;
++                    moe_td_w     = nullptr;
++                }
++                cb(p, "ffn_out_part", il);
++                ggml_tensor * y = ggml_add(ctx0, ggml_pair_allreduce(ctx0, p, c), ffn_inp);
++                cb(y, "l_out", il);
++                ggml_build_forward_expand(gf, y);
++                pin_from(c == H ? n1 : n0, c);
++                x[c] = y;
++            };
++
++            pre(H);
++            pre(O);
++            ggml_tensor * ffn_inp_o = attn(O);
++            ffn(O, ffn_inp_o);
++            ggml_tensor * ffn_inp_h = attn(H);
++            ffn(H, ffn_inp_h);
++        }
++
++        // the final norm, the MTP hidden state and the logits on the output's card
++        const int co = model.dev_output() == model.tp_devs[0] ? 0 : 1;
++        const int n0 = ggml_graph_n_nodes(gf);
++        ggml_tensor * cur = build_norm(x[co], model.output_norm, NULL, LLM_NORM_RMS, -1);
++        if (crop_before_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++        if (crop_after_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
++        cur = ggml_mul_mat(ctx0, model.output, cur);
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++        ggml_build_forward_expand(gf, cur);
++        pin_from(n0, co);
++        return;
++    }
++
+     // 0108 LLAMA_LAYER_MAJOR=R (llama_context::decode sets cparams.lm_rows for a batch whose tokens sit at the cells of their positions):
+     // each layer's attention in blocks of R query rows and its FFN in blocks of LLAMA_LM_MOE_ROWS rows, so a ubatch of up to n_ubatch
+     // tokens uploads each layer's experts once while the indexer's scores and masks stay [n_kv, R].  The masks are views of the device's
+-- 
+2.43.0
+
