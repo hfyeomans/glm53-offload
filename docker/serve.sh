@@ -3,26 +3,33 @@
 # context asked for, sizes the MoE cache and starts llama-server on port 8080 (OpenAI-compatible: /v1/chat/completions).
 #
 #   serve.sh --model /models/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [options] [-- extra llama-server args]
-#     --ctx 256k           context preset: 256k (default), 512k or 1m
+#     --ctx 256k           context preset: 256k (default), 512k or 1m (and 768k with --ram 256)
+#     --ram 256|384        host memory tier (default: 256 on a host with less than 360 GiB of RAM, else 384).  256 is for two cards:
+#                          the routed experts of some layers stay whole on the cards, the rest is in host memory (recipes/*-ram256.sh)
 #     --route-bias V       0 (default): the model's own routing.  0.03: the measured speed option; it changes the output (README.md)
+#     --prompt-cache-mib N host memory for the prompt cache, the conversations saved when another one takes the slot (default: the
+#                          preset's; about 1 GiB per 20,600 tokens, and a conversation larger than the cache is not saved).  With
+#                          --ram 256 the memory check rises and falls with it
 #     --cache-mib N        MoE cache size in MiB over all GPUs (default: the preset's measured size, less when a card is not whole)
 #     --threads N          CPU threads (default: the physical cores)
 #     --alias NAME         model name the API reports (default glm-5.3)
 #     --force              start even if a check fails (RAM, GPU model, peer-to-peer, a bias above 0.03, a card with too little free)
 #     --dry-run            print the command and the environment, start nothing
 set -u
-MODEL=; PRESET=256k; BIAS=; CACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; PASS=()
+MODEL=; PRESET=256k; RAM=; BIAS=; CACHE=; PCACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; PASS=()
 while [ $# -gt 0 ]; do case $1 in
   --model) MODEL=$2; shift 2;;
   --ctx) PRESET=${2,,}; shift 2;;
+  --ram) RAM=$2; shift 2;;
   --route-bias) BIAS=$2; shift 2;;
   --cache-mib) CACHE=$2; shift 2;;
+  --prompt-cache-mib) PCACHE=$2; shift 2;;
   --threads) THREADS=$2; shift 2;;
   --alias) ALIAS=$2; shift 2;;
   --force) FORCE=1; shift;;
   --dry-run) DRY=1; shift;;
   --) shift; PASS=("$@"); break;;
-  -h|--help) sed -n 2,12p "$0"; exit 0;;
+  -h|--help) sed -n 2,16p "$0"; exit 0;;
   *) echo "unknown option $1 (see --help)"; exit 2;;
 esac; done
 
@@ -55,14 +62,47 @@ if [ "$NGPU" = 2 ]; then
 fi
 
 # the recipe: what every preset shares, what the card count adds, what the context changes
-R=/app/recipes/${NGPU}gpu-${PRESET}.sh
-[ -f "$R" ] || { echo "[serve] no recipe for $NGPU GPU(s) at --ctx $PRESET (have: $(ls /app/recipes | grep gpu- | sed 's/[.]sh$//' | tr '\n' ' '))"; exit 2; }
+# the host memory tier: the 384 presets pin every routed expert in host memory; the 256 presets keep some layers' experts on the cards
+MEM_TOTAL_GB=$(awk '/MemTotal/ {printf "%d", $2/1048576}' /proc/meminfo)
+if [ -z "$RAM" ]; then if [ "$MEM_TOTAL_GB" -lt 360 ]; then RAM=256; else RAM=384; fi; fi
+case $RAM in 384) TIER=;; 256) TIER=-ram256;; *) echo "[serve] --ram is 256 or 384, not '$RAM'"; exit 2;; esac
+R=/app/recipes/${NGPU}gpu-${PRESET}${TIER}.sh
+[ -f "$R" ] || { [ "$RAM$NGPU" != 2561 ] || echo "[serve] the --ram 256 presets need both cards (--gpus 0,1); one card needs a host with 384 GiB of RAM"
+                echo "[serve] no recipe for $NGPU GPU(s) at --ctx $PRESET with --ram $RAM (have: $(ls /app/recipes | grep gpu- | grep -v gpu-ram | sed 's/[.]sh$//' | tr '\n' ' '))"; exit 2; }
 # shellcheck source=/dev/null
 source /app/recipes/common.sh
 # shellcheck source=/dev/null
 source "/app/recipes/${NGPU}gpu.sh"
 # shellcheck source=/dev/null
+[ -z "$TIER" ] || source "/app/recipes/${NGPU}gpu${TIER}.sh"
+# shellcheck source=/dev/null
 source "$R"
+
+# RESIDENT (the 256 presets): the layers whose routed experts stay whole on their card; the experts of the other layers go to host memory
+if [ -n "${RESIDENT:-}" ]; then
+  HOST_L=; for l in $(seq 3 77); do case " $RESIDENT " in *" $l "*) ;; *) HOST_L="$HOST_L|$l";; esac; done
+  OT_R="blk[.](${HOST_L#|})[.]ffn_(up|down|gate|gate_up)_(ch|)exps=CPU"
+  for i in "${!COMMON_ARGS[@]}"; do [ "${COMMON_ARGS[$i]}" = "$OT" ] && COMMON_ARGS[$i]=$OT_R; done
+fi
+# LOAD_MODE: a preset that does not pin the host experts (mmap: they sit in the page cache and can be read back from the disk)
+if [ -n "${LOAD_MODE:-}" ]; then
+  for i in "${!COMMON_ARGS[@]}"; do [ "${COMMON_ARGS[$i]}" = --load-mode ] && COMMON_ARGS[$((i + 1))]=$LOAD_MODE; done
+fi
+
+# the prompt cache: the preset's size (CACHE_RAM_MIB; the 384 presets leave the server's default, 8,192 MiB), or the one asked for.
+# The memory check below counts the preset's cache full, adds what a larger one takes, and gives back what a smaller one leaves.
+if [ -n "$PCACHE" ]; then
+  case $PCACHE in ''|*[!0-9]*) echo "[serve] --prompt-cache-mib takes a size in MiB (0 turns the cache off), not '$PCACHE'"; exit 2;; esac
+  PC_BASE=${CACHE_RAM_MIB:-8192}
+  PC_LOW=${CACHE_RAM_MEASURED_MIB:-$PC_BASE}    # the smallest cache the preset's memory was measured with (none given: its own)
+  if [ "$PCACHE" -gt "$PC_BASE" ]; then
+    NEED_RAM_GIB=$((NEED_RAM_GIB + (PCACHE - PC_BASE + 1023) / 1024))
+  elif [ "$PC_LOW" -lt "$PC_BASE" ]; then       # a smaller cache gives its memory back, down to the smallest one measured
+    NEED_RAM_GIB=$((NEED_RAM_GIB - (PC_BASE - (PCACHE > PC_LOW ? PCACHE : PC_LOW)) / 1024))
+  fi
+  CACHE_RAM_MIB=$PCACHE
+fi
+[ -z "${CACHE_RAM_MIB:-}" ] || RECIPE_ARGS+=(--cache-ram "$CACHE_RAM_MIB")
 
 # the route bias: 0 unless asked for
 if [ -n "$BIAS" ]; then
@@ -77,7 +117,7 @@ fi
 # host memory: the experts live in pinned host memory (~296 GiB) next to the engine's host buffers
 MEM_AVAIL_GB=$(awk '/MemAvailable/ {printf "%d", $2/1048576}' /proc/meminfo)
 say "host memory: ${MEM_AVAIL_GB} GiB available; this preset peaked at ${NEED_RAM_GIB} GiB in use on the test host, the OS included"
-[ "$MEM_AVAIL_GB" -ge "$NEED_RAM_GIB" ] || fail "not enough host memory: ${MEM_AVAIL_GB} GiB available, ${NEED_RAM_GIB} GiB needed (a host with 384 GiB of RAM or more)"
+[ "$MEM_AVAIL_GB" -ge "$NEED_RAM_GIB" ] || fail "not enough host memory: ${MEM_AVAIL_GB} GiB available, ${NEED_RAM_GIB} GiB needed (a host with $RAM GiB of RAM or more)"
 [ "$(ulimit -l)" = unlimited ] || fail "locked-memory limit is $(ulimit -l) (run the container with --ulimit memlock=-1:-1)"
 
 # CPU threads: the physical cores
@@ -110,7 +150,7 @@ if [ -z "$CACHE" ]; then
 else
   say "MoE cache set by hand: $CACHE MiB (the preset measured $CACHE_MIB)"
 fi
-say "recipe $(basename "$R" .sh), route bias $LLAMA_MOE_ROUTE_BIAS, MoE cache $CACHE MiB, $THREADS threads"
+say "recipe $(basename "$R" .sh), route bias $LLAMA_MOE_ROUTE_BIAS, MoE cache $CACHE MiB, prompt cache ${CACHE_RAM_MIB:-8192} MiB, $THREADS threads"
 
 ARGS=(--model "$MODEL" --alias "$ALIAS" --host 0.0.0.0 --port 8080 --threads "$THREADS" --threads-batch "$THREADS"
       --moe-cache-mib "$CACHE" "${COMMON_ARGS[@]}" "${RECIPE_ARGS[@]}" "${PASS[@]}")

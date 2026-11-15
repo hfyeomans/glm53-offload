@@ -132,7 +132,8 @@ medians are within 0.7 % of the first.
   97,887.
 - **Less RAM.** The presets pin the whole model in host memory. Loading it memory-mapped instead was measured and is not shipped:
   with every page in memory it was 4 to 15 % slower, and it saved no memory. With the container capped at 256 GB, decode fell to
-  2.8 and 4.3 tok/s on one card and to 6.1 and 6.2 on two (a story and a code prompt), and at 192 GB to under 3.
+  2.8 and 4.3 tok/s on one card and to 6.1 and 6.2 on two (a story and a code prompt), and at 192 GB to under 3. Two cards on a
+  256 GB host have presets that pin less: [A 256 GB host](#a-256-gb-host).
 
 ## The route bias
 
@@ -255,6 +256,189 @@ byte for byte. That takes 6.2 GB off what is read for every token (19.5 to 13.3 
 These two rows are from early in the work: two cards, an earlier engine, the same cache size on both sides. They show what the
 requant itself is worth, not what the presets reach. A Q4_K version was 4 to 6 % faster again and cost +1.9 % perplexity, outside
 the error bar, so it is not shipped.
+
+## A 256 GB host
+
+The `--ram 256` presets (`recipes/2gpu-ram256.sh` and `recipes/2gpu-*-ram256.sh`) were measured on a second machine, on
+2026-11-14. Nothing else in this file is from it.
+
+| | |
+|---|---|
+| GPUs | 2 × NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 96 GB (97,887 MiB), PCIe 5.0 x16 each, peer-to-peer OK; a desktop session held 113 to 153 MiB of card 0 |
+| CPU | AMD Ryzen Threadripper PRO 9955WX, 16 cores (one NUMA node) |
+| RAM | 256 GB (246.8 GiB to the OS), 8 GiB of swap |
+| Driver / model disk | NVIDIA 615.71.09; the model on a Samsung 9100 PRO NVMe drive |
+| Image | this repo's image built at `b5e86ee`, with `recipes/` and `docker/serve.sh` of this change mounted over the image's |
+
+**What the presets change.** The 384 GB presets pin the routed experts of all 75 MoE layers in host memory: 295.8 GiB, more than
+this host has. These keep 20 to 28 layers' experts whole on the cards and pin the rest. A card's memory then goes to its weights
+(6.2 GiB on card 0, 10.7 on card 1), the resident layers (3,984 MiB each; layer 8 is 5,376 and layers 75 to 77 are 4,872), the KV
+cache (12.4 GiB over both cards for each 262,144 tokens), the compute buffer (3.9 to 4.3 GiB), the layer-major staircase (0.5 to
+1.0 GiB), and the expert cache in what is left. The upload ring (two slots of the card's largest layer, 10.5 and 9.5 GiB) and part
+of the cache share memory with the compute buffer and the KV cache, as in the 384 GB presets. Decode splits the layers across the
+cards, as `2gpu-1m` does; the both-cards decode was not tried with resident layers.
+
+| Preset | Context, tokens | Layers on card 0 + card 1 | Host experts, pinned | Expert cache, card 0 / card 1, MiB | Host experts a card caches | Host RAM in use at the peak | GPU peak, card 0 / card 1, MiB |
+|---|---|---|---|---|---|---|---|
+| `2gpu-256k-ram256` | 262,144 | 15 + 13 | 182.9 GiB | 25,042 / 26,038 | 13.3 / 13.8 % | 204 GiB | 96,513 / 96,270 |
+| `2gpu-512k-ram256` | 524,288 | 13 + 11 | 198.4 GiB | 30,022 / 32,014 | 14.7 / 15.7 % | 221 GiB | 94,131 / 95,102 |
+| `2gpu-768k-ram256` | 786,432 | 12 + 10 | 206.2 GiB | 34,006 / 35,998 | 16.0 / 17.0 % | 231 GiB | 96,231 / 95,762 |
+| `2gpu-1m-ram256` | 1,000,000 | 11 + 9 | 214.0 GiB | 38,986 / 39,982 | 17.7 / 18.2 % | 238 GiB | 96,275 / 95,764 |
+
+- The cache column is its size at the start, with the slots it holds on the compute buffer's and the KV cache's memory. The KV
+  cache takes 7 to 25 GiB of it a card back as the context fills.
+- Host RAM in use is the total less the available, at the lowest point of the run below; 4 to 7 GiB of it was the host's own OS
+  and desktop. Those runs had a 2 GiB prompt cache. The start refuses a host with less available than this with the preset's
+  prompt cache full: 219, 227, 233 and 238 GiB ([the prompt cache](#the-prompt-cache-on-the-256-gb-host) below).
+- Layers 8 and 75 to 77 are always on the cards. Left on the host they are slot groups of their own in the cache, and with the
+  small budget these presets give the cache the engine stopped at the start ("MoE cache budget is too small").
+
+**Method.** One server per preset, started as it ships with one request at a time. A 9,022-token prompt first, then
+`scripts/bench.sh` in full (the method at the top of this file; for 768K the steps are 4,096, 344,064 and 688,128 target tokens),
+then fresh prompts of eight sizes. Each preset was run once. Raw files: `results/ram256/2gpu-<ctx>.json` and
+`results/ram256/2gpu-<ctx>-sizes.json`. `bench/report.py --tables` does not read them; the tables below were written by hand
+from those files.
+
+**Decode.**
+
+| Preset | Decode, tok/s | Lowest prompt | Highest prompt | First token, s |
+|---|---|---|---|---|
+| `2gpu-256k-ram256` | 26.6 | 23.8 | 31.9 | 1.27 |
+| `2gpu-512k-ram256` | 26.7 | 22.3 | 32.0 | 1.31 |
+| `2gpu-768k-ram256` | 27.5 | 24.5 | 32.4 | 1.28 |
+| `2gpu-1m-ram256` | 25.6 | 22.8 | 30.9 | 1.40 |
+
+**One prompt grown in three steps.**
+
+| Preset | Prompt grown to | Prompt, tok/s | First token after, s | Decode after it, tok/s |
+|---|---|---|---|---|
+| `2gpu-256k-ram256` | 3,608 | 849 | 4.2 | 28.4 |
+|  | 100,376 | 1,494 | 64.9 | 28.5 |
+|  | 200,728 | 1,276 | 78.7 | 27.3 |
+| `2gpu-512k-ram256` | 3,608 | 814 | 4.4 | 29.2 |
+|  | 200,728 | 1,344 | 146.7 | 27.7 |
+|  | 401,432 | 1,052 | 190.9 | 24.5 |
+| `2gpu-768k-ram256` | 3,608 | 794 | 4.5 | 30.7 |
+|  | 301,080 | 1,000 | 297.6 | 26.5 |
+|  | 602,136 | 718 | 419.7 | 22.3 |
+| `2gpu-1m-ram256` | 3,608 | 542 | 6.7 | 28.0 |
+|  | 401,432 | 760 | 523.8 | 26.0 |
+|  | 802,840 | 616 | 651.8 | 18.3 |
+
+**Fresh prompts by size.** `bench/probe.py --salt`: every prompt starts with a line of its own, so the server computes all of it,
+and 64 tokens are generated after it. Three prompts of each size up to 32K, and the table gives their median; one prompt of 64K
+and of 128K. The first figure is prompt tokens a second as the server reports them, the second the wait for the first streamed
+token as the client sees it.
+
+| Prompt, tokens | `256k`: tok/s, first token | `512k` | `768k` | `1m` |
+|---|---|---|---|---|
+| 1,049 | 288, 3.6 s | 266, 3.9 s | 255, 4.1 s | 245, 4.2 s |
+| 2,058 | 564, 3.6 s | 524, 3.9 s | 503, 4.1 s | 485, 4.2 s |
+| 4,101 | 956, 4.3 s | 919, 4.5 s | 898, 4.6 s | 625, 6.6 s |
+| 8,161 | 1,246, 6.6 s | 1,180, 6.9 s | 1,040, 7.9 s | 732, 11.2 s |
+| 16,309 | 1,460, 11.3 s | 1,403, 11.8 s | 1,139, 14.5 s | 801, 20.5 s |
+| 32,606 | 1,571, 21.1 s | 1,525, 21.7 s | 1,184, 27.9 s | 800, 41.1 s |
+| 65,197 | 1,538, 42.8 s | 1,497, 43.9 s | 1,161, 56.5 s | 797, 82.2 s |
+| 130,354 | 1,470, 88.7 s | 1,441, 90.5 s | 1,124, 116.1 s | 796, 163.8 s |
+
+- **A prompt of 1K to 2K tokens waits about as long as one of 4K:** 3.6 to 4.2 s. From 513 new tokens a prompt takes the
+  layer-major graph (`LLAMA_LM_MIN_TOKENS`). That reads like a fixed cost a ubatch; it was not traced.
+- **Three prompts of a size agree within 3 %,** except at 768K: 249 to 264 tok/s at 1K, 922 to 1,169 at 8K and 1,138 to 1,207
+  at 16K.
+- **1M is slower on prompts** than the other three, by 30 to 49 % from 4K tokens up. It runs ubatches of 2K tokens where the
+  others run 4K; that this is the cause was not tested.
+- The 64 tokens after these prompts ran at 24 to 30 tok/s.
+
+### The prompt cache on the 256 GB host
+
+When a request does not continue the conversation in the slot, the server saves that conversation's state to host memory
+(`--cache-ram`) and restores it when a later request returns to it. A state larger than the limit is not saved; otherwise the
+oldest entries leave to make room. That is from the server's source at the engine's base commit; the sizes and times below
+are measured. The 384 GB presets leave the server's 8,192 MiB. On this host the cache sits next to the pinned experts, so each
+preset sets its own (`CACHE_RAM_MIB`), and `--prompt-cache-mib N` overrides it:
+
+| Preset | Prompt cache, MiB | Idle conversations it holds, tokens | Host RAM left of 246.8 GiB, lowest | The start's memory check |
+|---|---|---|---|---|
+| `2gpu-256k-ram256` | 16,384 | 330K | 29 GiB: 30.5 measured with 14,895 MiB in the cache | 219 GiB |
+| `2gpu-512k-ram256` | 8,192 | 165K | 19.9 GiB: 25.9 measured with a 2 GiB cache, less 6 | 227 GiB |
+| `2gpu-768k-ram256` | 4,096 | 83K | 14.7 GiB: 16.7 measured with a 2 GiB cache, less 2 | 233 GiB |
+| `2gpu-1m-ram256` | 2,048 | 41K | 9.7 GiB, measured | 238 GiB |
+
+The memory check follows `--prompt-cache-mib`: up by what a larger cache takes, and down by what a smaller one leaves, as far
+as the 2 GiB cache every preset was measured with (`256k` with 8,192 MiB: 211 GiB, as measured; with 2,048 or less: 205, and
+203.8 was measured).
+
+**A saved conversation is 0.0496 MiB a token** (1 GiB per 20,600 tokens), as the server logged it on `2gpu-256k-ram256`:
+
+| Conversation, tokens | State, MiB |
+|---|---|
+| 12,042 | 598 |
+| 100,042 | 4,966 |
+| 150,042 | 7,448 |
+| 180,042 | 8,937 |
+| 200,042 | 9,929 |
+
+A conversation that fills the 262,144-token context is then 13,012 MiB (12.7 GiB).
+
+**Method.** `bench/switch.py`: conversations of random common words, each ending with the same question, sent in turn to the
+one slot with a short unrelated request ("side") between some of them; 16 tokens generated, temperature 0. One run per cache
+size, on `2gpu-256k-ram256`. Both were made while the preset had 8,192 MiB, the 16 GiB one with `--prompt-cache-mib 16384`: the
+server's arguments are the ones the preset gives it now. "First token" is the client's wall time less the server's generation
+time, so it includes saving the conversation that leaves the slot. Raw files: `results/ram256/2gpu-256k-switch-8g.json` and
+`2gpu-256k-switch-16g.json`.
+
+| Prompt cache | Step | Tokens computed | Tokens reused | First token, s |
+|---|---|---|---|---|
+| 8,192 MiB (`--prompt-cache-mib 8192`) | A, 150K, new | 150,027 | 0 | 117.3 |
+|  | side | 9 | 10 | 2.1 |
+|  | A again | 1 | 150,026 | 0.8 |
+|  | B, 12K, new | 12,015 | 12 | 10.6 |
+|  | A again | 1 | 150,026 | 0.8 |
+|  | B again | 1 | 12,026 | 1.5 |
+|  | side | 4 | 15 | 0.3 |
+|  | C, 180K, new | 180,017 | 10 | 134.5 |
+|  | side: C is not saved | 4 | 15 | 0.5 |
+| 16,384 MiB (the preset) | A, 200K, new | 200,027 | 0 | 160.1 |
+|  | side | 9 | 10 | 2.6 |
+|  | A again | 1 | 200,026 | 1.0 |
+|  | B, 100K, new | 100,015 | 12 | 74.4 |
+|  | A again | 1 | 200,026 | 1.7 |
+|  | B again | 1 | 100,026 | 2.2 |
+|  | side | 4 | 15 | 1.3 |
+
+- **8 GiB held the 150K and the 12K conversation together** (8,045 MiB) and refused the 180K one: "prompt state size 8936.717
+  MiB exceeds cache size limit 8192.000 MiB, skipping". Returning to C would have cost its 134 s again; that return was not run.
+- **16 GiB held the 200K and the 100K conversation together** (14,895 MiB). The server's cache updates took 0.7 to 1.4 s with
+  8 GiB and 0.9 to 2.1 s with 16.
+- **Memory.** The lowest available host memory was 36.6 GiB with 8 GiB and 30.5 GiB with 16; the cards peaked at 96,493 /
+  96,236 and 96,505 / 96,252 MiB, within 20 MiB of the preset's bench run: the prompt cache takes no GPU memory. The 16 GiB
+  cache held 14.5 GiB at the most, so full it would leave about 29 GiB.
+- **Why the 256K preset has 16 GiB.** It is the smallest round size that holds any one conversation the context allows
+  (12.7 GiB) with room for short ones beside it; 8 GiB stops at 165K tokens, and a larger conversation is then computed again
+  in full after every switch. It costs 8 GiB of host memory and no GPU memory. Two full conversations need 25.4 GiB, which
+  would leave about 19 GiB by arithmetic; that was not run.
+- **The answers.** With 16 GiB, the two answers to A after a restore were the same text, and differed from the answer after A
+  was computed new; B's two answers were the same. The cause was not traced. The 8 GiB run did not record the answers.
+- **Not run:** `512k` and `768k` with their cache full, a cache above 16 GiB, and a save that fails to allocate (the server
+  then cuts its limit).
+
+**What was tried and not kept.**
+
+- **The model memory-mapped instead of pinned.** `2gpu-256k` as it ships with `--load-mode mmap`, every expert in the page
+  cache: two requests decoded at 1.9 and 4.6 tok/s. `2gpu-768k-ram256` with `--load-mode mmap`: decode 23.8 tok/s over the 24
+  prompts (27.5 pinned), the 9,022-token prompt at 96 tok/s (466 pinned), and the 3,608-token step at 208 tok/s with the first
+  token after 17.3 s (794 and 4.5 s). That run was stopped there and its JSON was not written; the figures are from its console
+  output. So no preset reads the model from the disk after the load, which took 2 to 3 minutes.
+- **256K with 24 layers on the cards, 2K-token attention blocks and 16K ubatches:** decode 26.8 tok/s and prompt steps of 769,
+  1,246 and 1,125 tok/s, with 17.7 GiB of host memory left at the lowest. The preset has 28 layers, 1K blocks and 4K ubatches:
+  the same decode within 1 %, faster prompts, and 43 GiB left.
+- **A smaller CPU share of the cache misses** (`--moe-cache-cpu-share`, 0.9 in every preset), for the 16 cores: on the first
+  eight decode prompts of `2gpu-256k-ram256`, 0.5 gave a median of 26.9 tok/s and 0.75 gave 26.6, against 26.3 for the preset on
+  the same prompts. One run each, and the spread between two runs was not measured, so the presets keep 0.9.
+
+**What was not measured.** The route bias, same top token against the reference, and a stability run: no mixed load, no
+cancelled requests, and no prompt past 77 % of the context (80 % for `1m`). `2gpu-512k-ram256` leaves 3.7 and 2.7 GiB of its
+cards unused at the peak, which a larger cache could take.
 
 ## What was not measured
 

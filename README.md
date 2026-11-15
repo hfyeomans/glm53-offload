@@ -24,9 +24,10 @@ start it.
 - **GPUs:** 1 or 2 × RTX PRO 6000 Blackwell (96 GB; the Workstation edition was measured), each on PCIe 5.0 x16, with nothing else
   on them: the presets fill a card to within about 0.5 GiB. Two cards need peer-to-peer access (`nvidia-smi topo -p2p r` says
   `OK`). Prompt speed scales with the PCIe link.
-- **RAM:** 384 GB or more. The whole model is pinned in host memory, and the host peaked at 338 to 354 GiB in use, the OS included,
-  depending on the preset. There is no way under that: with the weights memory-mapped on a host capped at 256 GB, decode fell to
-  3-6 tokens a second.
+- **RAM:** 384 GB or more for the presets below. The whole model is pinned in host memory, and the host peaked at 338 to 354 GiB in
+  use, the OS included, depending on the preset. Memory-mapping the weights is no way under that: on a host capped at 256 GB, decode
+  fell to 3-6 tokens a second. A host with 256 GB and two cards has presets of its own, which keep part of the experts on the cards:
+  [A 256 GB host](#a-256-gb-host).
 - **CPU:** it computes most expert-cache misses and part of each prompt, so cores and memory bandwidth matter. Measured on a 64-core
   Threadripper PRO 9985WX with 8 channels of DDR5-6400. The image is built for AVX-512; see `docker/Dockerfile` for an AVX2 build.
 - **Software:** Linux, an NVIDIA driver for CUDA 13.0 (measured on 610.43.02), Docker with the NVIDIA Container Toolkit.
@@ -57,9 +58,11 @@ as `reasoning_content`. `reasoning_effort` (`low`, `high`, default `max`) sets h
 `./run.sh --help` lists the options:
 
 - `--ctx 256k|512k|1m`: the context preset (default `256k`);
+- `--ram 256|384`: the host memory tier (default: 256 on a host with less than 360 GiB of RAM, see [A 256 GB host](#a-256-gb-host));
 - `--route-bias 0.03`: the speed option (default 0);
 - `--port`, and `--bind 0.0.0.0` to serve the LAN (there is no authentication: add `-- --api-key KEY`);
 - `--detach` to run in the background;
+- `--prompt-cache-mib N`: host memory for conversations saved when another one takes the slot (default: the preset's);
 - `--cache-mib`, `--threads`;
 - `--dry-run` (prints the exact llama-server command and environment, and starts nothing).
 
@@ -81,6 +84,44 @@ Each context has its own preset for one card and for two: six recipes, each meas
 Take the smallest context your work fits in. A larger context takes GPU memory from the expert cache, so fewer experts sit on the
 GPU. The one-card 1M preset is 1,000,000 tokens (the server reports 1,000,192, the next multiple of 256) and leaves the cache almost
 nothing to give: the card must be whole.
+
+## A 256 GB host
+
+Two cards also serve the model from a host with 256 GB of RAM: `--ram 256`, which the start picks by itself on a host with less
+than 360 GiB. These presets keep the routed experts of 20 to 28 of the 75 MoE layers whole on the cards and pin the other layers'
+in host memory, 183 to 214 GiB instead of 296. A layer on the cards never misses; the expert cache serves the rest. One card
+cannot hold enough of the experts for this.
+
+| Context | `--ctx` | Layers on the cards | Pinned in host RAM | Decode, tok/s | Prompt, tok/s (deepest step) | First token of a fresh 16K / 32K prompt | Host RAM free at the lowest |
+|---|---|---|---|---|---|---|---|
+| 256K | `256k` | 28 | 183 GiB | 26.6 | 1,276 (to 201K) | 11.3 s / 21.1 s | 43 GiB |
+| 512K | `512k` | 24 | 198 GiB | 26.7 | 1,052 (to 401K) | 11.8 s / 21.7 s | 26 GiB |
+| 768K | `768k` | 22 | 206 GiB | 27.5 | 718 (to 602K) | 14.5 s / 27.9 s | 17 GiB |
+| 1M | `1m` | 20 | 214 GiB | 25.6 | 616 (to 803K) | 20.5 s / 41.1 s | 10 GiB |
+
+- **These are from another machine** than the tables above: a 16-core Threadripper PRO 9955WX with 256 GB and two Max-Q cards.
+  Decode is less than half of the 64-core host's two-card figure. Three things differ: a quarter of the cores for the cache
+  misses, a cache of 13 to 18 % of the host experts, and layers split across the cards on decode instead of both cards on every
+  layer. Which of them costs the most was not separated. One run a preset, with `scripts/bench.sh`. [RESULTS.md](RESULTS.md) has
+  the method, every step, and prompt sizes from 1K to 128K.
+- **Any prompt of more than 512 new tokens waits at least 3.6 to 4.3 s** for its first token (6.6 s from 4K tokens at 1M): each
+  batch of a prompt uploads the experts of every host layer once.
+- **1M takes the whole machine.** It is 1,000,000 tokens, as on one card. The host was left with 10 GiB at the lowest, and pinned
+  memory cannot be swapped out: close what else runs on the host, or use `768k`. The start refuses when less memory is available
+  than the preset used (238 GiB for `1m`; the idle test host had 239).
+- **No rung reads the model from the disk.** All four pin their host experts. Memory-mapping them was tried at 768K and was not
+  kept: a 3.6K-token prompt ran at 208 tok/s instead of 794.
+- **The prompt cache follows the context: 16, 8, 4 and 2 GiB** for `256k`, `512k`, `768k` and `1m`. When a request does not
+  continue the conversation in the slot, the server saves that conversation to host memory, 1 GiB per 20,600 tokens, and restores
+  it when a request returns to it. So about 330K, 165K, 83K and 41K tokens of idle conversations survive; one larger than the
+  cache is not saved and is computed again. The "host RAM free" column was measured with a 2 GiB cache: with the preset's cache
+  full, 256K is left about 29 GiB (30.5 measured with 14.5 GiB in it), 512K about 20 and 768K about 15 (arithmetic, not run).
+- **256K has 16 GiB** because that holds any one conversation the context allows (12.7 GiB at 262,144 tokens) and short ones
+  beside it. Measured: a 200K-token conversation that took 160 s to compute came back in 1.0 to 1.7 s after another request.
+  With 8 GiB (`--prompt-cache-mib 8192`, which gives 8 GiB of host memory back) a 150K one came back in 0.8 s and a 180K one was
+  not saved. The start's memory check follows the cache: 219 GiB for `256k` as it ships, 211 with 8 GiB, 235 with 32.
+- **Not measured here:** the route bias, a long mixed load, and the same-top-token comparison. The presets route as the model
+  defines; what differs from the 384 GB presets is where an expert is computed.
 
 ## The route bias
 
@@ -145,7 +186,8 @@ Values above 0.03 were not measured, and the start refuses them without `--force
 
 The patch is `patches/glm53-offload.patch` (one diff against upstream `d02b4c0d`). `patches/series/` is the same change as the commit
 history, with the authors and messages. Every engine setting is an environment variable set in `recipes/`: `common.sh` holds what
-all six presets share, `1gpu.sh` and `2gpu.sh` what the card count adds, and one file per preset the rest.
+all six presets share, `1gpu.sh` and `2gpu.sh` what the card count adds, and one file per preset the rest. `2gpu-ram256.sh` and
+the four `2gpu-*-ram256.sh` files are the presets for a 256 GB host.
 
 ## Measure it yourself
 

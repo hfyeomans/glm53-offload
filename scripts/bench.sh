@@ -4,7 +4,7 @@
 # prompt grown in three steps, with 256 tokens generated after each: the prompt rate and the decode rate AT that depth.  The steps are
 # 4K target tokens, then 7/16 and 7/8 of the context (256K: 4K / 115K / 229K target, 3.6K / 100K / 201K real; the filler text counts about
 # 12 % short of its target).  Python 3, stdlib only.
-#   scripts/bench.sh [--url http://127.0.0.1:8080] [--ctx 256k|512k|1m] [--decode-only] [--out bench-<date>.json]
+#   scripts/bench.sh [--url http://127.0.0.1:8080] [--ctx 256k|512k|768k|1m] [--decode-only] [--out bench-<date>.json]
 # Without --ctx the context is read from the server (/props).  --decode-only runs the 24 decode prompts and no prompt steps.
 # The deep steps take minutes at 512k and tens of minutes at 1m.  It ends with the summary; bench/report.py <file> prints it again.
 set -u
@@ -28,15 +28,16 @@ else
     CTX=$(curl -fs "$URL/props" | grep -o 'n_ctx":[0-9]*' | head -n 1 | grep -o '[0-9]*$')
     case ${CTX:-0} in
       # the one-card 1M preset asks for 1,000,000 tokens and the server reports 1,000,192, the next multiple of 256
-      262144) PRESET=256k;; 524288) PRESET=512k;; 1000000|1000192|1048576) PRESET=1m;;
+      262144) PRESET=256k;; 524288) PRESET=512k;; 786432) PRESET=768k;; 1000000|1000192|1048576) PRESET=1m;;
       *) echo "bench.sh: the server reports a context of ${CTX:-?} tokens, not one of the presets; pass --ctx"; exit 2;;
     esac
   fi
   case $PRESET in
     256k) DEPTHS=4096,114688,229376;;
     512k) DEPTHS=4096,229376,458752;;
+    768k) DEPTHS=4096,344064,688128;;
     1m)   DEPTHS=4096,458752,917504;;
-    *) echo "bench.sh: --ctx is one of 256k, 512k, 1m"; exit 2;;
+    *) echo "bench.sh: --ctx is one of 256k, 512k, 768k, 1m"; exit 2;;
   esac
   STEPS=(--after-tokens 256 --prefill "$DEPTHS")
   echo "bench.sh: $URL, preset $PRESET, prompt steps $DEPTHS target tokens, results in $OUT"
