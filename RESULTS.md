@@ -452,7 +452,8 @@ time, so it includes saving the conversation that leaves the slot. Raw files: `r
   eight decode prompts of `2gpu-256k-ram256`, 0.5 gave a median of 26.9 tok/s and 0.75 gave 26.6, against 26.3 for the preset on
   the same prompts. One run each, and the spread between two runs was not measured, so the presets keep 0.9.
 
-**What was not measured.** The route bias, same top token against the reference, and a stability run: no mixed load, no
+**What was not measured.** Same top token against the reference, and a stability run (the route bias at 256K is in
+[EXPERIMENTS.md](EXPERIMENTS.md), E5): no mixed load, no
 cancelled requests, and no prompt past 77 % of the context (80 % for `1m`). `2gpu-512k-ram256` leaves 3.7 and 2.7 GiB of its
 cards unused at the peak, which a larger cache could take.
 

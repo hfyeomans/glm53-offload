@@ -121,9 +121,12 @@ A token whose expert is not on a GPU waits for the CPU or for an upload. `--rout
 of the experts the cache already holds, so more tokens find theirs on the GPU.
 
 - **The default is 0:** the router picks exactly the experts the model defines. Every figure above is at 0.
-- **`--route-bias 0.03` is upstream's speed option.** On upstream's machine it gave 23 to 32 % more decode and changed the
-  first choice at 1.1 to 2.2 positions in 100. With any bias above 0, an answer can depend on what the server handled before.
-- **It was not measured on this host.** RESULTS.md has upstream's runs. Values above 0.03 are refused without `--force`.
+- **On this host, 256K, it gives about 30 % more decode:** 26.6 to 34.5 tok/s as shipped, and 34.0 to 44.7 with `--hot-map`.
+  Prompt speed and first-token times do not change.
+- **It changes the output.** Against the `--hot-map` preset's own output at bias 0, 0.03 changes the top token at 3.5 more positions in
+  100, and 0.005 and 0.01 at 1.9 and 2.5 (wikitext-2, `bench/kl.sh`). Upstream's rule for a default allows 0.5, so the
+  default stays 0. With any bias above 0, an answer can also depend on what the server handled before.
+- [EXPERIMENTS.md](EXPERIMENTS.md), E5, has the method and every run. Values above 0.03 are refused without `--force`.
 
 ## How it works
 

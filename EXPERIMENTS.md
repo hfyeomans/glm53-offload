@@ -148,12 +148,62 @@ The map is `recipes/hotmap-256k.txt`, made by `bench/hotmap.py --pin 3584,2560` 
     between its own runs.
 - **Costs.** The start is about 13 s longer (2:06 against 1:53 to the open port, the medians of five starts each). The map is fitted to recorded routing. Only the 256K preset has one. A trace
   still carries the file's expert numbers; `LLAMA_MOE_ROUTE_HIST` carries positions.
-- **Not done:** maps for 512K, 768K and 1M; a map from a wider set of prompts; the route bias with the map.
+- **Not done:** maps for 512K, 768K and 1M; a map from a wider set of prompts. The route bias with the map is E5.
 
 Raw files: `results/experiments/e4-*.json`.
+
+## E5. The route bias with the hot-expert map (2026-11-16, measured): faster, and it moves the output; the default stays 0
+
+`--route-bias V` adds V to the router score of the experts a card already holds, so more tokens pick experts on the cards.
+Upstream measured it on its machine only. Here: the 256K preset as shipped and with `--hot-map`, at 0.005, 0.01 and 0.03.
+
+**Speed.** The 24 decode prompts, `scripts/bench.sh`; the map at 0.03 also ran the prompt steps and the size probe.
+
+| 256K preset | Route bias | Decode, tok/s | Gain over bias 0 |
+|---|---|---|---|
+| As shipped | 0 | 26.6 | |
+| | 0.03 | 34.5 (28.4 to 40.9) | +30 % |
+| `--hot-map` | 0 | 34.0 (30.8 to 39.6) | |
+| | 0.005 | 37.7 (31.4 to 41.9) | +11 % |
+| | 0.01 | 39.2 (33.8 to 45.4) | +15 % |
+| | 0.03 | 44.7 (39.9 to 48.9) | +31 % |
+
+- **The gains multiply:** the map and 0.03 together are 68 % over the preset as shipped.
+- **Prompts do not change.** The map at 0.03: 824 / 1,462 / 1,257 tok/s to 3.6K / 100K / 201K (824 / 1,463 / 1,254 at bias 0),
+  first token of a fresh 16K / 32K / 130K prompt after 11.7 / 21.8 / 90.7 s (11.7 / 21.7 / 90.8). The bias only acts on
+  batches of up to 32 tokens. Host and GPU memory peaks are the same.
+
+**What it costs.** `llama-perplexity` in its KL-divergence mode on the wikitext-2 test text, 8 chunks of 4,096 tokens, the
+second half of each scored (16,376 positions), with each preset's exact environment (`bench/kl.sh`). It runs 4-token batches,
+the size decode runs, because the cache and the bias serve only small batches. Upstream's reference, every expert in host
+memory, does not fit in 256 GB, so the reference is the map at bias 0, and a second run of it shows the engine's own spread.
+
+| Against the map at bias 0 | Same top token | Mean KL divergence | Perplexity |
+|---|---|---|---|
+| The map at bias 0, run again | 98.25 ± 0.10 % | 0.0039 | × 1.0012 |
+| As shipped, bias 0 | 96.51 ± 0.14 % | 0.0095 | × 1.0008 |
+| The map at 0.005 | 96.35 ± 0.15 % | 0.0122 | × 1.0027 |
+| The map at 0.01 | 95.75 ± 0.16 % | 0.0154 | × 1.0021 |
+| The map at 0.03 | 94.75 ± 0.17 % | 0.0247 | × 1.0034 |
+| As shipped, 0.03 | 94.97 ± 0.17 % | 0.0240 | × 1.0018 |
+
+- **The bias moves the output more than anything else here.** Against the map's own spread (98.25 %), 0.005 / 0.01 / 0.03
+  change the top token at 1.9 / 2.5 / 3.5 more positions in 100. Perplexity barely sees it (+0.3 % at 0.03).
+- **No value passes upstream's rule** for a default (same top token within 0.5 points of bias 0, perplexity within 1 %, 5 %
+  more decode), so the default stays 0, with or without the map. 0.03 stays the speed option for anyone who accepts that.
+- **The map does not make the bias costlier.** As shipped and with the map, 0.03 lands as far from the reference (94.97 and
+  94.75 %, KL 0.024 and 0.025). Read upstream's way, the shipped preset loses 1.54 points from bias 0 to 0.03 against a common
+  reference; upstream's two-card presets lost 1.08 to 1.59.
+- **A decode run does not repeat exactly, even at bias 0** (1.75 points between two runs of the same preset). Which experts
+  sit in the cache at a token differs between runs, and the CPU and the cards round differently. That is also why the shipped
+  preset at bias 0 is 3.5 points from the map at bias 0: they compute different experts on the CPU. Upstream's bias-0 presets
+  were 2.7 to 3.0 points from its reference for the same reason. Neither is a different model; E4's byte checks stand.
+- **Not measured:** a reference outside the engine's decode path (it would need the 384 GB host), more than one run of each
+  biased value, values between 0.005 and 0.01 with a longer text, and the bias at 512K to 1M.
+
+Raw files: `results/experiments/e5-*.json` (speed) and `e5-kl.txt` (the KL statistics of every run).
 
 ## What is left
 
 1. **Maps for the other rungs** (512K, 768K, 1M), each from its own count of whole layers, and a run of each.
-2. **The route bias** (`--route-bias`), upstream's speed option, was not measured on this host. It changes the output.
-3. **A map from wider traffic** than the 24 bench prompts: code, long conversations, other languages.
+2. **A map from wider traffic** than the 24 bench prompts: code, long conversations, other languages.
