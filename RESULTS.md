@@ -361,7 +361,7 @@ preset sets its own (`CACHE_RAM_MIB`), and `--prompt-cache-mib N` overrides it:
 
 | Preset | Prompt cache, MiB | Idle conversations it holds, tokens | Host RAM left of 246.8 GiB, lowest | The start's memory check |
 |---|---|---|---|---|
-| `2gpu-256k-ram256` | 16,384 | 330K | 29 GiB: 30.5 measured with 14,895 MiB in the cache | 219 GiB |
+| `2gpu-256k-ram256` | 16,384 | 330K | 27.8 GiB, measured with the bench and the size probe (2026-11-15) | 219 GiB |
 | `2gpu-512k-ram256` | 8,192 | 165K | 19.9 GiB: 25.9 measured with a 2 GiB cache, less 6 | 227 GiB |
 | `2gpu-768k-ram256` | 4,096 | 83K | 14.7 GiB: 16.7 measured with a 2 GiB cache, less 2 | 233 GiB |
 | `2gpu-1m-ram256` | 2,048 | 41K | 9.7 GiB, measured | 238 GiB |
@@ -414,7 +414,8 @@ time, so it includes saving the conversation that leaves the slot. Raw files: `r
   8 GiB and 0.9 to 2.1 s with 16.
 - **Memory.** The lowest available host memory was 36.6 GiB with 8 GiB and 30.5 GiB with 16; the cards peaked at 96,493 /
   96,236 and 96,505 / 96,252 MiB, within 20 MiB of the preset's bench run: the prompt cache takes no GPU memory. The 16 GiB
-  cache held 14.5 GiB at the most, so full it would leave about 29 GiB.
+  cache held 14.5 GiB at the most, so full it would leave about 29 GiB. A later run of `scripts/bench.sh` in full and the size
+  probe, which fill the cache, left 27.8 GiB: 219.0 GiB in use, the start's memory check.
 - **Why the 256K preset has 16 GiB.** It is the smallest round size that holds any one conversation the context allows
   (12.7 GiB) with room for short ones beside it; 8 GiB stops at 165K tokens, and a larger conversation is then computed again
   in full after every switch. It costs 8 GiB of host memory and no GPU memory. Two full conversations need 25.4 GiB, which

@@ -10,7 +10,7 @@ patch: an OpenAI-compatible server, a Docker image, and one command to start it.
 
 | Context | `--ctx` | Decode, tok/s | Prompt, tok/s (deepest step) | First token of a fresh 16K / 32K prompt | Prompt cache | Host RAM free at the lowest |
 |---|---|---|---|---|---|---|
-| 256K (default) | `256k` | 26.6 | 1,276 (to 201K) | 11.3 s / 21.1 s | 16 GiB | about 29 GiB |
+| 256K (default) | `256k` | 26.6 | 1,276 (to 201K) | 11.3 s / 21.1 s | 16 GiB | 28 GiB |
 | 512K | `512k` | 26.7 | 1,052 (to 401K) | 11.8 s / 21.7 s | 8 GiB | about 20 GiB |
 | 768K | `768k` | 27.5 | 718 (to 602K) | 14.5 s / 27.9 s | 4 GiB | about 15 GiB |
 | 1M | `1m` | 25.6 | 616 (to 803K) | 20.5 s / 41.1 s | 2 GiB | 10 GiB |
@@ -20,8 +20,8 @@ patch: an OpenAI-compatible server, a Docker image, and one command to start it.
 - **Prompt** is prompt tokens a second as the server reports them, while one prompt grows to that many tokens.
 - **Measured** on a 16-core Threadripper PRO 9955WX with 256 GB and two Max-Q cards, one run a preset, with `scripts/bench.sh`.
   The method, every step and the raw files are in [RESULTS.md](RESULTS.md), "A 256 GB host".
-- **Host RAM free** is with the preset's prompt cache full. 1M was measured; the others are a measured run plus arithmetic for
-  the cache.
+- **Host RAM free** is with the preset's prompt cache full. 256K and 1M were measured; the other two are a measured run plus
+  arithmetic for the cache.
 
 ## What this fork changes
 
