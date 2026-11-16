@@ -10,7 +10,7 @@ patch: an OpenAI-compatible server, a Docker image, and one command to start it.
 
 | Context | `--ctx` | Decode, tok/s | Prompt, tok/s (deepest step) | First token of a fresh 16K / 32K prompt | Prompt cache | Host RAM free at the lowest |
 |---|---|---|---|---|---|---|
-| 256K (default) | `256k` | 26.6 | 1,276 (to 201K) | 11.3 s / 21.1 s | 16 GiB | 28 GiB |
+| 256K (default) | `256k` | 34.0 | 1,254 (to 201K) | 11.7 s / 21.7 s | 16 GiB | 28 GiB |
 | 512K | `512k` | 26.7 | 1,052 (to 401K) | 11.8 s / 21.7 s | 8 GiB | about 20 GiB |
 | 768K | `768k` | 27.5 | 718 (to 602K) | 14.5 s / 27.9 s | 4 GiB | about 15 GiB |
 | 1M | `1m` | 25.6 | 616 (to 803K) | 20.5 s / 41.1 s | 2 GiB | 10 GiB |
@@ -36,12 +36,12 @@ Upstream pins the routed experts of all 75 MoE layers in host memory: 296 GiB, s
   overrides it, and the start's memory check rises and falls with it.
 - **Benchmarks:** `scripts/bench.sh` knows the 768K context, `bench/switch.py` measures the prompt cache, and the raw files
   are in `results/ram256/`.
-- **A hot-expert map for 256K,** `--hot-map`, off by default. Each card pins the busiest experts of all its layers
-  instead of some layers whole, so the CPU computes 27 % less of the expert work: decode goes from 26.6 to 34.0 tok/s on
-  the same GPU and host memory. The model is the same: its experts are reordered, not changed. Cost: prompts are 2 to 3 %
-  slower (first token of a fresh 16K / 32K prompt after 11.7 / 21.7 s), and the start takes about 13 s more. Trade-off:
-  the map is fitted to recorded routing, and only this rung has one. It is one change to the engine patch;
-  [EXPERIMENTS.md](EXPERIMENTS.md), E4, has the method and the checks.
+- **A hot-expert map for 256K,** on by default; `--no-hot-map` turns it off. Each card pins the busiest experts of all its
+  layers instead of some layers whole, so the CPU computes 27 % less of the expert work: decode goes from 26.6 to 34.0 tok/s
+  on the same GPU and host memory. The model is the same: its experts are reordered, not changed. Cost: prompts are 2 to 3 %
+  slower (first token of a fresh 16K / 32K prompt after 11.7 / 21.7 s instead of 11.3 / 21.1), and the start takes about
+  13 s more. Trade-off: the map is fitted to recorded routing, and only this rung has one. It is one change to the engine
+  patch; [EXPERIMENTS.md](EXPERIMENTS.md), E4, has the method and the checks.
 - **Not changed:** the image recipe and the model. Upstream's presets for a 384 GB host are still in `recipes/`
   and were not run here; [upstream's README](https://github.com/killy-netsphere/glm53-offload#readme) has them.
 
@@ -85,6 +85,7 @@ GLM-5.3 always thinks: `enable_thinking` has no effect, and the reasoning arrive
 - `--port`, and `--bind 0.0.0.0` to serve the LAN (there is no authentication: add `-- --api-key KEY`);
 - `--detach` to run in the background;
 - `--route-bias 0.03`: upstream's speed option (default 0, see [below](#the-route-bias));
+- `--no-hot-map`: 256K without its hot-expert map;
 - `--ram 256|384`, `--cache-mib`, `--threads`;
 - `--dry-run` (prints the exact llama-server command and environment, and starts nothing).
 
@@ -92,15 +93,16 @@ GLM-5.3 always thinks: `enable_thinking` has no effect, and the reasoning arrive
 
 Take the smallest context your work fits in.
 
-- **256K is the fastest on prompts and leaves the most host memory.** Decode is 25.6 to 27.5 tok/s on every rung.
-- **Any prompt of more than 512 new tokens waits at least 3.6 to 4.3 s** for its first token (6.6 s from 4K tokens at 1M):
+- **256K is the fastest and leaves the most host memory.** Its hot-expert map gives it 34.0 tok/s of decode; the other rungs
+  have 25.6 to 27.5.
+- **Any prompt of more than 512 new tokens waits at least 3.6 to 4.4 s** for its first token (6.6 s from 4K tokens at 1M):
   each batch of a prompt uploads the experts of every host layer once. A short prompt waits 1.3 to 1.4 s.
 - **1M takes the whole machine.** It is 1,000,000 tokens, and the host was left 10 GiB at the lowest: use `768k` if anything
   else runs on the host.
 
 | | `256k` | `512k` | `768k` | `1m` |
 |---|---|---|---|---|
-| Layers' experts on the cards | 28 | 24 | 22 | 20 |
+| Layers' experts on the cards | 4, and 6,144 hot experts of the others | 24 | 22 | 20 |
 | Experts pinned in host RAM | 183 GiB | 198 GiB | 206 GiB | 214 GiB |
 
 ## The prompt cache
@@ -121,9 +123,9 @@ A token whose expert is not on a GPU waits for the CPU or for an upload. `--rout
 of the experts the cache already holds, so more tokens find theirs on the GPU.
 
 - **The default is 0:** the router picks exactly the experts the model defines. Every figure above is at 0.
-- **On this host, 256K, it gives about 30 % more decode:** 26.6 to 34.5 tok/s as shipped, and 34.0 to 44.7 with `--hot-map`.
-  Prompt speed and first-token times do not change.
-- **It changes the output.** Against the `--hot-map` preset's own output at bias 0, 0.03 changes the top token at 3.5 more positions in
+- **On this host, 256K, it gives about 30 % more decode:** 34.0 to 44.7 tok/s with the hot-expert map, and 26.6 to 34.5 with
+  `--no-hot-map`. Prompt speed and first-token times do not change.
+- **It changes the output.** Against the 256K preset's own output at bias 0, 0.03 changes the top token at 3.5 more positions in
   100, and 0.005 and 0.01 at 1.9 and 2.5 (wikitext-2, `bench/kl.sh`). Upstream's rule for a default allows 0.5, so the
   default stays 0. With any bias above 0, an answer can also depend on what the server handled before.
 - [EXPERIMENTS.md](EXPERIMENTS.md), E5, has the method and every run. Values above 0.03 are refused without `--force`.
@@ -133,8 +135,9 @@ of the experts the cache already holds, so more tokens find theirs on the GPU.
 - **The model** is Unsloth's UD-Q3_K_XL with one change by upstream: the tensors read on every token are requantized from Q8_0
   to Q5_K. The routed experts are byte-identical to Unsloth's. `scripts/get-model.sh` downloads the result.
 - **Each card** holds its half of the layers' attention and shared experts, the routed experts of its resident layers, the KV
-  cache, and a cache of the other layers' hot experts in what is left. Part of that cache sits on memory the compute buffer and
-  the KV cache take back when a long prompt runs and as the context fills.
+  cache, and a cache of the other layers' hot experts in what is left. At 256K the map pins most of that cache's experts.
+  Part of that cache sits on memory the compute buffer and the KV cache take back when a long prompt runs and as the context
+  fills.
 - **The host** holds the other layers' routed experts in pinned memory.
 - **Decode:** the layers are split across the two cards. An expert-cache miss is mostly computed on the CPU.
 - **Prompts:** from 513 new tokens they run "layer-major", with both cards pipelined: each layer's experts go up once for a
@@ -143,7 +146,8 @@ of the experts the cache already holds, so more tokens find theirs on the GPU.
 
 The engine is `patches/glm53-offload.patch`, one diff against llama.cpp `d02b4c0d`, with upstream's kernels for this model on
 these cards. Every engine setting is an environment variable set in `recipes/`: `common.sh` holds what all presets share,
-`2gpu.sh` what two cards add, `2gpu-ram256.sh` what this host adds, and `2gpu-<ctx>-ram256.sh` the rung.
+`2gpu.sh` what two cards add, `2gpu-ram256.sh` what this host adds, `2gpu-<ctx>-ram256.sh` the rung, and
+`2gpu-256k-ram256-hot.sh` with `hotmap-256k.txt` the 256K map.
 
 ## Measure it yourself
 

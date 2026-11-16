@@ -95,9 +95,9 @@ with the cache over them. That is the same GPU memory and the same host memory a
 - **It needs an engine change:** the loader and the cache place whole tensors, and a cached expert is a copy of a pinned one.
   Its effect on prompts is unknown. E4 builds it.
 
-## E4. The hot-expert map, built (2026-11-15, measured): 28 % faster decode, kept as `--hot-map`
+## E4. The hot-expert map, built (2026-11-15, measured): 28 % faster decode, the 256K default
 
-`./run.sh --ctx 256k --hot-map`. Off by default: the 256K preset is as measured unless the option is given.
+The 256K preset's default since 2026-11-16 (`--hot-map` until then); `--no-hot-map` runs the preset without it.
 
 **What it does.** The preset keeps 28 layers' experts whole on the cards. With the map only layers 8 and 75 to 77 stay whole.
 The memory of the other 24 holds the busiest experts of every layer instead: 3,584 on card 0 (72 to 156 a layer) and 2,560 on

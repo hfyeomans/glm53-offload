@@ -7,8 +7,8 @@
 #     --ram 256|384        host memory tier (default: 256 on a host with less than 360 GiB of RAM, else 384).  256 is for two cards:
 #                          the routed experts of some layers stay whole on the cards, the rest is in host memory (recipes/*-ram256.sh)
 #     --route-bias V       0 (default): the model's own routing.  0.03: the measured speed option; it changes the output (README.md)
-#     --hot-map            the preset's hot-expert map (EXPERIMENTS.md, E4): each card pins the busiest experts of all its layers
-#                          instead of some layers whole.  Faster decode, the same model and memory.  256k with --ram 256 only
+#     --no-hot-map         the preset without its hot-expert map (EXPERIMENTS.md, E4), which is on by default where there is one
+#                          (256k with --ram 256): each card pins the busiest experts of all its layers.  --hot-map requires it
 #     --prompt-cache-mib N host memory for the prompt cache, the conversations saved when another one takes the slot (default: the
 #                          preset's; about 1 GiB per 20,600 tokens, and a conversation larger than the cache is not saved).  With
 #                          --ram 256 the memory check rises and falls with it
@@ -18,13 +18,14 @@
 #     --force              start even if a check fails (RAM, GPU model, peer-to-peer, a bias above 0.03, a card with too little free)
 #     --dry-run            print the command and the environment, start nothing
 set -u
-MODEL=; PRESET=256k; RAM=; BIAS=; CACHE=; PCACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; HOT=0; PASS=()
+MODEL=; PRESET=256k; RAM=; BIAS=; CACHE=; PCACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; HOT=auto; PASS=()
 while [ $# -gt 0 ]; do case $1 in
   --model) MODEL=$2; shift 2;;
   --ctx) PRESET=${2,,}; shift 2;;
   --ram) RAM=$2; shift 2;;
   --route-bias) BIAS=$2; shift 2;;
   --hot-map) HOT=1; shift;;
+  --no-hot-map) HOT=0; shift;;
   --cache-mib) CACHE=$2; shift 2;;
   --prompt-cache-mib) PCACHE=$2; shift 2;;
   --threads) THREADS=$2; shift 2;;
@@ -32,7 +33,7 @@ while [ $# -gt 0 ]; do case $1 in
   --force) FORCE=1; shift;;
   --dry-run) DRY=1; shift;;
   --) shift; PASS=("$@"); break;;
-  -h|--help) sed -n 2,18p "$0"; exit 0;;
+  -h|--help) sed -n 2,19p "$0"; exit 0;;
   *) echo "unknown option $1 (see --help)"; exit 2;;
 esac; done
 
@@ -80,11 +81,15 @@ source "/app/recipes/${NGPU}gpu.sh"
 [ -z "$TIER" ] || source "/app/recipes/${NGPU}gpu${TIER}.sh"
 # shellcheck source=/dev/null
 source "$R"
-# --hot-map: what the preset's hot-expert map changes (<preset>-hot.sh)
-if [ $HOT = 1 ]; then
-  [ -f "${R%.sh}-hot.sh" ] || { echo "[serve] no hot-expert map for $(basename "$R" .sh) (have: $(ls /app/recipes | grep -e '-hot[.]sh' | sed 's/-hot[.]sh$//' | tr '\n' ' '))"; exit 2; }
+# the preset's hot-expert map (<preset>-hot.sh), on unless --no-hot-map
+if [ $HOT != 0 ] && [ -f "${R%.sh}-hot.sh" ]; then
+  HOT=1
   # shellcheck source=/dev/null
   source "${R%.sh}-hot.sh"
+elif [ $HOT = 1 ]; then
+  echo "[serve] no hot-expert map for $(basename "$R" .sh) (have: $(ls /app/recipes | grep -e '-hot[.]sh' | sed 's/-hot[.]sh$//' | tr '\n' ' '))"; exit 2
+else
+  HOT=0
 fi
 
 # RESIDENT (the 256 presets): the layers whose routed experts stay whole on their card; the experts of the other layers go to host memory

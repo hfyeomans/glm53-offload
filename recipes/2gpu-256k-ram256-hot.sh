@@ -1,4 +1,4 @@
-# 2gpu-256k-ram256-hot.sh -- what serve.sh --hot-map changes in 2gpu-256k-ram256.sh (EXPERIMENTS.md, E4).
+# 2gpu-256k-ram256-hot.sh -- what the hot-expert map changes in 2gpu-256k-ram256.sh (EXPERIMENTS.md, E4); on by default, --no-hot-map turns it off.
 # The preset keeps 28 layers' experts whole on the cards.  With the map only layers 8 and 75-77 stay whole; the memory of the other
 # 24 holds the busiest experts of every layer of the card instead (hotmap-256k.txt: 3,584 on card 0, 2,560 on card 1, pinned in the
 # expert cache and never in host memory).  Host memory holds the other 12,032 experts: 182.9 GiB, as the preset.
