@@ -36,9 +36,8 @@ Upstream pins the routed experts of all 75 MoE layers in host memory: 296 GiB, s
   overrides it, and the start's memory check rises and falls with it.
 - **Benchmarks:** `scripts/bench.sh` knows the 768K context, `bench/switch.py` measures the prompt cache, and the raw files
   are in `results/ram256/`.
-- **Tried and not kept:** reading the experts from the NVMe drive instead of pinning them, one card, and a smaller CPU share
-  of the cache misses. The figures are in RESULTS.md.
-- **Not changed:** the engine patch, the image, the model, and upstream's 384 GB presets, which were not measured again here.
+- **Not changed:** the engine patch, the image and the model. Upstream's presets for a 384 GB host are still in `recipes/`
+  and were not run here; [upstream's README](https://github.com/killy-netsphere/glm53-offload#readme) has them.
 
 ## What you need
 
@@ -110,15 +109,6 @@ again in full.
   at those contexts. Their sizes are arithmetic: only 256K was run with its cache full.
 - **It matters when requests interleave** on the one slot: an agent with subagents, or side requests such as title generation.
 
-## One card, or a 384 GB host
-
-- **One card does not serve the model on a 256 GB host.** Nine layers' experts fit on the card at 256K, and the other 257 GiB
-  is more than the host can pin or hold in its page cache. Tried memory-mapped: decode reached 9 to 10 tok/s, but a 1K-token
-  prompt waited 103 s for its first token and a 16K one had none after 9 minutes.
-- **With 384 GB of RAM** upstream's presets apply unchanged, on one card or two (`--ram 384`, picked by itself from 360 GiB).
-  Upstream measured them on a 64-core host: 38.9 tok/s on one card and 61.6 on two at 256K. Their tables are in
-  [upstream's README](https://github.com/killy-netsphere/glm53-offload#readme) and in RESULTS.md.
-
 ## The route bias
 
 A token whose expert is not on a GPU waits for the CPU or for an upload. `--route-bias` adds a small bonus to the router score
@@ -157,6 +147,7 @@ file with every request in it. `bench/switch.py` switches conversations on the s
 
 ## Limits
 
+- **Two cards only, for now.** One card is not supported on a 256 GB host.
 - One request at a time (`--parallel 1`).
 - The cards must be whole. If a card has less free memory than a whole one, the start makes the expert cache smaller and says
   so; that path's speed was not measured.

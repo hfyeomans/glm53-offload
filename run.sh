@@ -1,17 +1,17 @@
 #!/bin/bash
-# run.sh -- serve GLM-5.3 on one or two RTX PRO 6000 from this repo's image.
+# run.sh -- serve GLM-5.3 on two RTX PRO 6000 from this repo's image.
 #
-#   ./run.sh --model /path/to/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [--gpus 0 | 0,1] [--ctx 256k|512k|1m]
+#   ./run.sh --model /path/to/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [--gpus 0,1] [--ctx 256k|512k|768k|1m]
 #            [--route-bias 0.03] [--port 8080] [--bind 127.0.0.1] [--detach] [--image glm53-offload:latest]
 #            [more serve.sh options: --ram 256|384 --prompt-cache-mib N --cache-mib N --threads N --alias NAME --force --dry-run]
 #            [-- llama-server args]
 #
-# Default GPUs: 0 (one card); --gpus 0,1 for two.  Default context 256k.  Default route bias 0, the model's own routing; 0.03 is the
+# Default GPUs: 0,1 (two cards).  Default context 256k.  Default route bias 0, the model's own routing; 0.03 is the
 # measured speed option, and it changes the output (README.md, "The route bias").  --detach runs it in the background (container
 # --name glm53-offload).  The API comes up at http://<bind>:<port>/v1 once the model has loaded.  Ctrl-C stops it.
 # A host with 256 GB of RAM needs both cards and gets the --ram 256 presets (README.md, "What this fork changes"), with --ctx 768k as well.
 set -u
-MODEL=; GPUS=0; PORT=8080; BIND=127.0.0.1; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; NAME=glm53-offload; DETACH=0; REST=()
+MODEL=; GPUS=0,1; PORT=8080; BIND=127.0.0.1; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; NAME=glm53-offload; DETACH=0; REST=()
 while [ $# -gt 0 ]; do case $1 in
   --model) MODEL=$2; shift 2;;
   --gpus) GPUS=$2; shift 2;;
