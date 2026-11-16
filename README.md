@@ -36,7 +36,13 @@ Upstream pins the routed experts of all 75 MoE layers in host memory: 296 GiB, s
   overrides it, and the start's memory check rises and falls with it.
 - **Benchmarks:** `scripts/bench.sh` knows the 768K context, `bench/switch.py` measures the prompt cache, and the raw files
   are in `results/ram256/`.
-- **Not changed:** the engine patch, the image and the model. Upstream's presets for a 384 GB host are still in `recipes/`
+- **A hot-expert map for 256K,** `--hot-map`, off by default. Each card pins the busiest experts of all its layers
+  instead of some layers whole, so the CPU computes 27 % less of the expert work: decode goes from 26.6 to 34.0 tok/s on
+  the same GPU and host memory. The model is the same: its experts are reordered, not changed. Cost: prompts are 2 to 3 %
+  slower (first token of a fresh 16K / 32K prompt after 11.7 / 21.7 s), and the start takes about 13 s more. Trade-off:
+  the map is fitted to recorded routing, and only this rung has one. It is one change to the engine patch;
+  [EXPERIMENTS.md](EXPERIMENTS.md), E4, has the method and the checks.
+- **Not changed:** the image recipe and the model. Upstream's presets for a 384 GB host are still in `recipes/`
   and were not run here; [upstream's README](https://github.com/killy-netsphere/glm53-offload#readme) has them.
 
 ## What you need

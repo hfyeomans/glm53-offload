@@ -74,7 +74,7 @@ replay of the cache on those traces (within 3 points of the measured hit rate) g
 Raw files: `results/experiments/e2-*.json`. The replay is `bench/replay_cache.py`, and `bench/replay_hotmap.py` for E3. The
 traces (27 MB each) are not in the repository: `LLAMA_MOE_CACHE_TRACE=<file>` on the server writes one.
 
-## E3. What a hot-expert map would give (2026-11-15, simulated, not built)
+## E3. What a hot-expert map would give (2026-11-15, simulated; built in E4)
 
 The same replay with the DeepSeek layout: the hottest 87 experts of every layer on the cards only, the other 169 on the host
 with the cache over them. That is the same GPU memory and the same host memory as today. The hot sets come from prompts 1 to
@@ -93,11 +93,67 @@ with the cache over them. That is the same GPU memory and the same host memory a
   57 % of the experts took 85 %. And this engine already has a cache that follows the conversation: it hits 57 % with 13.5 %
   of the host experts, where the same number of fixed hot experts would take about 30 %.
 - **It needs an engine change:** the loader and the cache place whole tensors, and a cached expert is a copy of a pinned one.
-  Its effect on prompts is unknown.
+  Its effect on prompts is unknown. E4 builds it.
+
+## E4. The hot-expert map, built (2026-11-15, measured): 28 % faster decode, kept as `--hot-map`
+
+`./run.sh --ctx 256k --hot-map`. Off by default: the 256K preset is as measured unless the option is given.
+
+**What it does.** The preset keeps 28 layers' experts whole on the cards. With the map only layers 8 and 75 to 77 stay whole.
+The memory of the other 24 holds the busiest experts of every layer instead: 3,584 on card 0 (72 to 156 a layer) and 2,560 on
+card 1 (62 to 87). Host memory holds the other 12,032 experts. GPU and host memory are what the preset uses.
+
+**How.** One change to the engine patch, `LLAMA_MOE_HOT_MAP=<file>`:
+
+- **The loader gives a layer's experts a new order,** the pinned ones last, and host memory gets only the others. The router's
+  rows take the same order, so the model computes the same function.
+- **The expert cache reads the pinned experts from the model file** into the first slots of the layer's group at start (15 to
+  17 s) and never evicts them. The other slots work as before.
+- **A layer's experts are pinned on its own card,** because a prompt takes cached experts from the layer's card only. So the
+  split is not E3's 87 a layer: it is what each card's whole layers free.
+- **A path that would read a pinned expert from host memory stops the server.** Engine options this preset does not use and
+  that were not checked with pinned experts are refused at start.
+
+The map is `recipes/hotmap-256k.txt`, made by `bench/hotmap.py --pin 3584,2560` from the routing of runs A, B and C of E2.
+
+| | As shipped | With the map |
+|---|---|---|
+| Decode, median of 24 prompts, tok/s | 26.6 | 34.0 (30.8 to 39.6); 34.5 with the trace on |
+| Expert selections computed on a card, all 75 layers | 73.3 % (cache hit rate 57.3 % on 47 layers) | 80.5 % (79.4 % on 71 layers) |
+| Prompt to 3.6K / 100K / 201K, tok/s | 849 / 1,494 / 1,276 | 824 / 1,463 / 1,254 |
+| First token after those steps, s | 4.2 / 64.9 / 78.7 | 4.4 / 66.2 / 80.1 |
+| First token of a fresh 16K / 32K prompt, s | 11.3 / 21.1 | 11.7 / 21.7 |
+| First token of a fresh 65K / 130K prompt, s | 42.8 / 88.7 | 43.7 / 90.8 |
+| Lowest host memory available, 16 GiB prompt cache full | 27.8 GiB | 27.7 GiB |
+| GPU memory at the peak, MiB | 96,513 / 96,270 | 96,489 / 96,268 |
+
+- **Decode is 28 % faster,** twice E3's estimate, with 27 % less expert work on the CPU (26.7 % of the selections to 19.5 %).
+  Prompts are 2 to 3 % slower and a first token 2 to 4 % later: the layers that were whole on the cards now copy their
+  pinned experts card to card for each prompt batch.
+- **It holds on prompts the map has not seen.** A map made from prompts 1 to 12 alone shares 5,341 of its 6,144 experts with
+  the full one, and ran prompts 13 to 24 at 34.0 tok/s (34.5 with the full map, 26.4 as shipped). All 24 are bench prompts
+  of one kind; code, long conversations and other languages were not tried.
+- **The loaded bytes were checked.** `LLAMA_MOE_HOT_VERIFY=1` compares them with the model file at start: 36,096 host expert
+  tensors, 36,352 router rows and 18,432 pinned expert tensors, none differ.
+- **The model is the same; its rounding is not.** Five prompts of 16 to 9,010 tokens, greedy, 120 tokens, each asked twice
+  (`bench/equiv.py`):
+  - The shipped engine does not repeat itself: between its two runs the first token of two prompts changed
+    and the chosen token's probability moved by up to 0.24 over identical text. With the map it is the same (up to 0.07),
+    and the first-token probabilities of the two engines overlap.
+  - The first token of one prompt (738 tokens) repeats exactly in each engine and differs between them: 0.160 / 0.148 /
+    0.105 for the shipped engine's top three tokens, 0.172 / 0.139 / 0.182 for the same tokens with the map.
+  - Two controls place the difference. Other layers whole on the cards (E2's pick) give the shipped numbers exactly. So does
+    a test map that pins each layer's last experts and leaves every expert its number. So the pinning is exact, and the new
+    order of the experts alone moves the result: the same sums in another order, which this engine amplifies as it does
+    between its own runs.
+- **Costs.** The start is about 13 s longer (2:06 against 1:53 to the open port, the medians of five starts each). The map is fitted to recorded routing. Only the 256K preset has one. A trace
+  still carries the file's expert numbers; `LLAMA_MOE_ROUTE_HIST` carries positions.
+- **Not done:** maps for 512K, 768K and 1M; a map from a wider set of prompts; the route bias with the map.
+
+Raw files: `results/experiments/e4-*.json`.
 
 ## What is left
 
-1. **The hot-expert map of E3,** in the engine. The only candidate with a double-digit estimate, and the largest work.
+1. **Maps for the other rungs** (512K, 768K, 1M), each from its own count of whole layers, and a run of each.
 2. **The route bias** (`--route-bias`), upstream's speed option, was not measured on this host. It changes the output.
-3. **A spread pick:** the low layers on the cards but not in one block, to keep the prompt speed. Worth 2 to 3 % decode by the
-   replay, which one run cannot resolve.
+3. **A map from wider traffic** than the 24 bench prompts: code, long conversations, other languages.

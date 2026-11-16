@@ -1,0 +1,714 @@
+From 140a165f36ac64592eead462272772ed1b63c0ce Mon Sep 17 00:00:00 2001
+From: Hank Yeomans <16584630+hfyeomans@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 23:15:28 -0500
+Subject: [PATCH] LLAMA_MOE_HOT_MAP: a layer's busiest experts pinned in the
+ MoE cache and kept out of host memory
+
+A map names, per layer, the experts the layer's card pins.  The layer's experts are loaded in a new order with those last: host
+memory holds only the others, the MoE cache reads the pinned ones from the model file into the first slots of the layer's own
+group and never gives them up.  The router's rows take the same order, so the model computes the same thing.
+LLAMA_MOE_HOT_VERIFY=1 compares the host experts, the router rows and the pinned slots with the model file at start.
+
+Amp-Thread-ID: https://ampcode.com/threads/T-01a1dcf3-98bb-7200-b1a5-d8e1c956fb0c
+Co-authored-by: Amp <amp@ampcode.com>
+---
+ src/llama-context.cpp      |  22 ++++
+ src/llama-model-loader.cpp |  21 +++-
+ src/llama-model-loader.h   |   3 +
+ src/llama-model.cpp        | 214 +++++++++++++++++++++++++++++++++++++
+ src/llama-model.h          |  23 ++++
+ src/llama-moe-cache.cpp    | 183 ++++++++++++++++++++++++++++---
+ 6 files changed, 452 insertions(+), 14 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4a08294..17b2dbb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3558,6 +3558,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+ 
+     const int64_t n_expert    = src->ne[2];
+     const size_t  expert_size = src->nb[2];
++    // LLAMA_MOE_HOT_MAP: host memory holds the first n_host experts of the tensor, the MoE cache of the layer's card the others
++    const int64_t n_host = lctx->model.moe_host_experts(src->view_src != nullptr ? src->view_src : src);
++    if (n_host < n_expert && (src->view_src != nullptr || lctx->moe_cache == nullptr || !lctx->expert_placeholders.empty())) {
++        GGML_ABORT("LLAMA_MOE_HOT_MAP: %s is copied on a path that reads all of it from host memory", src->name);
++    }
+ 
+     // 0063: before the first-node test below, the whole-view upload reads no ids
+     // 0061 LLAMA_TP_PROMPT: a card's experts in the prompt graph are a view of the host expert tensor (half of them): the whole view goes
+@@ -3711,6 +3716,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 continue;
+             }
+             const void * p = lctx->moe_cache ? lctx->moe_cache->cached_expert(backend, src, e) : nullptr;
++            GGML_ASSERT(p != nullptr || e < n_host);
+             table[e] = p != nullptr ? p : (const void *) ((const uint8_t *) src->data + e*expert_size);
+         }
+         // LLAMA_MOE_UPLOAD_RING=1: gather into the device's upload ring on its upload stream, overlapped with the previous split's
+@@ -3759,6 +3765,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                             const void * tb[256];
+                             for (int64_t e = 0; e < ne; ++e) {
+                                 const void * pc = lctx->moe_cache->cached_expert(backend, t, e);
++                                GGML_ASSERT(pc != nullptr || e < lctx->model.moe_host_experts(t));
+                                 tb[e] = pc != nullptr ? pc : (const void *) ((const uint8_t *) t->data + e*es);
+                             }
+                             void * p = ggml_backend_cuda_upload_ring_ahead_gather(backend, l % nsl, k, tb, ne, es, slot_bytes,
+@@ -3822,12 +3829,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 continue;
+             }
+             if (next < e) {
++                GGML_ASSERT(e <= n_host);
+                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+             }
+             e   += n;
+             next = e;
+         }
+         if (next < n_expert) {
++            GGML_ASSERT(n_host == n_expert);
+             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
+         }
+         return true;
+@@ -3901,12 +3910,14 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                         continue;
+                     }
+                     if (next < e) {
++                        GGML_ASSERT(e <= n_host);
+                         ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                     }
+                     e   += n;
+                     next = e;
+                 }
+                 if (next < n_expert) {
++                    GGML_ASSERT(n_host == n_expert);
+                     ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (n_expert - next)*expert_size);
+                 }
+                 st.cur_path = 2;
+@@ -3966,6 +3977,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 continue;
+             }
+             if (next < e) {
++                GGML_ASSERT(e <= n_host);
+                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+             }
+             e   += n;
+@@ -3975,6 +3987,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+         const size_t offset  = next*expert_size;
+         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
++        GGML_ASSERT(next > last || last < n_host);
++        if (padding > 0 && last + 1 >= n_host) {
++            // host memory ends at the last expert: the padding is the start of the first one
++            if (next <= last) {
++                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, (last + 1 - next)*expert_size);
++            }
++            ggml_backend_tensor_set_async(backend, dst, src->data, (last + 1)*expert_size, padding);
++            first = last + 1;
++            continue;
++        }
+         const size_t size    = (last + 1 - next)*expert_size + padding;
+         if (size > 0) {
+             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 485483b..932e0af 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1751,7 +1751,26 @@ bool llama_model_loader::load_all_data(
+         } else {
+             const auto & file = files.at(weight->idx);
+ 
+-            if (ggml_backend_buffer_is_host(cur->buffer)) {
++            if (const auto it_order = expert_order.find(cur); it_order != expert_order.end()) {
++                GGML_ASSERT(ggml_backend_buffer_is_host(cur->buffer));
++                const std::vector<int32_t> & order = *it_order->second;
++                const size_t expert_size = cur->nb[2];
++                for (int64_t p = 0; p < cur->ne[2]; ) {
++                    // experts that follow each other in the file are read together
++                    int64_t n = 1;
++                    while (p + n < cur->ne[2] && order[p + n] == order[p] + n) {
++                        n++;
++                    }
++                    file->seek(weight->offs + (size_t) order[p]*expert_size, SEEK_SET);
++                    file->read_raw((uint8_t *) cur->data + p*expert_size, n*expert_size);
++                    p += n;
++                }
++                if (check_tensors) {
++                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
++                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
++                    }));
++                }
++            } else if (ggml_backend_buffer_is_host(cur->buffer)) {
+                 file->seek(weight->offs, SEEK_SET);
+                 file->read_raw(cur->data, n_size);
+                 if (check_tensors) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..77bd6b2 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -220,6 +220,9 @@ struct llama_model_loader {
+ 
+     const llama_tensor_weight * get_weight(const char * name) const;
+ 
++    // LLAMA_MOE_HOT_MAP: a host expert tensor that holds its first ne[2] experts of this order (position -> expert of the file)
++    std::unordered_map<const ggml_tensor *, const std::vector<int32_t> *> expert_order;
++
+     const llama_tensor_weight & require_weight(const char * name) const;
+ 
+     struct ggml_tensor * get_tensor_meta(const char * name) const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1d6c8a2..5ef6ee4 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -25,9 +25,15 @@
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+ 
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cfloat>
++#include <fstream>
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+@@ -1371,6 +1377,211 @@ llama_model::~llama_model() {
+     for (auto * lora : loras) {
+         delete lora;
+     }
++#ifndef _WIN32
++    for (int fd : moe_hot_fds) {
++        if (fd >= 0) {
++            close(fd);
++        }
++    }
++#endif
++}
++
++static std::vector<ggml_tensor *> llama_moe_hot_experts(const llama_layer & layer) {
++    std::vector<ggml_tensor *> res;
++    for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++        if (t != nullptr) {
++            res.push_back(t);
++        }
++    }
++    return res;
++}
++
++// before the buffers are allocated: the layers of the map get their order, and their expert tensors the size of their host part
++static void llama_moe_hot_plan(llama_model & model, llama_model_loader & ml) {
++    const char * path = getenv("LLAMA_MOE_HOT_MAP");
++    if (path == nullptr || *path == '\0' || ml.no_alloc) {
++        return;
++    }
++#ifdef _WIN32
++    throw std::runtime_error("LLAMA_MOE_HOT_MAP is not supported on Windows");
++#else
++    if (ml.use_mmap) {
++        throw std::runtime_error("LLAMA_MOE_HOT_MAP needs a load mode that reads the file (--load-mode none)");
++    }
++    std::ifstream in(path);
++    if (!in) {
++        throw std::runtime_error(std::string("LLAMA_MOE_HOT_MAP: cannot open ") + path);
++    }
++    if (model.hparams.n_expert_groups > 1) {
++        throw std::runtime_error("LLAMA_MOE_HOT_MAP: the router picks groups of experts by their number, the experts cannot take a new order");
++    }
++    const int32_t n_expert = (int32_t) model.hparams.n_expert;
++    model.moe_hot_fds.assign(ml.files.size(), -1);
++    size_t n_hot = 0;
++    std::string line;
++    while (std::getline(in, line)) {
++        if (const size_t c = line.find('#'); c != std::string::npos) {
++            line.resize(c);
++        }
++        std::istringstream ss(line);
++        int32_t il;
++        if (!(ss >> il)) {
++            continue;
++        }
++        if (il < 0 || il >= (int32_t) model.layers.size() || model.moe_hot.count(il) > 0) {
++            throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d is out of range or named twice", il));
++        }
++        const llama_layer & layer = model.layers[il];
++        const auto experts = llama_moe_hot_experts(layer);
++        if (experts.empty() || layer.ffn_gate_inp == nullptr || layer.ffn_gate_inp->ne[1] != n_expert) {
++            throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d has no routed experts", il));
++        }
++        for (const ggml_tensor * t : { layer.ffn_gate_inp_b, layer.ffn_gate_inp_s, layer.ffn_exp_probs_b_vl,
++                layer.ffn_gate_exps_s, layer.ffn_up_exps_s, layer.ffn_down_exps_s, layer.ffn_gate_exps_in_s, layer.ffn_up_exps_in_s, layer.ffn_down_exps_in_s }) {
++            if (t != nullptr) {
++                throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d has a per-expert tensor that is not reordered (%s)", il, t->name));
++            }
++        }
++        std::vector<bool> hot(n_expert, false);
++        std::vector<int32_t> tail;
++        int32_t e;
++        while (ss >> e) {
++            if (e < 0 || e >= n_expert || hot[e]) {
++                throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d: expert %d is out of range or named twice", il, e));
++            }
++            hot[e] = true;
++            tail.push_back(e);
++        }
++        if (tail.empty()) {
++            continue;
++        }
++        if ((int32_t) tail.size() + (int32_t) model.hparams.n_expert_used_max() > n_expert) {
++            throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d names too many experts", il));
++        }
++        auto & h = model.moe_hot[il];
++        h.n_host = n_expert - (int32_t) tail.size();
++        for (int32_t x = 0; x < n_expert; ++x) {
++            if (!hot[x]) {
++                h.order.push_back(x);
++            }
++        }
++        h.order.insert(h.order.end(), tail.begin(), tail.end());
++        for (ggml_tensor * t : experts) {
++            const auto * w = ml.get_weight(ggml_get_name(t));
++            if (w == nullptr || t->ne[2] != n_expert) {
++                throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d: %s is not an expert tensor of the file", il, t->name));
++            }
++            int & fd = model.moe_hot_fds[w->idx];
++            if (fd < 0) {
++                fd = dup(ml.files.at(w->idx)->file_id());
++                if (fd < 0) {
++                    throw std::runtime_error("LLAMA_MOE_HOT_MAP: cannot keep the model file open");
++                }
++            }
++            h.src.push_back({ t, fd, w->offs });
++            model.moe_hot_n_host[t] = h.n_host;
++            ml.expert_order[t]      = &h.order;
++            t->ne[2] = h.n_host; // allocated and loaded with this size, see llama_moe_hot_done
++        }
++        for (const ggml_tensor * t : { layer.ffn_gate_inp, layer.ffn_exp_probs_b }) {
++            const auto * w = t != nullptr ? ml.get_weight(ggml_get_name(t)) : nullptr;
++            if (w != nullptr && model.moe_hot_fds[w->idx] >= 0) {
++                h.router.push_back({ t, model.moe_hot_fds[w->idx], w->offs });
++            }
++        }
++        n_hot += tail.size();
++    }
++    LLAMA_LOG_INFO("%s: LLAMA_MOE_HOT_MAP: %zu experts of %zu layers stay out of host memory\n", __func__, n_hot, model.moe_hot.size());
++#endif
++}
++
++// after the load: the tensors get their shape back, and the router of each layer the order of its experts
++static void llama_moe_hot_done(llama_model & model) {
++    const int32_t n_expert = (int32_t) model.hparams.n_expert;
++    std::vector<uint8_t> a;
++    std::vector<uint8_t> b;
++    for (auto & [il, h] : model.moe_hot) {
++        for (const auto & s : h.src) {
++            ggml_tensor * t = const_cast<ggml_tensor *>(s.t);
++            if (!llama_tensor_is_host_weight(t)) {
++                throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d: %s is not in host memory", il, t->name));
++            }
++            t->ne[2] = n_expert;
++        }
++        const llama_layer & layer = model.layers[il];
++        for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ffn_exp_probs_b }) {
++            if (t == nullptr) {
++                continue;
++            }
++            // one row per expert: ffn_gate_inp [n_embd, n_expert], ffn_exp_probs_b [n_expert]
++            const size_t row = ggml_nbytes(t)/n_expert;
++            GGML_ASSERT(ggml_nelements(t) % n_expert == 0 && row*n_expert == ggml_nbytes(t) && (ggml_n_dims(t) == 1 || t->nb[1] == row));
++            a.resize(ggml_nbytes(t));
++            b.resize(ggml_nbytes(t));
++            ggml_backend_tensor_get(t, a.data(), 0, a.size());
++            for (int32_t p = 0; p < n_expert; ++p) {
++                memcpy(b.data() + p*row, a.data() + h.order[p]*row, row);
++            }
++            ggml_backend_tensor_set(t, b.data(), 0, b.size());
++        }
++    }
++#ifndef _WIN32
++    // LLAMA_MOE_HOT_VERIFY=1: the host experts and the router rows against the model file, byte for byte
++    if (const char * s = getenv("LLAMA_MOE_HOT_VERIFY"); s != nullptr && atoi(s) != 0 && !model.moe_hot.empty()) {
++        const int64_t t0 = ggml_time_us();
++        auto same = [](int fd, size_t offs, const uint8_t * data, size_t size) {
++            std::vector<uint8_t> buf(std::min<size_t>(size, 8u*1024*1024));
++            for (size_t done = 0; done < size; ) {
++                const ssize_t r = pread(fd, buf.data(), std::min(buf.size(), size - done), (off_t) (offs + done));
++                if (r <= 0 || memcmp(buf.data(), data + done, (size_t) r) != 0) {
++                    return false;
++                }
++                done += (size_t) r;
++            }
++            return true;
++        };
++        std::vector<const llama_model::moe_hot_layer *> hs;
++        for (const auto & [il, h] : model.moe_hot) {
++            hs.push_back(&h);
++        }
++        std::atomic<size_t> next { 0 };
++        std::atomic<size_t> n_bad { 0 };
++        std::atomic<size_t> n_ok { 0 };
++        std::vector<std::thread> thr;
++        for (int i = 0; i < 8; ++i) {
++            thr.emplace_back([&]() {
++                for (size_t k = next++; k < hs.size(); k = next++) {
++                    const auto & h = *hs[k];
++                    for (const auto & s : h.src) {
++                        const size_t es = s.t->nb[2];
++                        for (int32_t p = 0; p < h.n_host; ++p) {
++                            (same(s.fd, s.offs + (size_t) h.order[p]*es, (const uint8_t *) s.t->data + (size_t) p*es, es) ? n_ok : n_bad)++;
++                        }
++                    }
++                }
++            });
++        }
++        for (auto & t : thr) {
++            t.join();
++        }
++        std::atomic<size_t> n_rows { 0 };
++        for (const auto & [il, h] : model.moe_hot) {
++            for (const auto & s : h.router) {
++                const size_t row = ggml_nbytes(s.t)/n_expert;
++                a.resize(ggml_nbytes(s.t));
++                ggml_backend_tensor_get(s.t, a.data(), 0, a.size());
++                for (int32_t p = 0; p < n_expert; ++p) {
++                    (same(s.fd, s.offs + (size_t) h.order[p]*row, a.data() + p*row, row) ? n_rows : n_bad)++;
++                }
++            }
++        }
++        LLAMA_LOG_INFO("%s: LLAMA_MOE_HOT_VERIFY: %zu host experts and %zu router rows match the model file, %zu differ (%.1f s)\n", __func__,
++            n_ok.load(), n_rows.load(), n_bad.load(), (ggml_time_us() - t0)/1e6);
++        if (n_bad > 0) {
++            throw std::runtime_error("LLAMA_MOE_HOT_VERIFY: the loaded experts differ from the model file");
++        }
++    }
++#endif
+ }
+ 
+ void llama_model_base::load_stats(llama_model_loader & ml) {
+@@ -1919,6 +2130,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
++    llama_moe_hot_plan(*this, ml);
++
+     // create the backend buffers
+     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
+     std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;
+@@ -2066,6 +2279,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             return false;
+         }
+     }
++    llama_moe_hot_done(*this);
+ 
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index ce6658c..fafff92 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -923,6 +923,29 @@ struct llama_model {
+     int64_t t_load_us  = 0;
+     int64_t t_start_us = 0;
+ 
++    // LLAMA_MOE_HOT_MAP=file: a line per layer, "layer expert expert ...".  The layer's experts are loaded in a new order, the ones
++    // named last: host memory holds the first n_host only, the others live in the MoE cache alone (it reads them from the file).
++    // The router's rows take the same order, so the model computes the same thing; every expert index of the layer is a position
++    struct moe_hot_layer {
++        int32_t n_host = 0;
++        std::vector<int32_t> order; // position -> expert of the file
++        struct source {
++            const ggml_tensor * t;
++            int    fd;
++            size_t offs;
++        };
++        std::vector<source> src;    // the layer's expert tensors in the files
++        std::vector<source> router; // ffn_gate_inp and ffn_exp_probs_b there
++    };
++    std::map<int32_t, moe_hot_layer> moe_hot;
++    std::unordered_map<const ggml_tensor *, int32_t> moe_hot_n_host;
++    std::vector<int> moe_hot_fds;
++    // the experts of w that host memory holds, the first ones
++    int64_t moe_host_experts(const ggml_tensor * w) const {
++        const auto it = moe_hot_n_host.find(w);
++        return it != moe_hot_n_host.end() ? it->second : w->ne[2];
++    }
++
+     explicit llama_model(const llama_model_params & params);
+     virtual ~llama_model();
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 7b0d19f..91bb3e9 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -11,13 +11,19 @@
+ #include "ggml-cpp.h"
+ #include "ggml-alloc.h"
+ 
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
+ #include <numeric>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -44,6 +50,7 @@ struct moe_cache_slru {
+     int32_t n_filled    = 0; // slots that hold an expert
+     int32_t n_active    = 0; // 0138: the slots in use, [0, n_active); the rest are given up (their memory is borrowed by a graph)
+     int32_t n_low       = 0; // 0150: slots [0, n_low) stage predicted experts; the LFU uses [n_low, n_active)
++    int32_t n_pin       = 0; // LLAMA_MOE_HOT_MAP: slots [0, n_pin) hold experts that are not in host memory, they stay (n_low = n_pin)
+ 
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+@@ -420,6 +427,8 @@ struct llama_moe_cache::impl {
+ 
+     struct layer {
+         int32_t ig = -1;                    // -1 if the layer is not cached
++        int32_t n_host = INT32_MAX;         // LLAMA_MOE_HOT_MAP: the experts from n_host on are pinned in the layer's own group
++        const std::vector<int32_t> * order = nullptr; // LLAMA_MOE_HOT_MAP: position -> expert of the file (nullptr: the file's order)
+         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+         ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
+         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
+@@ -673,7 +682,7 @@ struct llama_moe_cache::impl {
+                 } else {
+                     for (int32_t i = 0; i < s.lfu_sample; ++i) {
+                         rng = rng*6364136223846793005ull + 1442695040888963407ull;
+-                        const int32_t v   = (int32_t) ((rng >> 33) % (uint64_t) s.n_active);
++                        const int32_t v   = s.n_low + (int32_t) ((rng >> 33) % (uint64_t) (s.n_active - s.n_low));
+                         const int32_t key = s.key_of[v];
+                         if (key < 0) {
+                             continue;
+@@ -1376,6 +1385,31 @@ struct llama_moe_cache::impl {
+                 g.stage_ev.assign(4, nullptr);
+                 LLAMA_LOG_INFO("%s: 0150: %d staging slots for the predicted experts of the next layer (%d a layer)\n", __func__, g.n_stage, stage_k());
+             }
++            // LLAMA_MOE_HOT_MAP: the experts that host memory does not hold take the first slots of their layer's own group
++            for (int32_t il : g.layers) {
++                const auto it_hot = model.moe_hot.find(il);
++                if (it_hot != model.moe_hot.end() && ggml_backend_get_device(d.backend) == model.dev_layer(il)) {
++                    g.slru.n_pin += n_expert - it_hot->second.n_host;
++                }
++            }
++            if (g.slru.n_pin > 0) {
++                // the paths that were not checked with pinned experts are refused
++                const char * pc = getenv("LLAMA_MOE_PROMPT_CPU");
++                if (g.slru.lfu_half <= 0.0f || g.n_stage > 0 || prefetch_enabled() || (pc != nullptr && atoi(pc) != 0)) {
++                    throw std::runtime_error("LLAMA_MOE_HOT_MAP needs LLAMA_MOE_CACHE_LFU, and no LLAMA_MOE_PREFETCH, LLAMA_MOE_PREFETCH_STAGE or LLAMA_MOE_PROMPT_CPU");
++                }
++                // the slots of the cache's own budget: the borrowed and lent ones are given up at times
++                if (g.slru.n_pin + 256 > g.n_base) {
++                    size_t slot_bytes = 0;
++                    for (const ggml_tensor * t : g.ref) {
++                        slot_bytes += t->nb[2];
++                    }
++                    throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: %s has %d slots of its own and the map pins %d there: its share of --moe-cache-mib must be %.0f MiB or more",
++                        ggml_backend_name(d.backend), g.n_base, g.slru.n_pin, (g.slru.n_pin + 256)*(double) slot_bytes/1024.0/1024.0));
++                }
++                g.slru.n_low    = g.slru.n_pin;
++                g.slru.n_filled = g.slru.n_pin;
++            }
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
+         }
+@@ -1425,6 +1459,10 @@ struct llama_moe_cache::impl {
+                 if (home) {
+                     l.ig      = (int32_t) ig;
+                     l.experts = llama_moe_cache_layer_experts(model.layers[il]);
++                    if (const auto it_hot = model.moe_hot.find(il); it_hot != model.moe_hot.end()) {
++                        l.n_host = it_hot->second.n_host;
++                        l.order  = &it_hot->second.order;
++                    }
+                 } else {
+                     l.ig_xd = (int32_t) ig;
+                 }
+@@ -1648,6 +1686,7 @@ struct llama_moe_cache::impl {
+                     }
+                 }
+             }
++            pin_load(model);
+         }
+ 
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+@@ -1860,8 +1899,127 @@ struct llama_moe_cache::impl {
+     void write_trace(int32_t il, int32_t n_used) {
+         const int32_t rec[3] = { il, n_used, (int32_t) ids.size() };
+         fwrite(rec, sizeof(int32_t), 3, trace);
++        if (layers[il].order != nullptr) {
++            // LLAMA_MOE_HOT_MAP: the trace keeps the file's expert numbers
++            trace_ids.resize(ids.size());
++            for (size_t i = 0; i < ids.size(); ++i) {
++                trace_ids[i] = (*layers[il].order)[ids[i]];
++            }
++            fwrite(trace_ids.data(), sizeof(int32_t), trace_ids.size(), trace);
++            return;
++        }
+         fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
+     }
++    std::vector<int32_t> trace_ids;
++
++    // LLAMA_MOE_HOT_MAP: the experts that host memory does not hold go from the model file into the first slots of their layer's group
++    void pin_load(const llama_model & model) {
++        if (model.moe_hot.empty()) {
++            return;
++        }
++#ifndef _WIN32
++        const int64_t t0 = ggml_time_us();
++        size_t n_pinned = 0;
++        size_t bytes    = 0;
++        std::vector<uint8_t> buf;
++        for (group & g : groups) {
++            if (g.slru.n_pin == 0) {
++                continue;
++            }
++            const int32_t n_expert = g.slru.n_expert;
++            int32_t s0 = 0;
++            for (int32_t il : g.layers) {
++                const layer & l = layers[il];
++                const auto it = model.moe_hot.find(il);
++                if (it == model.moe_hot.end() || l.ig != (int32_t) (&g - groups.data())) {
++                    continue;
++                }
++                const auto &  h     = it->second;
++                const int32_t n_hot = n_expert - h.n_host;
++                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                    const auto src = std::find_if(h.src.begin(), h.src.end(), [&](const auto & x) { return x.t == l.experts[ip]; });
++                    GGML_ASSERT(src != h.src.end());
++                    const size_t es = l.experts[ip]->nb[2];
++                    buf.resize((size_t) n_hot*es);
++                    const int n_thr = std::min<int>(8, n_hot);
++                    std::vector<std::thread> thr;
++                    std::atomic<bool> ok { true };
++                    for (int it_thr = 0; it_thr < n_thr; ++it_thr) {
++                        thr.emplace_back([&, it_thr]() {
++                            for (int32_t p = it_thr; p < n_hot; p += n_thr) {
++                                size_t done = 0;
++                                while (done < es) {
++                                    const ssize_t r = pread(src->fd, buf.data() + (size_t) p*es + done, es - done, (off_t) (src->offs + (size_t) h.order[h.n_host + p]*es + done));
++                                    if (r <= 0) {
++                                        ok = false;
++                                        return;
++                                    }
++                                    done += (size_t) r;
++                                }
++                            }
++                        });
++                    }
++                    for (auto & t : thr) {
++                        t.join();
++                    }
++                    if (!ok) {
++                        throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: failed to read %s from the model file", l.experts[ip]->name));
++                    }
++                    ggml_backend_tensor_set(g.banks[ip], buf.data(), (size_t) s0*es, buf.size());
++                    bytes += buf.size();
++                }
++                for (int32_t p = 0; p < n_hot; ++p) {
++                    g.slru.key_of[s0 + p] = il*n_expert + h.n_host + p;
++                    g.slru.slot_map[il][h.n_host + p] = s0 + p;
++                }
++                s0       += n_hot;
++                n_pinned += n_hot;
++            }
++            GGML_ASSERT(s0 == g.slru.n_pin);
++            LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_HOT_MAP: %s: %d of its %d own slots hold pinned experts\n", ggml_backend_name(devices[g.id].backend), g.slru.n_pin, g.n_base);
++        }
++        for (const auto & [il, h] : model.moe_hot) {
++            if (layers[il].ig < 0 || groups[layers[il].ig].slru.n_pin == 0) {
++                throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: layer %d is not cached, its pinned experts have no place", il));
++            }
++        }
++        LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_HOT_MAP: %zu experts of %zu layers pinned, %.1f MiB read from the model file in %.1f s\n",
++            n_pinned, model.moe_hot.size(), bytes/1024.0/1024.0, (ggml_time_us() - t0)/1e6);
++        // LLAMA_MOE_HOT_VERIFY=1: every pinned slot, read back from the device, against the model file
++        if (const char * v = getenv("LLAMA_MOE_HOT_VERIFY"); v != nullptr && atoi(v) != 0) {
++            size_t n_ok  = 0;
++            size_t n_bad = 0;
++            std::vector<uint8_t> dev;
++            for (const group & g : groups) {
++                for (int32_t s = 0; s < g.slru.n_pin; ++s) {
++                    const int32_t il = g.slru.key_of[s] / g.slru.n_expert;
++                    const int32_t p  = g.slru.key_of[s] % g.slru.n_expert;
++                    const layer & l  = layers[il];
++                    const auto &  h  = model.moe_hot.at(il);
++                    GGML_ASSERT(p >= h.n_host && g.slru.slot_map[il][p] == s);
++                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                        const auto src = std::find_if(h.src.begin(), h.src.end(), [&](const auto & x) { return x.t == l.experts[ip]; });
++                        const size_t es = l.experts[ip]->nb[2];
++                        buf.resize(es);
++                        dev.resize(es);
++                        ggml_backend_tensor_get(g.banks[ip], dev.data(), (size_t) s*es, es);
++                        bool ok = true;
++                        for (size_t done = 0; done < es && ok; ) {
++                            const ssize_t r = pread(src->fd, buf.data() + done, es - done, (off_t) (src->offs + (size_t) h.order[p]*es + done));
++                            ok = r > 0;
++                            done += ok ? (size_t) r : 0;
++                        }
++                        (ok && memcmp(buf.data(), dev.data(), es) == 0 ? n_ok : n_bad)++;
++                    }
++                }
++            }
++            LLAMA_LOG_INFO("llama_moe_cache: LLAMA_MOE_HOT_VERIFY: %zu pinned expert tensors match the model file, %zu differ\n", n_ok, n_bad);
++            if (n_bad > 0) {
++                throw std::runtime_error("LLAMA_MOE_HOT_VERIFY: the pinned experts differ from the model file");
++            }
++        }
++#endif
++    }
+ 
+     ~impl() {
+         log_stats();
+@@ -2181,7 +2339,7 @@ struct llama_moe_cache::impl {
+             ids_h.clear();
+             ids_x.clear();
+             for (int32_t e : ids) {
+-                ((e & 1) == g.own ? ids_h : ids_x).push_back(e);
++                (e >= l.n_host || (e & 1) == g.own ? ids_h : ids_x).push_back(e);
+             }
+             const uint32_t share_qx = gx->slru.n_filled == gx->slru.n_active ? cpu_share_q : 0;
+             auto n_cpu_x = [&](size_t n_miss) {
+@@ -2202,17 +2360,11 @@ struct llama_moe_cache::impl {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+         fill_mark.assign(g.slru.n_expert, 0);
+-        for (const auto & f : fills) {
+-            fill_mark[f.expert] = 1;
+-        }
+-        for (const auto & f : cpu) {
+-            fill_mark[f.expert] = 1;
+-        }
+-        for (const auto & f : fills_x) {
+-            fill_mark[f.expert] = 1;
+-        }
+-        for (const auto & f : cpu_x) {
+-            fill_mark[f.expert] = 1;
++        for (const auto * fs : { &fills, &cpu, &fills_x, &cpu_x }) {
++            for (const auto & f : *fs) {
++                GGML_ASSERT(f.expert < l.n_host); // a miss is read from host memory
++                fill_mark[f.expert] = 1;
++            }
+         }
+         int32_t * cpu_ids = (int32_t *) l.cpu_ids->data;
+         for (size_t i = 0; i < ids.size(); ++i) {
+@@ -3242,6 +3394,11 @@ struct llama_moe_cache::impl {
+         if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, n_cpu, rng, fills, cpu, n_hit)) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
++        for (const auto * fs : { &fills, &cpu }) {
++            for (const auto & f : *fs) {
++                GGML_ASSERT(f.expert < l.n_host); // a miss is read from host memory
++            }
++        }
+         if (has_cpu) {
+             int32_t * cpu_map = (int32_t *) l.cpu_map->data;
+             for (int32_t e : l.cpu_experts) {
+-- 
+2.53.0
+

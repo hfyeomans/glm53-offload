@@ -3,7 +3,7 @@
 #
 #   ./run.sh --model /path/to/GLM-5.3-UD-Q3_K_XL-a5-00001-of-00009.gguf [--gpus 0,1] [--ctx 256k|512k|768k|1m]
 #            [--route-bias 0.03] [--port 8080] [--bind 127.0.0.1] [--detach] [--image glm53-offload:latest]
-#            [more serve.sh options: --ram 256|384 --prompt-cache-mib N --cache-mib N --threads N --alias NAME --force --dry-run]
+#            [more serve.sh options: --ram 256|384 --hot-map --prompt-cache-mib N --cache-mib N --threads N --alias NAME --force --dry-run]
 #            [-- llama-server args]
 #
 # Default GPUs: 0,1 (two cards).  Default context 256k.  Default route bias 0, the model's own routing; 0.03 is the

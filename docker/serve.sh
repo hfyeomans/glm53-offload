@@ -7,6 +7,8 @@
 #     --ram 256|384        host memory tier (default: 256 on a host with less than 360 GiB of RAM, else 384).  256 is for two cards:
 #                          the routed experts of some layers stay whole on the cards, the rest is in host memory (recipes/*-ram256.sh)
 #     --route-bias V       0 (default): the model's own routing.  0.03: the measured speed option; it changes the output (README.md)
+#     --hot-map            the preset's hot-expert map (EXPERIMENTS.md, E4): each card pins the busiest experts of all its layers
+#                          instead of some layers whole.  Faster decode, the same model and memory.  256k with --ram 256 only
 #     --prompt-cache-mib N host memory for the prompt cache, the conversations saved when another one takes the slot (default: the
 #                          preset's; about 1 GiB per 20,600 tokens, and a conversation larger than the cache is not saved).  With
 #                          --ram 256 the memory check rises and falls with it
@@ -16,12 +18,13 @@
 #     --force              start even if a check fails (RAM, GPU model, peer-to-peer, a bias above 0.03, a card with too little free)
 #     --dry-run            print the command and the environment, start nothing
 set -u
-MODEL=; PRESET=256k; RAM=; BIAS=; CACHE=; PCACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; PASS=()
+MODEL=; PRESET=256k; RAM=; BIAS=; CACHE=; PCACHE=; THREADS=; ALIAS=glm-5.3; FORCE=0; DRY=0; HOT=0; PASS=()
 while [ $# -gt 0 ]; do case $1 in
   --model) MODEL=$2; shift 2;;
   --ctx) PRESET=${2,,}; shift 2;;
   --ram) RAM=$2; shift 2;;
   --route-bias) BIAS=$2; shift 2;;
+  --hot-map) HOT=1; shift;;
   --cache-mib) CACHE=$2; shift 2;;
   --prompt-cache-mib) PCACHE=$2; shift 2;;
   --threads) THREADS=$2; shift 2;;
@@ -29,7 +32,7 @@ while [ $# -gt 0 ]; do case $1 in
   --force) FORCE=1; shift;;
   --dry-run) DRY=1; shift;;
   --) shift; PASS=("$@"); break;;
-  -h|--help) sed -n 2,16p "$0"; exit 0;;
+  -h|--help) sed -n 2,18p "$0"; exit 0;;
   *) echo "unknown option $1 (see --help)"; exit 2;;
 esac; done
 
@@ -68,7 +71,7 @@ if [ -z "$RAM" ]; then if [ "$MEM_TOTAL_GB" -lt 360 ]; then RAM=256; else RAM=38
 case $RAM in 384) TIER=;; 256) TIER=-ram256;; *) echo "[serve] --ram is 256 or 384, not '$RAM'"; exit 2;; esac
 R=/app/recipes/${NGPU}gpu-${PRESET}${TIER}.sh
 [ -f "$R" ] || { [ "$RAM$NGPU" != 2561 ] || echo "[serve] the --ram 256 presets need both cards (--gpus 0,1); one card needs a host with 384 GiB of RAM"
-                echo "[serve] no recipe for $NGPU GPU(s) at --ctx $PRESET with --ram $RAM (have: $(ls /app/recipes | grep gpu- | grep -v gpu-ram | sed 's/[.]sh$//' | tr '\n' ' '))"; exit 2; }
+                echo "[serve] no recipe for $NGPU GPU(s) at --ctx $PRESET with --ram $RAM (have: $(ls /app/recipes | grep gpu- | grep -v -e gpu-ram -e '-hot[.]sh' | sed 's/[.]sh$//' | tr '\n' ' '))"; exit 2; }
 # shellcheck source=/dev/null
 source /app/recipes/common.sh
 # shellcheck source=/dev/null
@@ -77,6 +80,12 @@ source "/app/recipes/${NGPU}gpu.sh"
 [ -z "$TIER" ] || source "/app/recipes/${NGPU}gpu${TIER}.sh"
 # shellcheck source=/dev/null
 source "$R"
+# --hot-map: what the preset's hot-expert map changes (<preset>-hot.sh)
+if [ $HOT = 1 ]; then
+  [ -f "${R%.sh}-hot.sh" ] || { echo "[serve] no hot-expert map for $(basename "$R" .sh) (have: $(ls /app/recipes | grep -e '-hot[.]sh' | sed 's/-hot[.]sh$//' | tr '\n' ' '))"; exit 2; }
+  # shellcheck source=/dev/null
+  source "${R%.sh}-hot.sh"
+fi
 
 # RESIDENT (the 256 presets): the layers whose routed experts stay whole on their card; the experts of the other layers go to host memory
 if [ -n "${RESIDENT:-}" ]; then
@@ -143,14 +152,14 @@ if [ -z "$CACHE" ]; then
     printf "%d", c }')
   CACHE=$((CACHE_MIB - CUT))
   if [ "$CUT" -gt 0 ]; then
-    [ $((CUT * 4)) -le "$CACHE_MIB" ] || fail "the GPU(s) have ${FREE[*]} MiB free, a whole card has $FULL_MIB: the MoE cache would go from $CACHE_MIB to $CACHE MiB, too far from what was measured (free the GPUs, or set --cache-mib N yourself)"
+    [ $((CUT * 4)) -le $((CACHE_MIB - ${CACHE_PIN_MIB:-0})) ] || fail "the GPU(s) have ${FREE[*]} MiB free, a whole card has $FULL_MIB: the MoE cache would go from $CACHE_MIB to $CACHE MiB, too far from what was measured (free the GPUs, or set --cache-mib N yourself)"
     [ "$CACHE" -ge 1000 ] || { echo "[serve] no room for a MoE cache (free the GPUs)"; exit 2; }
     say "warning: the GPU(s) have ${FREE[*]} MiB free, a whole card has $FULL_MIB: MoE cache $CACHE_MIB -> $CACHE MiB (a size that was not measured; expect less speed)"
   fi
 else
   say "MoE cache set by hand: $CACHE MiB (the preset measured $CACHE_MIB)"
 fi
-say "recipe $(basename "$R" .sh), route bias $LLAMA_MOE_ROUTE_BIAS, MoE cache $CACHE MiB, prompt cache ${CACHE_RAM_MIB:-8192} MiB, $THREADS threads"
+say "recipe $(basename "$R" .sh)$([ $HOT = 1 ] && echo ' with its hot-expert map'), route bias $LLAMA_MOE_ROUTE_BIAS, MoE cache $CACHE MiB, prompt cache ${CACHE_RAM_MIB:-8192} MiB, $THREADS threads"
 
 ARGS=(--model "$MODEL" --alias "$ALIAS" --host 0.0.0.0 --port 8080 --threads "$THREADS" --threads-batch "$THREADS"
       --moe-cache-mib "$CACHE" "${COMMON_ARGS[@]}" "${RECIPE_ARGS[@]}" "${PASS[@]}")
