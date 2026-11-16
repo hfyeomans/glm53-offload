@@ -190,6 +190,8 @@ def tables(repo, draft):
         path = os.path.join(repo, name)
         with open(path, encoding="utf-8") as f:
             text = f.read()
+        if name == "README.md":   # a README without these tables (a fork's) keeps what it has
+            blocks = {k: body for k, body in blocks.items() if f"<!-- T:{k} -->" in text}
         for k, body in blocks.items():
             text = fill(text, k, body, name)
         left += [f"{name}: T:{m}" for m in re.findall(r"<!-- T:([a-z0-9-]+) -->\n(?=[^\n]*pending)", text)]

@@ -1,0 +1,27 @@
+One card on the 256 GB host, 2026-11-15: a trial that was not kept (RESULTS.md, "A 256 GB host", what was tried and not kept).
+Recipe: the settings of 1gpu-1m at a 262,144-token context, the routed experts of layers 8 14 24 34 54 64 75 76 77 on the card,
+the other 66 layers' experts (256.8 GiB) memory-mapped (--load-mode mmap), MoE cache 5,400 MiB (a 34,006 MiB bank), prompt cache 2,048 MiB.
+GPU 0 peaked at 95,441 MiB.  'disk' is what the host read from the model's drive during the request (pgpgin).
+
+== the first two requests after the start: 96 tokens each (server timings)
+request 1: decode 2.59 tok/s, 29 prompt tokens in 24.8 s
+request 2: decode 5.95 tok/s
+
+== ten more requests, 128 tokens each
+req 0: decode 5.35 tok/s (128 tok), prompt 12 tok in 3.5 s, wall 27.3 s, disk 20.9 GiB
+req 1: decode 5.28 tok/s (128 tok), prompt 15 tok in 4.1 s, wall 28.2 s, disk 20.0 GiB
+req 2: decode 6.99 tok/s (128 tok), prompt 12 tok in 2.3 s, wall 20.5 s, disk 12.2 GiB
+req 3: decode 8.12 tok/s (128 tok), prompt 8 tok in 1.3 s, wall 17.0 s, disk 6.1 GiB
+req 4: decode 10.03 tok/s (128 tok), prompt 16 tok in 2.8 s, wall 15.5 s, disk 5.7 GiB
+req 5: decode 8.97 tok/s (128 tok), prompt 15 tok in 2.5 s, wall 16.7 s, disk 6.7 GiB
+req 6: decode 9.45 tok/s (128 tok), prompt 13 tok in 2.0 s, wall 15.5 s, disk 4.6 GiB
+req 7: decode 9.52 tok/s (128 tok), prompt 12 tok in 1.6 s, wall 14.9 s, disk 4.6 GiB
+req 8: decode 9.18 tok/s (128 tok), prompt 13 tok in 1.4 s, wall 15.3 s, disk 3.9 GiB
+req 9: decode 8.89 tok/s (128 tok), prompt 11 tok in 2.0 s, wall 16.3 s, disk 6.7 GiB
+
+== fresh prompts (bench/probe.py --salt, 64 tokens generated after each)
+  warmup: 128 tok, ttft 4.84s, decode 10.5 tok/s
+  prefill 1050 tok: ttft 102.8s prompt 10 tok/s draft 45/40
+  prefill 4102 tok: ttft 105.1s prompt 39 tok/s draft 45/40
+  after the 1,050-token prompt the 64 tokens ran at 2.20 tok/s; after the 4,102-token one at 4.59 tok/s
+  prefill 16310 tok: no first token after more than 9 minutes; stopped there

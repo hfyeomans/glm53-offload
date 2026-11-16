@@ -1,8 +1,10 @@
 # Results and method
 
-Every speed figure in this file and in the README was measured on the machine below, with the image this repo builds and the scripts
-in it. The raw files are in `results/`: three JSON files per preset (as it ships, and two runs with the route bias), each holding
-every request with its text and its timestamps. The tables between the `T:` markers are written from those files by
+Every speed figure in this file outside [A 256 GB host](#a-256-gb-host) is upstream's
+([killy-netsphere/glm53-offload](https://github.com/killy-netsphere/glm53-offload)), measured on the machine below with the image
+this repo builds and the scripts in it. The README's figures are this fork's, from that section. The raw files are in `results/`:
+three JSON files per preset (as it ships, and two runs with the route bias), each holding every request with its text and its
+timestamps. The tables between the `T:` markers are written from those files by
 `bench/report.py --tables`.
 
 ## The machine
@@ -432,6 +434,19 @@ time, so it includes saving the conversation that leaves the slot. Raw files: `r
 - **256K with 24 layers on the cards, 2K-token attention blocks and 16K ubatches:** decode 26.8 tok/s and prompt steps of 769,
   1,246 and 1,125 tok/s, with 17.7 GiB of host memory left at the lowest. The preset has 28 layers, 1K blocks and 4K ubatches:
   the same decode within 1 %, faster prompts, and 43 GiB left.
+- **One card** (2026-11-15). The card, the weights, the KV cache and the compute buffer leave room for nine layers' experts at
+  256K, and the other 66 layers' are 256.8 GiB: more than the host can pin, so they were memory-mapped, and about 22 GiB more
+  than its page cache holds. Tried with the prompt settings of `1gpu-1m` at 262,144 tokens:
+  - decode rose from 2.6 tok/s on the first answer to 9 to 10 by the fifth as the page cache settled; the host read 21 GiB
+    from the disk during the first 128 tokens and 4 to 7 GiB during later ones;
+  - a fresh 1,050-token prompt waited 103 s for its first token (10 tok/s) and a 4,102-token one 105 s (39 tok/s): every batch
+    of a prompt reads all the host experts, and the ones that do not fit come from the disk each time. The 64 tokens after
+    them ran at 2.2 and 4.6 tok/s;
+  - a 16,310-token prompt had no first token after more than 9 minutes, and the trial was stopped there.
+
+  So one card has no preset on this host. A first start with ten layers on the card ran out of GPU memory. A 64K context with
+  15 layers on the card, whose host experts (233 GiB) might fit the page cache, was sized and not run. Console output:
+  `results/ram256/1gpu-256k-mmap-console.txt`.
 - **A smaller CPU share of the cache misses** (`--moe-cache-cpu-share`, 0.9 in every preset), for the 16 cores: on the first
   eight decode prompts of `2gpu-256k-ram256`, 0.5 gave a median of 26.9 tok/s and 0.75 gave 26.6, against 26.3 for the preset on
   the same prompts. One run each, and the spread between two runs was not measured, so the presets keep 0.9.

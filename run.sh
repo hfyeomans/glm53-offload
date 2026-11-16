@@ -9,7 +9,7 @@
 # Default GPUs: 0 (one card); --gpus 0,1 for two.  Default context 256k.  Default route bias 0, the model's own routing; 0.03 is the
 # measured speed option, and it changes the output (README.md, "The route bias").  --detach runs it in the background (container
 # --name glm53-offload).  The API comes up at http://<bind>:<port>/v1 once the model has loaded.  Ctrl-C stops it.
-# A host with 256 GB of RAM needs both cards and gets the --ram 256 presets (README.md, "A 256 GB host"), with --ctx 768k as well.
+# A host with 256 GB of RAM needs both cards and gets the --ram 256 presets (README.md, "What this fork changes"), with --ctx 768k as well.
 set -u
 MODEL=; GPUS=0; PORT=8080; BIND=127.0.0.1; IMAGE=${GLM53_IMAGE:-glm53-offload:latest}; NAME=glm53-offload; DETACH=0; REST=()
 while [ $# -gt 0 ]; do case $1 in
