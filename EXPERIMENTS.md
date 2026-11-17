@@ -218,6 +218,22 @@ hold what the preset holds. Each smaller map is a subset of the larger ones. Rec
 
 Without the map, then with it; one run of each.
 
+**Fresh prompts by size, with the map.** As in RESULTS.md, "A 256 GB host": `bench/probe.py --salt`, prompt tokens a second as the
+server reports them, then the wait for the first streamed token. The median of three prompts up to 32K; one of 64K and of 128K.
+Each cell is 1 to 4 % slower than the same one without the map there, except 768K at 8K, whose run without the map was the noisy
+one (922 to 1,169 tok/s).
+
+| Prompt, tokens | `256k` | `512k` | `768k` | `1m` |
+|---|---|---|---|---|
+| 1,048 | 277, 3.7 s | 257, 4.0 s | 248, 4.2 s | 238, 4.4 s |
+| 2,056 | 546, 3.7 s | 509, 4.0 s | 494, 4.2 s | 474, 4.3 s |
+| 4,100 | 934, 4.4 s | 897, 4.6 s | 876, 4.7 s | 614, 6.7 s |
+| 8,161 | 1,209, 6.8 s | 1,165, 7.1 s | 1,134, 7.3 s | 720, 11.4 s |
+| 16,308 | 1,407, 11.7 s | 1,357, 12.1 s | 1,100, 15.0 s | 789, 20.8 s |
+| 32,605 | 1,527, 21.7 s | 1,472, 22.4 s | 1,144, 28.8 s | 790, 41.7 s |
+| 65,195 | 1,503, 43.7 s | 1,455, 45.1 s | 1,134, 57.9 s | 788, 83.2 s |
+| 130,352 | 1,445, 90.8 s | 1,403, 93.5 s | 1,100, 119.3 s | 781, 167.0 s |
+
 - **Decode gains less as the rung grows,** because each rung up has fewer whole layers to turn into pins: the maps take an
   estimated 51, 45, 42 and 38 % of the expert traffic (`hotmap.py --holdout`). 768K gains least: 23 of the 24 prompts were faster,
   by 0 to 24 %. Why 768K falls below 1M was not traced.

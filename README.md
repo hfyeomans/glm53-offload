@@ -8,18 +8,19 @@ Serve **GLM-5.3** (Z.ai's 744B mixture-of-experts model, with DeepSeek-style spa
 RTX PRO 6000 Blackwell** cards and a host with **256 GB of RAM**, at 256K to 1M tokens of context. It is llama.cpp plus one
 patch: an OpenAI-compatible server, a Docker image, and one command to start it.
 
-| Context | `--ctx` | Decode, tok/s | Prompt, tok/s (deepest step) | First token of a fresh 16K / 32K prompt | Prompt cache | Host RAM free at the lowest |
+| Context | `--ctx` | Decode, tok/s | Prefill of a fresh 16K / 32K prompt, tok/s | First token of a fresh 16K / 32K prompt | Prompt cache | Host RAM free at the lowest |
 |---|---|---|---|---|---|---|
-| 256K (default) | `256k` | 34.0 | 1,254 (to 201K) | 11.7 s / 21.7 s | 16 GiB | 28 GiB |
-| 512K | `512k` | 31.5 | 1,039 (to 401K) | 12.1 s / 22.4 s | 8 GiB | about 18 GiB |
-| 768K | `768k` | 29.3 | 715 (to 602K) | 15.0 s / 28.8 s | 4 GiB | about 13 GiB |
-| 1M | `1m` | 29.5 | 607 (to 803K) | 20.8 s / 41.7 s | 2 GiB | 8 GiB |
+| 256K (default) | `256k` | 34.0 | 1,407 / 1,527 | 11.7 s / 21.7 s | 16 GiB | 28 GiB |
+| 512K | `512k` | 31.5 | 1,357 / 1,472 | 12.1 s / 22.4 s | 8 GiB | about 18 GiB |
+| 768K | `768k` | 29.3 | 1,100 / 1,144 | 15.0 s / 28.8 s | 4 GiB | about 13 GiB |
+| 1M | `1m` | 29.5 | 789 / 790 | 20.8 s / 41.7 s | 2 GiB | 8 GiB |
 
 - **Decode** is generated tokens a second for one user: the median over 24 prompts, 512 tokens each, with the MTP head drafting
   2 tokens a step. GLM-5.3 always thinks, so most of those tokens are reasoning.
-- **Prompt** is prompt tokens a second as the server reports them, while one prompt grows to that many tokens.
-- **Measured** on a 16-core Threadripper PRO 9955WX with 256 GB and two Max-Q cards, one run a preset, with `scripts/bench.sh`.
-  The method, every step and the raw files are in [RESULTS.md](RESULTS.md), "A 256 GB host".
+- **Prefill** is prompt tokens a second as the server reports them, for a prompt computed in full; the median of three.
+  Every size from 1K to 128K, and a prompt grown to 77 to 80 % of the context, are in [EXPERIMENTS.md](EXPERIMENTS.md), E6.
+- **Measured** on a 16-core Threadripper PRO 9955WX with 256 GB and two Max-Q cards, one run a preset, with `scripts/bench.sh`
+  and `bench/probe.py`. The method, every step and the raw files are in [RESULTS.md](RESULTS.md), "A 256 GB host".
 - **Host RAM free** is the lowest of the measured run. 256K's was with its prompt cache full; the others had theirs in use,
   not checked full.
 
