@@ -7,8 +7,8 @@
 #     --ram 256|384        host memory tier (default: 256 on a host with less than 360 GiB of RAM, else 384).  256 is for two cards:
 #                          the routed experts of some layers stay whole on the cards, the rest is in host memory (recipes/*-ram256.sh)
 #     --route-bias V       0 (default): the model's own routing.  0.03: the measured speed option; it changes the output (README.md)
-#     --no-hot-map         the preset without its hot-expert map (EXPERIMENTS.md, E4), which is on by default where there is one
-#                          (256k with --ram 256): each card pins the busiest experts of all its layers.  --hot-map requires it
+#     --no-hot-map         the preset without its hot-expert map (EXPERIMENTS.md, E4 and E6), which is on by default where there is
+#                          one (every --ram 256 preset): each card pins the busiest experts of all its layers.  --hot-map requires it
 #     --prompt-cache-mib N host memory for the prompt cache, the conversations saved when another one takes the slot (default: the
 #                          preset's; about 1 GiB per 20,600 tokens, and a conversation larger than the cache is not saved).  With
 #                          --ram 256 the memory check rises and falls with it

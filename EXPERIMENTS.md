@@ -148,7 +148,7 @@ The map is `recipes/hotmap-256k.txt`, made by `bench/hotmap.py --pin 3584,2560` 
     between its own runs.
 - **Costs.** The start is about 13 s longer (2:06 against 1:53 to the open port, the medians of five starts each). The map is fitted to recorded routing. Only the 256K preset has one. A trace
   still carries the file's expert numbers; `LLAMA_MOE_ROUTE_HIST` carries positions.
-- **Not done:** maps for 512K, 768K and 1M; a map from a wider set of prompts. The route bias with the map is E5.
+- **Not done:** a map from a wider set of prompts. The route bias with the map is E5; maps for the other rungs are E6.
 
 Raw files: `results/experiments/e4-*.json`.
 
@@ -203,7 +203,38 @@ memory, does not fit in 256 GB, so the reference is the map at bias 0, and a sec
 
 Raw files: `results/experiments/e5-*.json` (speed) and `e5-kl.txt` (the KL statistics of every run).
 
+## E6. Hot-expert maps for 512K, 768K and 1M (2026-11-17, measured): 7 to 18 % faster decode, the default on every rung
+
+Each rung's map is made as 256K's (E4): only layers 8 and 75 to 77 stay whole, and the memory of the rung's other whole layers
+pins the busiest experts of the card's layers (`bench/hotmap.py --pin N0,N1` from the same traces A, B and C). Host and GPU memory
+hold what the preset holds. Each smaller map is a subset of the larger ones. Recipes: `recipes/2gpu-<ctx>-ram256-hot.sh`.
+
+| Rung | Pinned, card 0 / card 1 | Decode, tok/s | Deepest prompt step, tok/s | First token of a fresh 16K / 32K prompt, s | Decode after the deepest step, tok/s |
+|---|---|---|---|---|---|
+| 256K (E4) | 3,584 / 2,560 | 26.6 -> 34.0 | 1,276 -> 1,254 (201K) | 11.3 / 21.1 -> 11.7 / 21.7 | 27.3 -> 32.1 |
+| 512K | 3,072 / 2,048 | 26.7 -> 31.5 | 1,052 -> 1,039 (401K) | 11.8 / 21.7 -> 12.1 / 22.4 | 24.5 -> 30.7 |
+| 768K | 2,816 / 1,792 | 27.5 -> 29.3 | 718 -> 715 (602K) | 14.5 / 27.9 -> 15.0 / 28.8 | 22.3 -> 23.3 |
+| 1M | 2,560 / 1,536 | 25.6 -> 29.5 | 616 -> 607 (803K) | 20.5 / 41.1 -> 20.8 / 41.7 | 18.3 -> 25.1 |
+
+Without the map, then with it; one run of each.
+
+- **Decode gains less as the rung grows,** because each rung up has fewer whole layers to turn into pins: the maps take an
+  estimated 51, 45, 42 and 38 % of the expert traffic (`hotmap.py --holdout`). 768K gains least: 23 of the 24 prompts were faster,
+  by 0 to 24 %. Why 768K falls below 1M was not traced.
+- **Prompts cost 1 to 3 %,** as at 256K. "Decode after" is one request of about 200 tokens, so it is noisy; 1M's +37 % there is one
+  sample.
+- **Memory.** GPU peaks are within 70 MiB of the presets'. The lowest host memory available was 18.5, 13.1 and 8.4 GiB, with each
+  rung's prompt cache in use but not checked full; without the map the same runs, with a 2 GiB cache, left 25.8, 15.8 and 9.7.
+  Host memory holds the same experts with and without the map, and at 256K, with the cache full, the two were 0.1 GiB apart.
+- **The engine needed one change.** E4 refused to start unless a card kept 256 of its own cache slots free beside the pins: enough
+  for every expert of a layer in one lookup, when the slots borrowed from the compute buffer and lent by the KV cache are gone. The
+  larger rungs keep 106 to 313. The start now asks for 8, the experts of one token, as without a map, and each lookup checks that
+  its unpinned experts fit the free slots; one that does not stops the server. The case that needs the most is a short prompt
+  (under 513 new tokens) deep in a long conversation. At 1M, card 0 with 106, follow-ups of 53, 194 and 376 new tokens after
+  748,144 tokens of context all ran (2.9 to 5.4 s to the answer). Prompts of 377 to 512 new tokens at that depth were not tried.
+
+Raw files: `results/experiments/e6-*.json`.
+
 ## What is left
 
-1. **Maps for the other rungs** (512K, 768K, 1M), each from its own count of whole layers, and a run of each.
-2. **A map from wider traffic** than the 24 bench prompts: code, long conversations, other languages.
+1. **A map from wider traffic** than the 24 bench prompts: code, long conversations, other languages.

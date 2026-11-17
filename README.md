@@ -11,17 +11,17 @@ patch: an OpenAI-compatible server, a Docker image, and one command to start it.
 | Context | `--ctx` | Decode, tok/s | Prompt, tok/s (deepest step) | First token of a fresh 16K / 32K prompt | Prompt cache | Host RAM free at the lowest |
 |---|---|---|---|---|---|---|
 | 256K (default) | `256k` | 34.0 | 1,254 (to 201K) | 11.7 s / 21.7 s | 16 GiB | 28 GiB |
-| 512K | `512k` | 26.7 | 1,052 (to 401K) | 11.8 s / 21.7 s | 8 GiB | about 20 GiB |
-| 768K | `768k` | 27.5 | 718 (to 602K) | 14.5 s / 27.9 s | 4 GiB | about 15 GiB |
-| 1M | `1m` | 25.6 | 616 (to 803K) | 20.5 s / 41.1 s | 2 GiB | 10 GiB |
+| 512K | `512k` | 31.5 | 1,039 (to 401K) | 12.1 s / 22.4 s | 8 GiB | about 18 GiB |
+| 768K | `768k` | 29.3 | 715 (to 602K) | 15.0 s / 28.8 s | 4 GiB | about 13 GiB |
+| 1M | `1m` | 29.5 | 607 (to 803K) | 20.8 s / 41.7 s | 2 GiB | 8 GiB |
 
 - **Decode** is generated tokens a second for one user: the median over 24 prompts, 512 tokens each, with the MTP head drafting
   2 tokens a step. GLM-5.3 always thinks, so most of those tokens are reasoning.
 - **Prompt** is prompt tokens a second as the server reports them, while one prompt grows to that many tokens.
 - **Measured** on a 16-core Threadripper PRO 9955WX with 256 GB and two Max-Q cards, one run a preset, with `scripts/bench.sh`.
   The method, every step and the raw files are in [RESULTS.md](RESULTS.md), "A 256 GB host".
-- **Host RAM free** is with the preset's prompt cache full. 256K and 1M were measured; the other two are a measured run plus
-  arithmetic for the cache.
+- **Host RAM free** is the lowest of the measured run. 256K's was with its prompt cache full; the others had theirs in use,
+  not checked full.
 
 ## What this fork changes
 
@@ -36,20 +36,21 @@ Upstream pins the routed experts of all 75 MoE layers in host memory: 296 GiB, s
   overrides it, and the start's memory check rises and falls with it.
 - **Benchmarks:** `scripts/bench.sh` knows the 768K context, `bench/switch.py` measures the prompt cache, and the raw files
   are in `results/ram256/`.
-- **A hot-expert map for 256K,** on by default; `--no-hot-map` turns it off. Each card pins the busiest experts of all its
-  layers instead of some layers whole, so the CPU computes 27 % less of the expert work: decode goes from 26.6 to 34.0 tok/s
-  on the same GPU and host memory. The model is the same: its experts are reordered, not changed. Cost: prompts are 2 to 3 %
-  slower (first token of a fresh 16K / 32K prompt after 11.7 / 21.7 s instead of 11.3 / 21.1), and the start takes about
-  13 s more. Trade-off: the map is fitted to recorded routing, and only this rung has one. It is one change to the engine
-  patch; [EXPERIMENTS.md](EXPERIMENTS.md), E4, has the method and the checks.
+- **A hot-expert map on every rung,** on by default; `--no-hot-map` turns it off. Each card pins the busiest experts of all
+  its layers instead of some layers whole, so the CPU computes less of the expert work: decode goes from 26.6 / 26.7 / 27.5 /
+  25.6 tok/s to 34.0 / 31.5 / 29.3 / 29.5 at 256K / 512K / 768K / 1M, with the same GPU memory and the same experts in
+  host memory. The model is the same: its experts are reordered, not changed. Cost: prompts are 1 to 3 % slower, and the
+  start takes about 13 s more. Trade-off: the map is fitted to recorded routing, and it gains less on the larger rungs,
+  which have fewer whole layers to give it. It is one change to the engine patch; [EXPERIMENTS.md](EXPERIMENTS.md), E4 and
+  E6, have the method and the checks.
 - **Not changed:** the image recipe and the model. Upstream's presets for a 384 GB host are still in `recipes/`
   and were not run here; [upstream's README](https://github.com/killy-netsphere/glm53-offload#readme) has them.
 
 ## What you need
 
 - **GPUs:** 2 × RTX PRO 6000 Blackwell (96 GB; the Max-Q Workstation edition was measured), each on PCIe 5.0 x16, with
-  peer-to-peer access (`nvidia-smi topo -p2p r` says `OK`) and nothing else on them: the presets peaked at 94,131 to
-  96,513 MiB of a card's 97,887. A desktop session of about 150 MiB on card 0 is allowed for.
+  peer-to-peer access (`nvidia-smi topo -p2p r` says `OK`) and nothing else on them: the presets peaked at 94,106 to
+  96,489 MiB of a card's 97,887. A desktop session of about 150 MiB on card 0 is allowed for.
 - **RAM:** 256 GB (246.8 GiB to the OS). The start refuses with less than 219, 227, 233 or 238 GiB available for `256k`,
   `512k`, `768k` or `1m`. Pinned memory cannot be swapped out, so close what else runs on the host for the larger rungs.
 - **CPU:** it computes most expert-cache misses, so cores and memory bandwidth matter. The image is built for AVX-512; see
@@ -85,7 +86,7 @@ GLM-5.3 always thinks: `enable_thinking` has no effect, and the reasoning arrive
 - `--port`, and `--bind 0.0.0.0` to serve the LAN (there is no authentication: add `-- --api-key KEY`);
 - `--detach` to run in the background;
 - `--route-bias 0.03`: upstream's speed option (default 0, see [below](#the-route-bias));
-- `--no-hot-map`: 256K without its hot-expert map;
+- `--no-hot-map`: the rung without its hot-expert map;
 - `--ram 256|384`, `--cache-mib`, `--threads`;
 - `--dry-run` (prints the exact llama-server command and environment, and starts nothing).
 
@@ -93,16 +94,15 @@ GLM-5.3 always thinks: `enable_thinking` has no effect, and the reasoning arrive
 
 Take the smallest context your work fits in.
 
-- **256K is the fastest and leaves the most host memory.** Its hot-expert map gives it 34.0 tok/s of decode; the other rungs
-  have 25.6 to 27.5.
-- **Any prompt of more than 512 new tokens waits at least 3.6 to 4.4 s** for its first token (6.6 s from 4K tokens at 1M):
-  each batch of a prompt uploads the experts of every host layer once. A short prompt waits 1.3 to 1.4 s.
-- **1M takes the whole machine.** It is 1,000,000 tokens, and the host was left 10 GiB at the lowest: use `768k` if anything
+- **256K is the fastest and leaves the most host memory:** 34.0 tok/s of decode, where the other rungs have 29.3 to 31.5.
+- **Any prompt of more than 512 new tokens waits at least 3.8 to 4.4 s** for its first token (6.7 s from 4K tokens at 1M):
+  each batch of a prompt uploads the experts of every host layer once. A short prompt waits 1.0 to 1.2 s.
+- **1M takes the whole machine.** It is 1,000,000 tokens, and the host was left 8.4 GiB at the lowest: use `768k` if anything
   else runs on the host.
 
 | | `256k` | `512k` | `768k` | `1m` |
 |---|---|---|---|---|
-| Layers' experts on the cards | 4, and 6,144 hot experts of the others | 24 | 22 | 20 |
+| Layers' experts on the cards | 4, and 6,144 hot experts of the others | 4, and 5,120 | 4, and 4,608 | 4, and 4,096 |
 | Experts pinned in host RAM | 183 GiB | 198 GiB | 206 GiB | 214 GiB |
 
 ## The prompt cache
@@ -135,7 +135,7 @@ of the experts the cache already holds, so more tokens find theirs on the GPU.
 - **The model** is Unsloth's UD-Q3_K_XL with one change by upstream: the tensors read on every token are requantized from Q8_0
   to Q5_K. The routed experts are byte-identical to Unsloth's. `scripts/get-model.sh` downloads the result.
 - **Each card** holds its half of the layers' attention and shared experts, the routed experts of its resident layers, the KV
-  cache, and a cache of the other layers' hot experts in what is left. At 256K the map pins most of that cache's experts.
+  cache, and a cache of the other layers' hot experts in what is left. The rung's map pins most of that cache's experts.
   Part of that cache sits on memory the compute buffer and the KV cache take back when a long prompt runs and as the context
   fills.
 - **The host** holds the other layers' routed experts in pinned memory.
@@ -147,7 +147,7 @@ of the experts the cache already holds, so more tokens find theirs on the GPU.
 The engine is `patches/glm53-offload.patch`, one diff against llama.cpp `d02b4c0d`, with upstream's kernels for this model on
 these cards. Every engine setting is an environment variable set in `recipes/`: `common.sh` holds what all presets share,
 `2gpu.sh` what two cards add, `2gpu-ram256.sh` what this host adds, `2gpu-<ctx>-ram256.sh` the rung, and
-`2gpu-256k-ram256-hot.sh` with `hotmap-256k.txt` the 256K map.
+`2gpu-<ctx>-ram256-hot.sh` with `hotmap-<ctx>.txt` the rung's map.
 
 ## Measure it yourself
 

@@ -1,4 +1,4 @@
-From 140a165f36ac64592eead462272772ed1b63c0ce Mon Sep 17 00:00:00 2001
+From eb1da9efd3e62366ae6f446e213eeec2069dcb68 Mon Sep 17 00:00:00 2001
 From: Hank Yeomans <16584630+hfyeomans@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 23:15:28 -0500
 Subject: [PATCH] LLAMA_MOE_HOT_MAP: a layer's busiest experts pinned in the
@@ -17,8 +17,8 @@ Co-authored-by: Amp <amp@ampcode.com>
  src/llama-model-loader.h   |   3 +
  src/llama-model.cpp        | 214 +++++++++++++++++++++++++++++++++++++
  src/llama-model.h          |  23 ++++
- src/llama-moe-cache.cpp    | 183 ++++++++++++++++++++++++++++---
- 6 files changed, 452 insertions(+), 14 deletions(-)
+ src/llama-moe-cache.cpp    | 194 ++++++++++++++++++++++++++++++---
+ 6 files changed, 463 insertions(+), 14 deletions(-)
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 4a08294..17b2dbb 100644
@@ -437,7 +437,7 @@ index ce6658c..fafff92 100644
      virtual ~llama_model();
  
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index 7b0d19f..91bb3e9 100644
+index 7b0d19f..662aa00 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
 @@ -11,13 +11,19 @@
@@ -468,7 +468,24 @@ index 7b0d19f..91bb3e9 100644
  
      std::vector<uint32_t> seen; // [n_expert]
      uint32_t seen_gen = 0;
-@@ -420,6 +427,8 @@ struct llama_moe_cache::impl {
+@@ -219,6 +226,16 @@ struct moe_cache_slru {
+         if (uniq.size() > (size_t) n_active) {
+             return false;
+         }
++        if (n_pin > 0) {
++            // the pinned slots [0, n_low) are never victims: the experts outside them must fit in the others
++            size_t n_free = 0;
++            for (int32_t e : uniq) {
++                n_free += slot_map[il][e] >= n_low;
++            }
++            if (n_free > (size_t) (n_active - n_low)) {
++                return false;
++            }
++        }
+         if (lfu_half > 0.0f) {
+             if (il <= lfu_il_last) {
+                 lfu_w *= lfu_mul;
+@@ -420,6 +437,8 @@ struct llama_moe_cache::impl {
  
      struct layer {
          int32_t ig = -1;                    // -1 if the layer is not cached
@@ -477,7 +494,7 @@ index 7b0d19f..91bb3e9 100644
          ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
          ggml_tensor * cpu_map  = nullptr;   // I32 [1, n_expert] in host memory, if cpu_share > 0
          std::vector<int32_t> cpu_experts;   // experts set in cpu_map
-@@ -673,7 +682,7 @@ struct llama_moe_cache::impl {
+@@ -673,7 +692,7 @@ struct llama_moe_cache::impl {
                  } else {
                      for (int32_t i = 0; i < s.lfu_sample; ++i) {
                          rng = rng*6364136223846793005ull + 1442695040888963407ull;
@@ -486,7 +503,7 @@ index 7b0d19f..91bb3e9 100644
                          const int32_t key = s.key_of[v];
                          if (key < 0) {
                              continue;
-@@ -1376,6 +1385,31 @@ struct llama_moe_cache::impl {
+@@ -1376,6 +1395,32 @@ struct llama_moe_cache::impl {
                  g.stage_ev.assign(4, nullptr);
                  LLAMA_LOG_INFO("%s: 0150: %d staging slots for the predicted experts of the next layer (%d a layer)\n", __func__, g.n_stage, stage_k());
              }
@@ -503,14 +520,15 @@ index 7b0d19f..91bb3e9 100644
 +                if (g.slru.lfu_half <= 0.0f || g.n_stage > 0 || prefetch_enabled() || (pc != nullptr && atoi(pc) != 0)) {
 +                    throw std::runtime_error("LLAMA_MOE_HOT_MAP needs LLAMA_MOE_CACHE_LFU, and no LLAMA_MOE_PREFETCH, LLAMA_MOE_PREFETCH_STAGE or LLAMA_MOE_PROMPT_CPU");
 +                }
-+                // the slots of the cache's own budget: the borrowed and lent ones are given up at times
-+                if (g.slru.n_pin + 256 > g.n_base) {
++                // the slots of the cache's own budget: the borrowed and lent ones are given up at times.  As without a map, they must
++                // hold the experts of one token; plan() checks each lookup
++                if (g.slru.n_pin + n_expert_used > g.n_base) {
 +                    size_t slot_bytes = 0;
 +                    for (const ggml_tensor * t : g.ref) {
 +                        slot_bytes += t->nb[2];
 +                    }
 +                    throw std::runtime_error(format("LLAMA_MOE_HOT_MAP: %s has %d slots of its own and the map pins %d there: its share of --moe-cache-mib must be %.0f MiB or more",
-+                        ggml_backend_name(d.backend), g.n_base, g.slru.n_pin, (g.slru.n_pin + 256)*(double) slot_bytes/1024.0/1024.0));
++                        ggml_backend_name(d.backend), g.n_base, g.slru.n_pin, (g.slru.n_pin + n_expert_used)*(double) slot_bytes/1024.0/1024.0));
 +                }
 +                g.slru.n_low    = g.slru.n_pin;
 +                g.slru.n_filled = g.slru.n_pin;
@@ -518,7 +536,7 @@ index 7b0d19f..91bb3e9 100644
              n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
              n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot map, CPU map and CPU ids
          }
-@@ -1425,6 +1459,10 @@ struct llama_moe_cache::impl {
+@@ -1425,6 +1470,10 @@ struct llama_moe_cache::impl {
                  if (home) {
                      l.ig      = (int32_t) ig;
                      l.experts = llama_moe_cache_layer_experts(model.layers[il]);
@@ -529,7 +547,7 @@ index 7b0d19f..91bb3e9 100644
                  } else {
                      l.ig_xd = (int32_t) ig;
                  }
-@@ -1648,6 +1686,7 @@ struct llama_moe_cache::impl {
+@@ -1648,6 +1697,7 @@ struct llama_moe_cache::impl {
                      }
                  }
              }
@@ -537,7 +555,7 @@ index 7b0d19f..91bb3e9 100644
          }
  
          // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
-@@ -1860,8 +1899,127 @@ struct llama_moe_cache::impl {
+@@ -1860,8 +1910,127 @@ struct llama_moe_cache::impl {
      void write_trace(int32_t il, int32_t n_used) {
          const int32_t rec[3] = { il, n_used, (int32_t) ids.size() };
          fwrite(rec, sizeof(int32_t), 3, trace);
@@ -665,7 +683,7 @@ index 7b0d19f..91bb3e9 100644
  
      ~impl() {
          log_stats();
-@@ -2181,7 +2339,7 @@ struct llama_moe_cache::impl {
+@@ -2181,7 +2350,7 @@ struct llama_moe_cache::impl {
              ids_h.clear();
              ids_x.clear();
              for (int32_t e : ids) {
@@ -674,7 +692,7 @@ index 7b0d19f..91bb3e9 100644
              }
              const uint32_t share_qx = gx->slru.n_filled == gx->slru.n_active ? cpu_share_q : 0;
              auto n_cpu_x = [&](size_t n_miss) {
-@@ -2202,17 +2360,11 @@ struct llama_moe_cache::impl {
+@@ -2202,17 +2371,11 @@ struct llama_moe_cache::impl {
              GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
          }
          fill_mark.assign(g.slru.n_expert, 0);
@@ -697,7 +715,7 @@ index 7b0d19f..91bb3e9 100644
          }
          int32_t * cpu_ids = (int32_t *) l.cpu_ids->data;
          for (size_t i = 0; i < ids.size(); ++i) {
-@@ -3242,6 +3394,11 @@ struct llama_moe_cache::impl {
+@@ -3242,6 +3405,11 @@ struct llama_moe_cache::impl {
          if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, n_cpu, rng, fills, cpu, n_hit)) {
              GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
          }

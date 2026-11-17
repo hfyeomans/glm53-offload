@@ -262,8 +262,8 @@ the error bar, so it is not shipped.
 ## A 256 GB host
 
 The `--ram 256` presets (`recipes/2gpu-ram256.sh` and `recipes/2gpu-*-ram256.sh`) were measured on a second machine, on
-2026-11-14. Nothing else in this file is from it. Since 2026-11-16 the 256K preset starts with its hot-expert map; the
-`2gpu-256k-ram256` rows below are without it (`--no-hot-map`), and [EXPERIMENTS.md](EXPERIMENTS.md), E4, has it measured.
+2026-11-14. Nothing else in this file is from it. Since 2026-11-17 these presets start with their hot-expert maps; the
+rows below are without them (`--no-hot-map`), and [EXPERIMENTS.md](EXPERIMENTS.md), E4 and E6, has them measured.
 
 | | |
 |---|---|
